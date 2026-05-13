@@ -233,6 +233,7 @@ sensors:
     #   auto_install_packages: true
     #   settings:
     #     i2c_address: 64       # 0x40 in decimal
+    #     bus_number: 1         # I2C bus number (1 for Raspberry Pi default)
     #     max_expected_amps: 2.0
     #     shunt_ohms: 0.1
 
