@@ -1,10 +1,12 @@
 FROM python:3.12-slim-bookworm
 
+ARG PACKAGE_VERSION=1.0.5
+
 ENV INSTALL_DIR=/opt/pymc_repeater \
     CONFIG_DIR=/etc/pymc_repeater \
     DATA_DIR=/var/lib/pymc_repeater \
     PYTHONUNBUFFERED=1 \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYMC_REPEATER=1.0.5
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYMC_REPEATER=${PACKAGE_VERSION}
 
 # Install runtime dependencies only
 RUN apt-get update && apt-get install -y \
