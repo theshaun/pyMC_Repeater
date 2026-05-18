@@ -8,7 +8,7 @@ import socket
 import time
 
 from repeater.companion.utils import validate_companion_node_name, normalize_companion_identity_key
-from repeater.config import get_radio_for_board, load_config, save_config
+from repeater.config import NullRadio, get_radio_for_board, load_config, save_config
 from repeater.config_manager import ConfigManager
 from repeater.data_acquisition.glass_handler import GlassHandler
 from repeater.data_acquisition.gps_service import GPSService
@@ -59,6 +59,8 @@ class RepeaterDaemon:
         self.companion_frame_servers: list = []
         self._shutdown_started = False
         self._main_task = None
+        self.radio_status = "unknown"
+        self.radio_error = None
 
         log_level = config.get("logging", {}).get("level", "INFO")
         logging.basicConfig(
@@ -99,9 +101,31 @@ class RepeaterDaemon:
         if self.radio is None:
             radio_type_raw = self.config.get("radio_type")
             radio_type = "none" if radio_type_raw is None else str(radio_type_raw)
+            radio_type_lower = radio_type.lower().strip()
+            radio_explicitly_disabled = radio_type_lower in (
+                "",
+                "none",
+                "null",
+                "disabled",
+                "off",
+                "no_radio",
+            )
             logger.info(f"Initializing radio hardware... (radio_type={radio_type})")
             try:
                 self.radio = get_radio_for_board(self.config)
+
+                if isinstance(self.radio, NullRadio):
+                    self.radio_status = "disabled" if radio_explicitly_disabled else "degraded"
+                    if self.radio_status == "disabled":
+                        self.radio_error = None
+                    else:
+                        self.radio_error = (
+                            self.radio_error
+                            or f"Radio type '{radio_type}' unavailable; running in no-radio mode"
+                        )
+                else:
+                    self.radio_status = "ok"
+                    self.radio_error = None
 
                 # KISS modem: schedule RX callbacks on the event loop for thread safety
                 if hasattr(self.radio, "set_event_loop"):
@@ -134,7 +158,14 @@ class RepeaterDaemon:
                 logger.info("Radio hardware initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize radio hardware: {e}")
-                raise RuntimeError("Repeater requires real LoRa hardware") from e
+                self.radio_status = "degraded"
+                self.radio_error = str(e)
+                logger.warning(
+                    "Radio type '%s' unavailable; starting in no-radio mode to keep service alive. "
+                    "Check radio configuration and hardware mapping.",
+                    radio_type,
+                )
+                self.radio = NullRadio()
 
         try:
             from pymc_core import LocalIdentity
@@ -944,6 +975,10 @@ class RepeaterDaemon:
 
         if self.sensor_manager:
             stats["sensors"] = self.sensor_manager.get_summary()
+
+        stats["radio_status"] = self.radio_status
+        if self.radio_error:
+            stats["radio_error"] = self.radio_error
 
         return stats
 
