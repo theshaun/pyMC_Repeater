@@ -252,7 +252,7 @@ sensors:
     #     i2c_address: 0x70
     #     bus_number: 1
 
-    # Example Waveshare UPS Hat 
+    # Example Waveshare UPS D Hat 
     # - type: waveshare_ups_d
     #   name: battery
     #   enabled: true
@@ -260,6 +260,17 @@ sensors:
     #   settings:
     #     i2c_address: 0x43
     #     bus_number: 1
+
+    # Example Waveshare UPS E Hat 
+    # - type: waveshare_ups_e
+    #   name: "battery"
+    #   enabled: true
+    #   auto_install_packages: false
+    #   settings:
+    #     i2c_address: 0x2D  # Waveshare UPS HAT (E) fixed address
+    #     bus_number: 1       # I2C bus number (1 for Raspberry Pi default)
+    #     low_cell_mv: 3150   # Per-cell warning threshold in mV
+
 
 
 # Mesh Network Configuration
