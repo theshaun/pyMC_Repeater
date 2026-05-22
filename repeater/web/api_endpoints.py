@@ -5295,8 +5295,21 @@ class APIEndpoints:
 
             # Sections we allow to be imported
             ALLOWED_SECTIONS = {
-                "repeater", "mesh", "radio", "identities", "delays",
-                "ch341", "web", "letsmesh", "glass", "logging", "radio_type",
+                "repeater",
+                "mesh",
+                "radio",
+                "sx1262",
+                "ch341",
+                "kiss",
+                "pymc_usb",
+                "pymc_tcp",
+                "identities",
+                "delays",
+                "web",
+                "letsmesh",
+                "glass",
+                "logging",
+                "radio_type",
             }
 
             updated_sections = []
@@ -5340,7 +5353,15 @@ class APIEndpoints:
                                 existing = cur_by_name.get(entry.get("name"), {})
                                 entry["identity_key"] = existing.get("identity_key", "")
 
-                if section == "radio":
+                if section in {
+                    "radio",
+                    "sx1262",
+                    "ch341",
+                    "kiss",
+                    "pymc_usb",
+                    "pymc_tcp",
+                    "radio_type",
+                }:
                     restart_required = True
 
                 if section == "radio_type":
