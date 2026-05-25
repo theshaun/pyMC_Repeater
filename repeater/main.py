@@ -1079,9 +1079,10 @@ class RepeaterDaemon:
             # Send via dispatcher
             await self.dispatcher.send_packet(packet, wait_for_ack=False)
 
-            # Mark our own advert as seen to prevent re-forwarding it
             if self.repeater_handler:
                 self.repeater_handler.mark_seen(packet)
+                pkt_hash = packet.calculate_packet_hash().hex()[:16]
+                self.dispatcher.packet_filter.track_packet(pkt_hash)
                 logger.debug("Marked own advert as seen in duplicate cache")
 
             logger.info(
