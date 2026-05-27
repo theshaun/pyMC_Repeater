@@ -5,6 +5,7 @@ Provides functions for service control operations like restart.
 
 import logging
 import os
+import shutil
 import subprocess  # nosec B404
 import threading
 import time
@@ -14,9 +15,9 @@ logger = logging.getLogger("ServiceUtils")
 INIT_SCRIPT = "/etc/init.d/S80pymc-repeater"
 BUILDROOT_METADATA_PATH = "/etc/pymc-image-build-id"
 _CONTAINER_RESTART_DELAY_SECONDS = 1.0
-_SH_BIN = "/bin/sh"
-_SYSTEMCTL_BIN = "/bin/systemctl"
-_SUDO_BIN = "/usr/bin/sudo"
+_SH_BIN = shutil.which("sh") or "sh"
+_SYSTEMCTL_BIN = shutil.which("systemctl") or "systemctl"
+_SUDO_BIN = shutil.which("sudo") or "sudo"
 
 
 def is_buildroot() -> bool:

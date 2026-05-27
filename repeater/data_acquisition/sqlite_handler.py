@@ -1715,11 +1715,14 @@ class SQLiteHandler:
 
         except Exception as e:
             logger.error(f"Failed to generate transport key using get_auto_key_for: {e}")
-            # Fallback to a transport-compatible random 16-byte key if derivation fails.
+            # Fallback to a transport-compatible random key if derivation fails.
             try:
-                random_bytes = secrets.token_bytes(16)
+                fallback_length = max(1, int(key_length_bytes))
+                random_bytes = secrets.token_bytes(fallback_length)
                 key = base64.b64encode(random_bytes).decode("utf-8")
-                logger.warning(f"Using fallback random key generation for '{name}'")
+                logger.warning(
+                    f"Using fallback random key generation for '{name}' with {fallback_length} bytes"
+                )
                 return key
             except Exception as fallback_e:
                 logger.error(f"Fallback key generation also failed: {fallback_e}")

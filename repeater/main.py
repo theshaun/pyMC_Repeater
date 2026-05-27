@@ -539,7 +539,7 @@ class RepeaterDaemon:
 
                 node_name = settings.get("node_name", name)
                 tcp_port = settings.get("tcp_port", 5000)
-                bind_address = settings.get("bind_address", "0.0.0.0")
+                bind_address = settings.get("bind_address", "0.0.0.0")  # nosec B104
                 tcp_timeout_raw = settings.get("tcp_timeout", 8 * 60 * 60)  # 8 hours
                 client_idle_timeout_sec = None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
 
@@ -721,7 +721,7 @@ class RepeaterDaemon:
 
         node_name = settings.get("node_name", name)
         tcp_port = settings.get("tcp_port", 5000)
-        bind_address = settings.get("bind_address", "0.0.0.0")
+        bind_address = settings.get("bind_address", "0.0.0.0")  # nosec B104
         tcp_timeout_raw = settings.get("tcp_timeout", 120)
         client_idle_timeout_sec = None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
 
@@ -1291,7 +1291,7 @@ class RepeaterDaemon:
 
             # Start HTTP stats server
             http_port = self.config.get("http", {}).get("port", 8000)
-            http_host = self.config.get("http", {}).get("host", "0.0.0.0")
+            http_host = self.config.get("http", {}).get("host", "0.0.0.0")  # nosec B104
 
             node_name = self.config.get("repeater", {}).get("node_name", "Repeater")
 

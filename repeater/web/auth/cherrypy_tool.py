@@ -28,8 +28,7 @@ def check_auth():
 
     if not jwt_handler or not token_manager:
         logger.error("Auth handlers not initialized in cherrypy.config")
-        cherrypy.response.status = 500
-        return {"success": False, "error": "Authentication system not configured"}
+        raise cherrypy.HTTPError(500, "Authentication system not configured")
 
     # Check for JWT token in Authorization header first
     auth_header = cherrypy.request.headers.get("Authorization", "")

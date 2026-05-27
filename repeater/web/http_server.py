@@ -177,7 +177,7 @@ class StatsApp:
 class HTTPStatsServer:
     def __init__(
         self,
-        host: str = "0.0.0.0",
+        host: str = "0.0.0.0",  # nosec B104 - intentional default for service exposure
         port: int = 8000,
         stats_getter: Optional[Callable] = None,
         node_name: str = "Repeater",

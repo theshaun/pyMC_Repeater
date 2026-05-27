@@ -172,9 +172,9 @@ class CompanionFrameWebSocket(WebSocket):
             if entry.get("name") == companion_name:
                 settings = entry.get("settings") or {}
                 port = settings.get("tcp_port", 5000)
-                bind = settings.get("bind_address", "0.0.0.0")
+                bind = settings.get("bind_address", "0.0.0.0")  # nosec B104
                 # 0.0.0.0 = all interfaces — connect via loopback
-                host = "127.0.0.1" if bind == "0.0.0.0" else bind
+                host = "127.0.0.1" if bind == "0.0.0.0" else bind  # nosec B104
                 logger.debug(f"_resolve_tcp_endpoint: '{companion_name}' → {host}:{port}")
                 return (host, port)
 

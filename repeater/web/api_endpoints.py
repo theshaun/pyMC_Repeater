@@ -3522,7 +3522,7 @@ class APIEndpoints:
                 comp_settings = {
                     "node_name": settings.get("node_name") or name,
                     "tcp_port": settings.get("tcp_port", 5000),
-                    "bind_address": settings.get("bind_address", "0.0.0.0"),
+                    "bind_address": settings.get("bind_address", "0.0.0.0"),  # nosec B104
                 }
                 if "tcp_timeout" in settings:
                     comp_settings["tcp_timeout"] = settings["tcp_timeout"]

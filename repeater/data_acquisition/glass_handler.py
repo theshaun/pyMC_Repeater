@@ -45,7 +45,7 @@ class GlassHandler:
         self.base_url = "http://localhost:8080"
         self.request_timeout_seconds = 10
         self.verify_tls = True
-        self.api_token = ""
+        self.api_token = ""  # nosec - runtime config value, not a hardcoded credential
         self.inform_interval_seconds = 30
         self.cert_store_dir = "/etc/pymc_repeater/glass"
         self._cert_expires_at: Optional[str] = None

@@ -43,8 +43,8 @@ class ACL:
         allow_read_only: bool = True,
     ):
         self.max_clients = max_clients
-        self.admin_password = admin_password
-        self.guest_password = guest_password
+        self.admin_password = admin_password or ""
+        self.guest_password = guest_password or ""
         self.allow_read_only = allow_read_only
         self.clients: Dict[bytes, ClientInfo] = {}
 
@@ -92,6 +92,9 @@ class ACL:
                 f"Repeater passwords - admin: {'SET' if admin_pwd else 'NONE'}, "
                 f"guest: {'SET' if guest_pwd else 'NONE'}"
             )
+
+        admin_pwd = admin_pwd or ""
+        guest_pwd = guest_pwd or ""
 
         if target_identity_name:
             logger.debug(

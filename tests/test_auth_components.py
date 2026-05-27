@@ -73,11 +73,12 @@ def test_check_auth_skips_options_and_login(monkeypatch):
     assert check_auth() is None
 
 
-def test_check_auth_missing_handlers_returns_500_json(monkeypatch):
+def test_check_auth_missing_handlers_raises_http_500(monkeypatch):
     _set_cp(monkeypatch, cfg={})
-    out = check_auth()
-    assert out["success"] is False
-    assert cherrypy.response.status == 500
+    with pytest.raises(cherrypy.HTTPError) as exc_info:
+        check_auth()
+
+    assert exc_info.value.status == 500
 
 
 def test_check_auth_accepts_bearer_token(monkeypatch):
