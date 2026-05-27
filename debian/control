@@ -16,7 +16,7 @@ Build-Depends: debhelper-compat (= 13),
                git
 Standards-Version: 4.6.2
 Homepage: https://github.com/rightup/pyMC_Repeater
-X-Python3-Version: >= 3.8
+X-Python3-Version: >= 3.9
 
 Package: pymc-repeater
 Architecture: all

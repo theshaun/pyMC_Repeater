@@ -399,7 +399,7 @@ I welcome contributions! To contribute to pyMC_repeater:
 ### Development Setup
 
 ```bash
-# Install in development mode with dev tools (black, pytest, isort, mypy, etc)
+# Install in development mode with dev tools (ruff, pytest, mypy, etc)
 pip install -e ".[dev]"
 
 # Setup pre-commit hooks for code quality
@@ -413,9 +413,8 @@ pre-commit run --all-files
 **Note:** Hardware support (LoRa radio drivers) is included in the base installation automatically via `pymc_core[hardware]`.
 
 Pre-commit hooks will automatically:
-- Format code with Black
-- Sort imports with isort
-- Lint with flake8
+- Lint and auto-fix Python issues with Ruff
+- Validate formatting with Ruff formatter
 - Fix trailing whitespace and other file issues
 
 ## Support
