@@ -365,7 +365,16 @@ sudo bash ./setup-radio-config.sh
 
 4. Configure the [docker compose](./docker-compose.yml) to your specific hardware and file paths. Be sure to comment-out or delete lines that aren't required for your hardware. Please note that your hardware devices might be at a different path than those listed in the docker compose file.
 
-5. Build and start the container.
+5. If you are using SPI/GPIO hardware, make sure the `GPIO_GID` and `SPI_GID`
+   values match the numeric group IDs on your host. The compose file defaults
+   to `GPIO_GID=986` and `SPI_GID=989`.
+
+```bash
+getent group gpio
+getent group spi
+```
+
+6. Build and start the container.
 
 ```bash
 docker compose up -d --force-recreate --build

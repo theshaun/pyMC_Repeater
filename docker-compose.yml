@@ -2,9 +2,12 @@ services:
   pymc-repeater:
     build:
       context: .
+      dockerfile: dockerfile
       args:
         PUID: ${PUID:-1000}
         PGID: ${PGID:-1000}
+        GPIO_GID: ${GPIO_GID:-986}
+        SPI_GID: ${SPI_GID:-989}
     container_name: pymc-repeater
     restart: unless-stopped
     ports:
@@ -20,7 +23,9 @@ services:
       - SYS_RAWIO
     # USB DEVICSE PERMISSIONS
     group_add:
-     - plugdev
+      - "${GPIO_GID:-986}"
+      - "${SPI_GID:-989}"
+      - plugdev
     volumes:
       - ./config:/etc/pymc_repeater
       - ./data:/var/lib/pymc_repeater
