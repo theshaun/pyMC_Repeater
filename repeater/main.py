@@ -268,6 +268,12 @@ class RepeaterDaemon:
                 identity_manager=self.identity_manager,
                 packet_injector=self.router.inject_packet,
                 log_fn=logger.info,
+                sqlite_handler=(
+                    self.repeater_handler.storage.sqlite_handler
+                    if self.repeater_handler and self.repeater_handler.storage
+                    else None
+                ),  # For anon regions-discovery replies
+                config=self.config,  # For owner-info / feature-flags replies
             )
 
             # Register default repeater identity
