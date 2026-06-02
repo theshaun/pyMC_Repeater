@@ -162,7 +162,7 @@ class RepeaterHandler(BaseHandler):
 
     async def __call__(
         self, packet: Packet, metadata: Optional[dict] = None, local_transmission: bool = False
-    ) -> None:
+    ) -> bool:
 
         if metadata is None:
             metadata = {}
@@ -259,19 +259,23 @@ class RepeaterHandler(BaseHandler):
                         f"Duty-cycle limit: deferring local TX by {wait_time:.1f}s "
                         f"(airtime={airtime_ms:.1f}ms)"
                     )
-                    self.forwarded_count += 1
-                    transmitted = True
                     tx_task = await self.schedule_retransmit(
                         fwd_pkt, deferred_delay, airtime_ms, local_transmission=True
                     )
                     try:
-                        await tx_task
+                        tx_success = await tx_task
                     except Exception as e:
-                        self.forwarded_count -= 1
                         transmitted = False
                         drop_reason = "TX failed (deferred)"
                         logger.warning(f"Deferred local TX failed: {e}")
                         raise
+                    if not tx_success:
+                        transmitted = False
+                        drop_reason = "TX failed (deferred)"
+                        self.dropped_count += 1
+                    else:
+                        self.forwarded_count += 1
+                        transmitted = True
                     tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
                     if tx_metadata:
                         lbt_attempts = tx_metadata.get("lbt_attempts", 0)
@@ -292,19 +296,23 @@ class RepeaterHandler(BaseHandler):
                     self.dropped_count += 1
                     drop_reason = "Duty cycle limit"
             else:
-                self.forwarded_count += 1
-                transmitted = True
                 tx_task = await self.schedule_retransmit(
                     fwd_pkt, delay, airtime_ms, local_transmission=local_transmission
                 )
                 try:
-                    await tx_task
+                    tx_success = await tx_task
                 except Exception as e:
-                    self.forwarded_count -= 1
                     transmitted = False
                     drop_reason = "TX failed"
                     logger.warning(f"Local TX failed: {e}")
                     raise
+                if not tx_success:
+                    transmitted = False
+                    drop_reason = "TX failed"
+                    self.dropped_count += 1
+                else:
+                    self.forwarded_count += 1
+                    transmitted = True
                 tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
                 if tx_metadata:
                     lbt_attempts = tx_metadata.get("lbt_attempts", 0)
@@ -414,6 +422,8 @@ class RepeaterHandler(BaseHandler):
         else:
             # Not a duplicate or first occurrence
             self._append_recent_packet(packet_record)
+
+        return transmitted
 
     def log_trace_record(self, packet_record: dict) -> None:
         """Manually log a packet trace record (used by external callers)"""
@@ -1128,10 +1138,20 @@ class RepeaterHandler(BaseHandler):
                                 "Packet dropped at TX time: duty-cycle exceeded (airtime=%.1fms)",
                                 airtime_ms,
                             )
-                            return
+                            return False
 
                     try:
-                        await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
+                        sent = await self.dispatcher.send_packet(
+                            fwd_pkt, wait_for_ack=False
+                        )
+                        if not sent:
+                            logger.warning(
+                                "Retransmit failed (attempt %d): dispatcher returned false",
+                                attempt + 1,
+                            )
+                            if local_transmission and attempt == 0:
+                                continue
+                            return False
                         self._record_packet_sent(fwd_pkt)
                         if airtime_ms > 0:
                             self.airtime_mgr.record_tx(airtime_ms)
@@ -1140,13 +1160,14 @@ class RepeaterHandler(BaseHandler):
                             f"Retransmitted packet ({packet_size} bytes, "
                             f"{airtime_ms:.1f}ms airtime)"
                         )
-                        return
+                        return True
                     except Exception as e:
                         logger.error(f"Retransmit failed (attempt {attempt + 1}): {e}")
                         if local_transmission and attempt == 0:
                             pass  # release lock, outer loop sleeps, then retries
                         else:
                             raise
+            return False
 
         return asyncio.create_task(delayed_send())
 

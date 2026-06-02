@@ -143,6 +143,15 @@ async def test_raw_rx_and_duplicate_logging_hooks():
     await daemon._on_raw_rx_for_companions(b"abc", rssi=-90, snr=2.0)
     fs_ok.push_rx_raw.assert_called_once()
 
+    # exclude_hash skips the matching companion's own frame server (no self-echo)
+    fs_self = SimpleNamespace(companion_hash="0x1a", push_rx_raw=MagicMock())
+    fs_other = SimpleNamespace(companion_hash="0x2b", push_rx_raw=MagicMock())
+    daemon.companion_frame_servers = [fs_self, fs_other]
+    await daemon._on_raw_rx_for_companions(b"xyz", rssi=0, snr=0.0, exclude_hash="0x1a")
+    fs_self.push_rx_raw.assert_not_called()
+    fs_other.push_rx_raw.assert_called_once()
+    daemon.companion_frame_servers = [fs_ok, fs_fail]
+
     engine = SimpleNamespace(
         is_duplicate=MagicMock(side_effect=[False, True]),
         record_duplicate=MagicMock(),

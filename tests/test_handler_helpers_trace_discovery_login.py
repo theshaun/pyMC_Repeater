@@ -207,13 +207,51 @@ def test_discovery_request_without_identity_does_not_send():
 @pytest.mark.asyncio
 async def test_discovery_send_packet_async_success_failure_and_exception():
     injector = AsyncMock(side_effect=[True, False, RuntimeError("send fail")])
-    helper = DiscoveryHelper(local_identity=FakeIdentity(0x42), packet_injector=injector)
+    # jitter disabled so the test doesn't sleep
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42), packet_injector=injector, response_jitter_ms=0
+    )
 
     await helper._send_packet_async(packet=object(), tag=0x11)
     await helper._send_packet_async(packet=object(), tag=0x12)
     await helper._send_packet_async(packet=object(), tag=0x13)
 
     assert injector.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_discovery_response_applies_bounded_jitter_before_send():
+    injector = AsyncMock(return_value=True)
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42), packet_injector=injector, response_jitter_ms=2000
+    )
+
+    slept = []
+
+    async def fake_sleep(secs):
+        slept.append(secs)
+
+    with patch("repeater.handler_helpers.discovery.asyncio.sleep", side_effect=fake_sleep):
+        await helper._send_packet_async(packet=object(), tag=0x55)
+
+    # Jitter applied exactly once, bounded to [0, 2.0]s, before the injection.
+    assert len(slept) == 1
+    assert 0.0 <= slept[0] <= 2.0
+    injector.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discovery_response_jitter_disabled_does_not_sleep():
+    injector = AsyncMock(return_value=True)
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42), packet_injector=injector, response_jitter_ms=0
+    )
+
+    with patch("repeater.handler_helpers.discovery.asyncio.sleep") as sleep_mock:
+        await helper._send_packet_async(packet=object(), tag=0x56)
+
+    sleep_mock.assert_not_called()
+    injector.assert_awaited_once()
 
 
 def test_discovery_send_response_without_injector_is_safe():
@@ -251,12 +289,16 @@ def test_login_register_identity_repeater_creates_acl_and_handler():
     identity = FakeIdentity(0x52)
     acl_obj = MagicMock()
     handler_obj = MagicMock()
+    anon_obj = MagicMock()
 
     with (
         patch("repeater.handler_helpers.acl.ACL", return_value=acl_obj) as acl_cls,
         patch(
             "repeater.handler_helpers.login.LoginServerHandler", return_value=handler_obj
         ) as handler_cls,
+        patch(
+            "repeater.handler_helpers.login.AnonRequestHandler", return_value=anon_obj
+        ) as anon_cls,
     ):
         helper.register_identity(
             name="repeater-main",
@@ -271,9 +313,63 @@ def test_login_register_identity_repeater_creates_acl_and_handler():
 
     acl_cls.assert_called_once()
     handler_cls.assert_called_once()
-    handler_obj.set_send_packet_callback.assert_called_once()
-    assert helper.handlers[0x52] is handler_obj
+    # The login handler is wrapped in an AnonRequestHandler, and that wrapper is
+    # what gets stored + wired with the send callback.
+    anon_cls.assert_called_once()
+    assert anon_cls.call_args.kwargs["login_handler"] is handler_obj
+    anon_obj.set_send_packet_callback.assert_called_once()
+    assert helper.handlers[0x52] is anon_obj
     assert helper.acls[0x52] is acl_obj
+
+
+class _FakeSqlite:
+    def __init__(self, keys):
+        self._keys = keys
+
+    def get_transport_keys(self):
+        return self._keys
+
+
+def test_format_region_names_filters_and_strips():
+    keys = [
+        {"name": "#VHF", "flood_policy": "allow"},
+        {"name": "USA", "flood_policy": "allow"},
+        {"name": "secret", "flood_policy": "deny"},
+        {"name": "*", "flood_policy": "allow"},  # duplicate wildcard ignored
+        {"name": "", "flood_policy": "allow"},
+    ]
+    # Default config => unscoped flood allowed => wildcard '*' present.
+    helper = LoginHelper(identity_manager=MagicMock(), sqlite_handler=_FakeSqlite(keys))
+    # Wildcard first (from policy), '#' stripped, deny + empty + literal '*' excluded.
+    assert helper._format_region_names() == "*,VHF,USA"
+
+
+def test_format_region_names_wildcard_suppressed_when_unscoped_denied():
+    keys = [{"name": "USA", "flood_policy": "allow"}]
+    helper = LoginHelper(
+        identity_manager=MagicMock(),
+        sqlite_handler=_FakeSqlite(keys),
+        config={"mesh": {"unscoped_flood_allow": False}},
+    )
+    # No wildcard when unscoped flood is denied (firmware: wildcard deny-flood).
+    assert helper._format_region_names() == "USA"
+
+
+def test_format_region_names_without_storage_is_just_wildcard():
+    # No named regions, but unscoped flood allowed by default => bare wildcard.
+    helper = LoginHelper(identity_manager=MagicMock(), sqlite_handler=None)
+    assert helper._format_region_names() == "*"
+
+
+def test_owner_and_features_callbacks_from_config():
+    config = {"repeater": {"node_name": "node-x", "owner_info": "me", "mode": "monitor"}}
+    helper = LoginHelper(identity_manager=MagicMock(), config=config)
+
+    assert helper._make_owner_info_fn("fallback", config)() == ("node-x", "me")
+    # Non-forward mode sets the forwarding-disabled bit (0x80).
+    assert helper._make_features_fn(config)() == 0x80
+    # Forwarding mode clears it.
+    assert helper._make_features_fn({"repeater": {"mode": "forward"}})() == 0x00
 
 
 @pytest.mark.asyncio

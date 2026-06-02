@@ -268,6 +268,12 @@ class RepeaterDaemon:
                 identity_manager=self.identity_manager,
                 packet_injector=self.router.inject_packet,
                 log_fn=logger.info,
+                sqlite_handler=(
+                    self.repeater_handler.storage.sqlite_handler
+                    if self.repeater_handler and self.repeater_handler.storage
+                    else None
+                ),  # For anon regions-discovery replies
+                config=self.config,  # For owner-info / feature-flags replies
             )
 
             # Register default repeater identity
@@ -566,7 +572,12 @@ class RepeaterDaemon:
 
                 bridge = RepeaterCompanionBridge(
                     identity=identity,
-                    packet_injector=self.router.inject_packet,
+                    # Tag the injector with this companion's hash so inject_packet can
+                    # skip its own frame server when echoing TX as raw RX (a node never
+                    # hears its own transmission).
+                    packet_injector=functools.partial(
+                        self.router.inject_packet, origin_hash=companion_hash_str
+                    ),
                     node_name=node_name,
                     radio_config=radio_config,
                     sqlite_handler=sqlite_handler,
@@ -813,12 +824,21 @@ class RepeaterDaemon:
             f"port={tcp_port}, bind={bind_address}, client_idle_timeout_sec={client_idle_timeout_sec}"
         )
 
-    async def _on_raw_rx_for_companions(self, data: bytes, rssi: int, snr: float) -> None:
-        """Raw RX subscriber: push PUSH_CODE_LOG_RX_DATA (0x88) to connected companion clients."""
+    async def _on_raw_rx_for_companions(
+        self, data: bytes, rssi: int, snr: float, exclude_hash: str | None = None
+    ) -> None:
+        """Raw RX subscriber: push PUSH_CODE_LOG_RX_DATA (0x88) to connected companion clients.
+
+        ``exclude_hash`` skips the frame server for that companion hash; used when
+        echoing a companion's own injected TX so it never hears its own transmission.
+        OTA RX subscribers leave it unset, so received packets reach every companion.
+        """
         servers = getattr(self, "companion_frame_servers", [])
         if not servers:
             return
         for fs in servers:
+            if exclude_hash is not None and getattr(fs, "companion_hash", None) == exclude_hash:
+                continue
             try:
                 fs.push_rx_raw(snr, rssi, data)
             except Exception as e:
@@ -1093,7 +1113,7 @@ class RepeaterDaemon:
                 logger.debug("Marked own advert as seen in duplicate cache")
 
             logger.info(
-                "Sent flood advert '%s' at (% .6f, % .6f) source=%s",
+                "Sent flood advert '%s' at (%.6f, %.6f) source=%s",
                 node_name,
                 latitude,
                 longitude,

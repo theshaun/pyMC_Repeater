@@ -255,7 +255,8 @@ class TestTxLockSerialisation(unittest.IsolatedAsyncioTestCase):
         task = await h.schedule_retransmit(
             pkt, delay=0.0, airtime_ms=100.0, local_transmission=True
         )
-        await task  # should complete without error (gate returns silently)
+        result = await task
+        self.assertFalse(result, "Duty-cycle drop should report TX failure")
 
         self.assertEqual(
             send_calls[0], 1, "send_packet called on retry despite duty-cycle rejection"

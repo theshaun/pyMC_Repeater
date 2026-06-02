@@ -6,7 +6,9 @@ This module processes login requests and manages authentication for all identiti
 
 import asyncio
 import logging
+import time
 
+from pymc_core.node.handlers.anon_request import AnonRateLimiter, AnonRequestHandler
 from pymc_core.node.handlers.login_server import LoginServerHandler
 from pymc_core.protocol.constants import PAYLOAD_TYPE_ANON_REQ
 
@@ -14,15 +16,27 @@ logger = logging.getLogger("LoginHelper")
 
 
 class LoginHelper:
-    def __init__(self, identity_manager, packet_injector=None, log_fn=None):
+    def __init__(
+        self,
+        identity_manager,
+        packet_injector=None,
+        log_fn=None,
+        sqlite_handler=None,
+        config=None,
+    ):
 
         self.identity_manager = identity_manager
         self.packet_injector = packet_injector
         self.log_fn = log_fn or logger.info
+        self.sqlite_handler = sqlite_handler
+        self.config = config or {}
 
         self.handlers = {}
         self.acls = {}  # Per-identity ACLs keyed by hash_byte
         self._pending_tasks = set()
+        # Shared across all identities so the node's total anon-reply rate is
+        # bounded (mirrors firmware anon_limiter: ~4 requests / 2 min).
+        self.anon_limiter = AnonRateLimiter()
 
     def _track_task(self, task: asyncio.Task) -> None:
         self._pending_tasks.add(task)
@@ -126,11 +140,87 @@ class LoginHelper:
             is_room_server=(identity_type == "room_server"),
         )
 
-        handler.set_send_packet_callback(self._send_packet_with_delay)
+        # Wrap the login handler in an anon-request dispatcher so anonymous
+        # regions/owner/basic discovery queries are answered instead of being
+        # mis-parsed as failed logins (MeshCore 1.16.0 discovery feature).
+        anon_handler = AnonRequestHandler(
+            local_identity=identity,
+            log_fn=self.log_fn,
+            login_handler=handler,
+            anon_limiter=self.anon_limiter,
+            region_names_fn=self._format_region_names,
+            owner_info_fn=self._make_owner_info_fn(name, config),
+            features_fn=self._make_features_fn(config),
+            clock_fn=lambda: int(time.time()),
+        )
+        # Wires the send callback through to both the wrapper and login handler.
+        anon_handler.set_send_packet_callback(self._send_packet_with_delay)
 
-        self.handlers[hash_byte] = handler
+        self.handlers[hash_byte] = anon_handler
 
         logger.info(f"Registered {identity_type} '{name}' login handler: hash=0x{hash_byte:02X}")
+
+    def _format_region_names(self) -> str:
+        """Build the comma-separated region-names string for an anon regions reply.
+
+        Mirrors firmware ``RegionMap::exportNamesTo`` with ``REGION_DENY_FLOOD``:
+        emit the ``*`` wildcard region first (unless unscoped flood is denied),
+        then each allow-flood named region with a leading ``#`` stripped, with no
+        trailing comma. The firmware wildcard is the always-present default flood
+        scope; pyMC_repeater models that via ``mesh.unscoped_flood_allow``
+        (falling back to ``mesh.global_flood_allow``, default allow).
+        """
+        parts = []
+
+        mesh_cfg = self.config.get("mesh", {}) if isinstance(self.config, dict) else {}
+        unscoped_allow = mesh_cfg.get(
+            "unscoped_flood_allow", mesh_cfg.get("global_flood_allow", True)
+        )
+        if unscoped_allow:
+            parts.append("*")
+
+        if self.sqlite_handler:
+            try:
+                keys = self.sqlite_handler.get_transport_keys()
+            except Exception as e:
+                logger.warning(f"Failed to read transport keys for regions reply: {e}")
+                keys = []
+            for rec in keys or []:
+                if rec.get("flood_policy", "deny") != "allow":
+                    continue
+                name = (rec.get("name") or "").strip()
+                if not name or name == "*":
+                    continue  # wildcard handled above
+                parts.append(name[1:] if name.startswith("#") else name)
+
+        return ",".join(parts)
+
+    @staticmethod
+    def _make_owner_info_fn(name: str, config: dict):
+        """Build an owner-info callback returning ``(node_name, owner_info)``."""
+
+        def owner_info_fn():
+            cfg = config or {}
+            repeater_cfg = cfg.get("repeater", {})
+            node_name = repeater_cfg.get("node_name") or name or "pyMC"
+            owner = repeater_cfg.get("owner_info", "") or ""
+            return (node_name, owner)
+
+        return owner_info_fn
+
+    @staticmethod
+    def _make_features_fn(config: dict):
+        """Build a feature-flags callback (bit0 = bridge, bit7 = forwarding disabled)."""
+
+        def features_fn():
+            cfg = config or {}
+            mode = cfg.get("repeater", {}).get("mode", "forward")
+            features = 0
+            if mode != "forward":  # monitor / no_tx => not forwarding
+                features |= 0x80
+            return features
+
+        return features_fn
 
     async def process_login_packet(self, packet):
 
@@ -147,9 +237,16 @@ class LoginHelper:
                 packet.mark_do_not_retransmit()
                 return True
             else:
-                # ANON_REQ to other nodes (e.g. owner-info to firmware) is normal; skip log to avoid spam
+                # ANON_REQ to other nodes (e.g. another repeater's regions/owner
+                # query overheard on-air) is normal; log at DEBUG so the dest is
+                # visible when diagnosing "why didn't my repeater answer".
                 ptype = getattr(packet, "get_payload_type", lambda: None)()
-                if ptype != PAYLOAD_TYPE_ANON_REQ:
+                if ptype == PAYLOAD_TYPE_ANON_REQ:
+                    logger.debug(
+                        f"ANON_REQ for hash 0x{dest_hash:02X} not addressed to a local "
+                        f"identity ({sorted(f'0x{h:02X}' for h in self.handlers)}); ignoring"
+                    )
+                else:
                     logger.debug(
                         f"No login handler registered for hash 0x{dest_hash:02X}, allowing forward"
                     )

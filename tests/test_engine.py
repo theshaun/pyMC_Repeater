@@ -1072,6 +1072,46 @@ class TestTxMode:
             await asyncio.sleep(0)
         handler.dispatcher.send_packet.assert_called_once()
 
+    async def test_local_tx_exception_does_not_underflow_forwarded_count(self, handler):
+        """TX exceptions must not decrement forwarded_count before any increment happened."""
+        handler.config["repeater"]["mode"] = "forward"
+        pkt = _make_flood_packet()
+        handler.forwarded_count = 0
+
+        async def _boom():
+            raise RuntimeError("simulated tx failure")
+
+        with patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock):
+            with patch.object(
+                handler, "schedule_retransmit", new=AsyncMock(return_value=asyncio.create_task(_boom()))
+            ):
+                with pytest.raises(RuntimeError, match="simulated tx failure"):
+                    await handler(pkt, {"snr": 0.0, "rssi": -80}, local_transmission=True)
+
+        assert handler.forwarded_count == 0
+
+    async def test_rx_tx_failure_increments_dropped_count_and_preserves_accounting(self, handler):
+        """A graceful TX failure should count as dropped and keep counters balanced."""
+        handler.config["repeater"]["mode"] = "forward"
+        pkt = _make_flood_packet()
+        handler.rx_count = 0
+        handler.forwarded_count = 0
+        handler.dropped_count = 0
+
+        async def _tx_false():
+            return False
+
+        with patch.object(
+            handler, "schedule_retransmit", new=AsyncMock(return_value=asyncio.create_task(_tx_false()))
+        ):
+            transmitted = await handler(pkt, {"snr": 0.0, "rssi": -80}, local_transmission=False)
+
+        assert transmitted is False
+        assert handler.rx_count == 1
+        assert handler.forwarded_count == 0
+        assert handler.dropped_count == 1
+        assert handler.rx_count == handler.forwarded_count + handler.dropped_count
+
 
 # ===================================================================
 # 16. Airtime calculation correctness
@@ -1793,7 +1833,7 @@ class TestEngineTransmissionAndBackgroundLifecycle:
         with patch.object(handler, "_calculate_tx_delay", return_value=0.5):
             loop = asyncio.get_running_loop()
             completed = loop.create_future()
-            completed.set_result(None)
+            completed.set_result(True)
 
             async def _fake_schedule(packet, delay, airtime_ms, local_transmission=False):
                 packet._tx_metadata = {

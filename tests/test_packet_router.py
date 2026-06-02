@@ -46,7 +46,7 @@ from repeater.packet_router import (
 def _make_daemon():
     """Minimal daemon that satisfies PacketRouter without touching hardware."""
     daemon = MagicMock()
-    daemon.repeater_handler = AsyncMock(return_value=None)
+    daemon.repeater_handler = AsyncMock(return_value=True)
     daemon.trace_helper = None
     daemon.discovery_helper = None
     daemon.advert_helper = None
@@ -200,6 +200,19 @@ class TestInFlightCap(unittest.IsolatedAsyncioTestCase):
             daemon.trace_helper.process_trace_packet.assert_not_awaited()
         finally:
             await router.stop()
+
+    async def test_non_injected_handler_false_is_logged(self):
+        """Inbound packets should log when repeater_handler reports TX failure."""
+        daemon = _make_daemon()
+        daemon.repeater_handler = AsyncMock(return_value=False)
+        router = PacketRouter(daemon)
+        pkt = _make_packet(payload_type=0xFF)
+
+        with patch("repeater.packet_router.logger.warning") as mock_warn:
+            await router._route_packet(pkt)
+
+        daemon.repeater_handler.assert_awaited_once()
+        mock_warn.assert_called()
 
     # ── 3. Shutdown: in-flight tasks drained ────────────────────────────────
 
@@ -548,3 +561,70 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         b1.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_awaited_once()
+
+
+class TestInjectedTxRawEcho(unittest.IsolatedAsyncioTestCase):
+    """inject_packet echoes local TX to companion clients as raw RX (0x88)."""
+
+    async def test_inject_packet_echoes_raw_tx_to_companions(self):
+        """Successful local TX is pushed via _on_raw_rx_for_companions with snr=0/rssi=0."""
+        daemon = _make_daemon()
+        daemon._on_raw_rx_for_companions = AsyncMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet()
+        pkt.write_to.return_value = b"\x10\x20\x30"
+
+        ok = await router.inject_packet(pkt)
+
+        self.assertTrue(ok)
+        daemon._on_raw_rx_for_companions.assert_awaited_once_with(
+            b"\x10\x20\x30", 0, 0.0, exclude_hash=None
+        )
+
+    async def test_inject_packet_excludes_originating_companion(self):
+        """A companion's own TX is echoed with its hash excluded (no self-echo)."""
+        daemon = _make_daemon()
+        daemon._on_raw_rx_for_companions = AsyncMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet()
+        pkt.write_to.return_value = b"\xaa\xbb"
+
+        ok = await router.inject_packet(pkt, origin_hash="0x1a")
+
+        self.assertTrue(ok)
+        daemon._on_raw_rx_for_companions.assert_awaited_once_with(
+            b"\xaa\xbb", 0, 0.0, exclude_hash="0x1a"
+        )
+
+    async def test_inject_packet_no_echo_when_tx_fails(self):
+        """A failed local transmission must not echo a raw RX frame."""
+        daemon = _make_daemon()
+        daemon.repeater_handler = AsyncMock(return_value=False)
+        daemon._on_raw_rx_for_companions = AsyncMock()
+        router = PacketRouter(daemon)
+
+        ok = await router.inject_packet(_make_packet())
+
+        self.assertFalse(ok)
+        daemon._on_raw_rx_for_companions.assert_not_awaited()
+
+    async def test_inject_packet_survives_echo_failure(self):
+        """An error while echoing must not fail the injection."""
+        daemon = _make_daemon()
+        daemon._on_raw_rx_for_companions = AsyncMock(side_effect=RuntimeError("boom"))
+        router = PacketRouter(daemon)
+
+        ok = await router.inject_packet(_make_packet())
+
+        self.assertTrue(ok)
+        daemon._on_raw_rx_for_companions.assert_awaited_once()
+
+    async def test_inject_packet_without_echo_hook(self):
+        """Injection succeeds even if the daemon has no raw-RX companion hook."""
+        daemon = _make_daemon()
+        daemon._on_raw_rx_for_companions = None
+        router = PacketRouter(daemon)
+
+        ok = await router.inject_packet(_make_packet())
+
+        self.assertTrue(ok)
