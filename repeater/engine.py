@@ -23,6 +23,7 @@ from pymc_core.protocol.packet_utils import PacketHeaderUtils, PathUtils
 
 from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
+from repeater.policy_engine import PolicyDecision, PolicyEngine
 
 logger = logging.getLogger("RepeaterHandler")
 
@@ -65,6 +66,7 @@ class RepeaterHandler(BaseHandler):
         self.local_hash_bytes = local_hash_bytes or bytes([local_hash])
         self.send_advert_func = send_advert_func
         self.airtime_mgr = AirtimeManager(config)
+        self.policy_engine = PolicyEngine.from_runtime_config(config)
         self.seen_packets = OrderedDict()
         self.cache_ttl = max(
             300, config.get("repeater", {}).get("cache_ttl", 3600)
@@ -190,6 +192,38 @@ class RepeaterHandler(BaseHandler):
             mode = "forward"
         allow_forward = mode == "forward"
         allow_local_tx = mode != "no_tx"
+
+        policy_context = {
+            "route_type": route_type,
+            "payload_type": packet.get_payload_type()
+            if hasattr(packet, "get_payload_type")
+            else None,
+            "payload_length": len(packet.payload or b""),
+            "path_hash_size": packet.get_path_hash_size()
+            if hasattr(packet, "get_path_hash_size")
+            else None,
+            "hop_count": packet.get_path_hash_count()
+            if hasattr(packet, "get_path_hash_count")
+            else None,
+            "rssi": metadata.get("rssi", 0),
+            "snr": metadata.get("snr", 0.0),
+            "local_transmission": local_transmission,
+            "mode": mode,
+        }
+        prechecked_decision = metadata.get("_policy_precheck_decision")
+        if isinstance(prechecked_decision, PolicyDecision):
+            policy_decision = prechecked_decision
+        else:
+            policy_decision = self.policy_engine.evaluate(packet, policy_context)
+        policy_reason = None
+
+        if policy_decision.matched:
+            logger.info(policy_decision.reason)
+
+        if policy_decision.action == "drop":
+            allow_forward = False
+            allow_local_tx = False
+            policy_reason = self._policy_drop_reason(policy_decision)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -329,9 +363,9 @@ class RepeaterHandler(BaseHandler):
             self.dropped_count += 1
             # Determine drop reason
             if local_transmission and not allow_local_tx:
-                drop_reason = "No TX mode"
+                drop_reason = policy_reason or "No TX mode"
             elif not allow_forward:
-                drop_reason = "Repeat disabled"
+                drop_reason = policy_reason or "Repeat disabled"
             else:
                 # Check if packet has a specific drop reason set by handlers
                 drop_reason = processed_packet.drop_reason or self._get_drop_reason(
@@ -424,6 +458,12 @@ class RepeaterHandler(BaseHandler):
             self._append_recent_packet(packet_record)
 
         return transmitted
+
+    @staticmethod
+    def _policy_drop_reason(decision: PolicyDecision) -> str:
+        if decision.rule_id is None:
+            return "Policy blocked packet"
+        return f"Policy blocked packet (rule {decision.rule_id})"
 
     def log_trace_record(self, packet_record: dict) -> None:
         """Manually log a packet trace record (used by external callers)"""

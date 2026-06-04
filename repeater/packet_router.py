@@ -19,6 +19,8 @@ from pymc_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_DIRECT,
 )
 
+from repeater.policy_engine import PolicyDecision, PolicyEngine
+
 logger = logging.getLogger("PacketRouter")
 
 # Deliver PATH and protocol-response (PATH) to companion at most once per logical packet
@@ -187,6 +189,68 @@ class PacketRouter:
             return False
         self._companion_delivered[key] = now + _COMPANION_DEDUPE_TTL_SEC
         return True
+
+    def _policy_companion_decision(self, packet, metadata: dict) -> PolicyDecision | None:
+        """Return cached policy decision used to gate companion delivery.
+
+        Stores the pre-check decision in shared metadata so the repeater engine
+        can reuse it and avoid a second full policy evaluation pass.
+        """
+        handler = getattr(self.daemon, "repeater_handler", None)
+        if not handler:
+            return None
+        policy_engine = getattr(handler, "policy_engine", None)
+        if not isinstance(policy_engine, PolicyEngine) or not policy_engine.enabled:
+            return None
+
+        cached = metadata.get("_policy_precheck_decision")
+        if isinstance(cached, PolicyDecision):
+            return cached
+
+        mode = self.daemon.config.get("repeater", {}).get("mode", "forward")
+        route_type = getattr(packet, "header", 0) & PH_ROUTE_MASK
+        policy_context = {
+            "route_type": route_type,
+            "payload_type": packet.get_payload_type()
+            if hasattr(packet, "get_payload_type")
+            else None,
+            "payload_length": len(packet.payload or b""),
+            "path_hash_size": packet.get_path_hash_size()
+            if hasattr(packet, "get_path_hash_size")
+            else None,
+            "hop_count": packet.get_path_hash_count()
+            if hasattr(packet, "get_path_hash_count")
+            else None,
+            "rssi": metadata.get("rssi", getattr(packet, "rssi", 0)),
+            "snr": metadata.get("snr", getattr(packet, "snr", 0.0)),
+            "local_transmission": False,
+            "mode": mode,
+        }
+        decision = policy_engine.evaluate(packet, policy_context)
+        metadata["_policy_precheck_decision"] = decision
+        return decision
+
+    def _policy_blocks_companion(self, packet, metadata: dict) -> bool:
+        """Return True when policy action is drop, making companion suppression final."""
+        decision = self._policy_companion_decision(packet, metadata)
+        if not isinstance(decision, PolicyDecision):
+            return False
+        if decision.action == "drop":
+            logger.debug(
+                "Policy pre-check blocked companion delivery: rule %s action=drop",
+                decision.rule_id,
+            )
+            return True
+        return False
+
+    def _companion_bridges_for_packet(self, packet, metadata: dict) -> dict:
+        """Return companion bridges unless policy drop pre-check blocks delivery."""
+        companion_bridges = getattr(self.daemon, "companion_bridges", {})
+        if not companion_bridges:
+            return {}
+        if self._policy_blocks_companion(packet, metadata):
+            return {}
+        return companion_bridges
 
     def _record_for_ui(self, packet, metadata: dict) -> None:
         """Record an injection-only packet for the web UI (storage + recent_packets)."""
@@ -373,8 +437,10 @@ class PacketRouter:
                 rssi = getattr(packet, "rssi", 0)
                 snr = getattr(packet, "snr", 0.0)
                 await self.daemon.advert_helper.process_advert_packet(packet, rssi, snr)
-            # Also feed adverts to companion bridges (for contact/path updates)
-            for bridge in getattr(self.daemon, "companion_bridges", {}).values():
+            # Also feed adverts to companion bridges (for contact/path updates),
+            # but keep policy drop final just like the other companion paths.
+            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+            for bridge in companion_bridges.values():
                 try:
                     await bridge.process_received_packet(packet)
                 except Exception as e:
@@ -385,7 +451,7 @@ class PacketRouter:
             # When dest is remote (not handled), pass to engine so DIRECT/FLOOD ANON_REQ can be forwarded.
             # Our own injected ANON_REQ is suppressed by the engine's duplicate (mark_seen) check.
             dest_hash = packet.payload[0] if packet.payload else None
-            companion_bridges = getattr(self.daemon, "companion_bridges", {})
+            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             if dest_hash is not None and dest_hash in companion_bridges:
                 await companion_bridges[dest_hash].process_received_packet(packet)
                 processed_by_injection = True
@@ -399,7 +465,7 @@ class PacketRouter:
         elif payload_type == AckHandler.payload_type():
             # ACK has no dest in payload (4-byte CRC only); deliver to all bridges so sender sees send_confirmed.
             # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
-            companion_bridges = getattr(self.daemon, "companion_bridges", {})
+            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             for bridge in companion_bridges.values():
                 try:
                     await bridge.process_received_packet(packet)
@@ -408,7 +474,7 @@ class PacketRouter:
 
         elif payload_type == TextMessageHandler.payload_type():
             dest_hash = packet.payload[0] if packet.payload else None
-            companion_bridges = getattr(self.daemon, "companion_bridges", {})
+            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             if dest_hash is not None and dest_hash in companion_bridges:
                 await companion_bridges[dest_hash].process_received_packet(packet)
                 processed_by_injection = True
@@ -421,7 +487,7 @@ class PacketRouter:
 
         elif payload_type == PathHandler.payload_type():
             dest_hash = packet.payload[0] if packet.payload else None
-            companion_bridges = getattr(self.daemon, "companion_bridges", {})
+            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             if dest_hash is not None and dest_hash in companion_bridges:
                 if self._should_deliver_path_to_companions(packet):
                     await companion_bridges[dest_hash].process_received_packet(packet)
@@ -450,7 +516,7 @@ class PacketRouter:
             # to first hop instead of original requester).
             # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
             dest_hash = packet.payload[0] if packet.payload and len(packet.payload) >= 1 else None
-            companion_bridges = getattr(self.daemon, "companion_bridges", {})
+            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             local_hash = getattr(self.daemon, "local_hash", None)
             if dest_hash is not None and dest_hash in companion_bridges:
                 try:
@@ -496,7 +562,7 @@ class PacketRouter:
             # PAYLOAD_TYPE_PATH (0x08): protocol responses (telemetry, binary, etc.).
             # Deliver at most once per logical packet so the client is not spammed with duplicates.
             # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
-            companion_bridges = getattr(self.daemon, "companion_bridges", {})
+            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             if companion_bridges and self._should_deliver_path_to_companions(packet):
                 for bridge in companion_bridges.values():
                     try:
@@ -516,7 +582,7 @@ class PacketRouter:
 
         elif payload_type == ProtocolRequestHandler.payload_type():
             dest_hash = packet.payload[0] if packet.payload else None
-            companion_bridges = getattr(self.daemon, "companion_bridges", {})
+            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             if dest_hash is not None and dest_hash in companion_bridges:
                 await companion_bridges[dest_hash].process_received_packet(packet)
                 processed_by_injection = True
@@ -537,24 +603,21 @@ class PacketRouter:
                 self._record_for_ui(packet, metadata)
 
         elif payload_type == GroupTextHandler.payload_type():
-            # GRP_TXT: pass to all companions (they filter by channel); still forward
-            companion_bridges = getattr(self.daemon, "companion_bridges", {})
-            for bridge in companion_bridges.values():
-                try:
-                    await bridge.process_received_packet(packet)
-                except Exception as e:
-                    logger.debug(f"Companion bridge GRP_TXT error: {e}")
+            # GRP_TXT: pass to all companions (they filter by channel); still forward.
+            # Policy drop is final and blocks companion delivery.
+            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+            if companion_bridges:
+                for bridge in companion_bridges.values():
+                    try:
+                        await bridge.process_received_packet(packet)
+                    except Exception as e:
+                        logger.debug(f"Companion bridge GRP_TXT error: {e}")
 
         # Only pass to repeater engine if not already processed by injection
         # Skip engine for packets we injected for TX (already sent; avoid double-send/double-count)
         if getattr(packet, "_injected_for_tx", False):
             processed_by_injection = True
         if self.daemon.repeater_handler and not processed_by_injection:
-            metadata = {
-                "rssi": getattr(packet, "rssi", 0),
-                "snr": getattr(packet, "snr", 0.0),
-                "timestamp": getattr(packet, "timestamp", 0),
-            }
             sent = await self.daemon.repeater_handler(packet, metadata)
             if sent is False:
                 drop_reason = getattr(packet, "_repeater_drop_reason", None)

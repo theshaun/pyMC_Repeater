@@ -1,12 +1,14 @@
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
 import cherrypy
+import yaml
 from pymc_core.protocol import CryptoUtils
 
 from repeater import __version__
@@ -16,6 +18,7 @@ from repeater.companion.identity_resolve import (
     heal_companion_empty_names,
 )
 from repeater.config import resolve_storage_dir
+from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
 
 from .auth.middleware import require_auth
@@ -25,6 +28,14 @@ from .companion_endpoints import CompanionAPIEndpoints
 from .update_endpoints import UpdateAPIEndpoints
 
 logger = logging.getLogger("HTTPServer")
+
+POLICY_GROUP_KINDS = {
+    "channel_hash": "channel_hashes",
+    "channel_hashes": "channel_hashes",
+    "channels": "channel_hashes",
+    "pubkey": "pubkeys",
+    "pubkeys": "pubkeys",
+}
 
 
 # ============================================================================
@@ -45,6 +56,7 @@ logger = logging.getLogger("HTTPServer")
 # GET    /api/gps - Get local GPS diagnostics and parsed NMEA attributes
 # GET    /api/gps_stream - GPS diagnostics SSE stream
 # GET    /api/logs - Get system logs
+# GET    /api/logs_stream - Stream live system logs over SSE
 # GET    /api/hardware_stats - Get hardware statistics
 # GET    /api/hardware_processes - Get process information
 # GET    /api/validate_config - Validate config.yaml syntax and required settings
@@ -319,6 +331,623 @@ class APIEndpoints:
         }
         return has_default_name or has_default_password or radio_not_configured, reasons
 
+    def _default_policy_document(self) -> dict:
+        return {
+            "policy_engine": {
+                "enabled": False,
+                "default_action": "allow",
+                "rules": [],
+                "objects": {},
+            },
+            "groups": {
+                "channel_hashes": [],
+                "pubkeys": [],
+            },
+        }
+
+    @staticmethod
+    def _slugify_policy_id(value: str, fallback: str) -> str:
+        text = str(value or "").strip().lower()
+        text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+        return text or fallback
+
+    def _normalize_policy_group_kind(self, raw_kind) -> Optional[str]:
+        if raw_kind is None:
+            return None
+        key = str(raw_kind).strip().lower()
+        return POLICY_GROUP_KINDS.get(key)
+
+    def _normalize_pubkey_value(self, value) -> str:
+        if value is None:
+            raise ValueError("pubkey value is required")
+        if isinstance(value, bytes):
+            raw = value.hex()
+        else:
+            raw = str(value).strip().lower()
+        if raw.startswith("0x"):
+            raw = raw[2:]
+        raw = raw.replace(" ", "")
+        if not raw:
+            raise ValueError("pubkey value is required")
+        if not re.fullmatch(r"[0-9a-f]+", raw):
+            raise ValueError("pubkey must be hex")
+        if len(raw) % 2 != 0:
+            raise ValueError("pubkey hex length must be even")
+        return f"0x{raw}"
+
+    def _normalize_channel_hash_value(self, value) -> str:
+        if value is None:
+            raise ValueError("channel hash value is required")
+
+        if isinstance(value, int):
+            parsed = value
+        else:
+            raw = str(value).strip()
+            if not raw:
+                raise ValueError("channel hash value is required")
+            normalized_hex = raw[2:] if raw.lower().startswith("0x") else raw
+            if len(normalized_hex) in (32, 64) and re.fullmatch(r"[0-9a-fA-F]+", normalized_hex):
+                return f"0x{normalized_hex.upper()}"
+            if raw.lower().startswith("0x"):
+                parsed = int(raw, 16)
+            elif re.fullmatch(r"[0-9]+", raw):
+                parsed = int(raw, 10)
+            else:
+                parsed = int(raw, 16)
+
+        if parsed < 0:
+            raise ValueError("channel hash must be non-negative")
+        if parsed > 0xFF:
+            raise ValueError("channel hash must be one byte (0x00-0xFF)")
+        return f"0x{parsed:02X}"
+
+    def _normalize_policy_entry_value(self, kind: str, value) -> str:
+        if kind == "pubkeys":
+            return self._normalize_pubkey_value(value)
+        if kind == "channel_hashes":
+            return self._normalize_channel_hash_value(value)
+        raise ValueError(f"Unsupported group kind: {kind}")
+
+    def _normalize_policy_groups(self, groups_cfg: dict) -> dict:
+        normalized = {"channel_hashes": [], "pubkeys": []}
+
+        if not isinstance(groups_cfg, dict):
+            return normalized
+
+        for kind in ("channel_hashes", "pubkeys"):
+            source_groups = groups_cfg.get(kind)
+            if not isinstance(source_groups, list):
+                continue
+
+            seen_group_ids = set()
+            for idx, group in enumerate(source_groups):
+                if not isinstance(group, dict):
+                    continue
+                group_id = self._slugify_policy_id(
+                    group.get("id") or group.get("name") or group.get("friendly_name"),
+                    f"{kind}_{idx + 1}",
+                )
+                if group_id in seen_group_ids:
+                    continue
+                seen_group_ids.add(group_id)
+
+                friendly_name = str(group.get("friendly_name") or group.get("name") or group_id)
+                description = str(group.get("description") or "")
+                entries = []
+                seen_entry_ids = set()
+
+                for ent_idx, entry in enumerate(group.get("entries") or []):
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        entry_value = self._normalize_policy_entry_value(kind, entry.get("value"))
+                    except Exception:
+                        continue
+
+                    entry_id = self._slugify_policy_id(
+                        entry.get("id")
+                        or entry.get("name")
+                        or entry.get("friendly_name")
+                        or entry_value,
+                        f"entry_{ent_idx + 1}",
+                    )
+                    if entry_id in seen_entry_ids:
+                        continue
+                    seen_entry_ids.add(entry_id)
+
+                    entry_friendly_name = str(
+                        entry.get("friendly_name") or entry.get("name") or entry_id
+                    )
+                    entries.append(
+                        {
+                            "id": entry_id,
+                            "friendly_name": entry_friendly_name,
+                            "value": entry_value,
+                        }
+                    )
+
+                normalized[kind].append(
+                    {
+                        "id": group_id,
+                        "friendly_name": friendly_name,
+                        "description": description,
+                        "entries": entries,
+                    }
+                )
+
+        return normalized
+
+    def _policy_objects_from_groups(self, groups_cfg: dict) -> dict:
+        channel_hash_groups = {}
+        pubkey_groups = {}
+
+        for group in groups_cfg.get("channel_hashes", []):
+            channel_hash_groups[group["id"]] = [
+                entry["value"] for entry in group.get("entries", [])
+            ]
+
+        for group in groups_cfg.get("pubkeys", []):
+            pubkey_groups[group["id"]] = [entry["value"] for entry in group.get("entries", [])]
+
+        return {
+            "channel_hash_groups": channel_hash_groups,
+            "pubkey_groups": pubkey_groups,
+        }
+
+    def _write_policy_document(self, doc: dict) -> None:
+        policy_path = self._get_policy_file_path()
+        os.makedirs(os.path.dirname(policy_path), exist_ok=True)
+        with open(policy_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                doc,
+                f,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+                width=1000000,
+            )
+
+    def _sync_policy_engine_objects_from_groups(self, doc: dict) -> dict:
+        policy_engine_cfg = self._normalize_policy_engine(doc.get("policy_engine", {}))
+        groups_cfg = self._normalize_policy_groups(doc.get("groups", {}))
+
+        objects = policy_engine_cfg.get("objects", {})
+        if not isinstance(objects, dict):
+            objects = {}
+        objects.update(self._policy_objects_from_groups(groups_cfg))
+
+        policy_engine_cfg["objects"] = objects
+        doc["policy_engine"] = policy_engine_cfg
+        doc["groups"] = groups_cfg
+        return doc
+
+    def _get_policy_file_path(self) -> str:
+        policy_cfg = self.config.get("policy", {}) if isinstance(self.config, dict) else {}
+        policy_file = policy_cfg.get("policy_file", "policy.yaml")
+
+        config_dir = os.path.dirname(os.path.abspath(self._config_path))
+        if os.path.isabs(str(policy_file)):
+            return str(policy_file)
+        return os.path.abspath(os.path.join(config_dir, str(policy_file)))
+
+    def _load_policy_document(self) -> tuple[dict, bool]:
+        path = self._get_policy_file_path()
+        if not os.path.exists(path):
+            return self._default_policy_document(), False
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            if not isinstance(data, dict):
+                return self._default_policy_document(), False
+            if "policy_engine" not in data:
+                return {"policy_engine": data}, True
+            if not isinstance(data.get("policy_engine"), dict):
+                return self._default_policy_document(), False
+            return data, True
+        except Exception as e:
+            logger.error(f"Failed to load policy file {path}: {e}")
+            return self._default_policy_document(), False
+
+    @staticmethod
+    def _normalize_policy_engine(engine_cfg: dict) -> dict:
+        normalized = {
+            "enabled": bool(engine_cfg.get("enabled", False)),
+            "default_action": str(engine_cfg.get("default_action", "allow")),
+            "rules": engine_cfg.get("rules") if isinstance(engine_cfg.get("rules"), list) else [],
+            "objects": (
+                engine_cfg.get("objects") if isinstance(engine_cfg.get("objects"), dict) else {}
+            ),
+        }
+        return normalized
+
+    def _apply_policy_runtime(self, policy_engine_cfg: dict) -> None:
+        self.config["policy_engine"] = policy_engine_cfg
+        self.config["policy_file_path"] = self._get_policy_file_path()
+
+        if not self.daemon_instance:
+            return
+        repeater_handler = getattr(self.daemon_instance, "repeater_handler", None)
+        if not repeater_handler:
+            return
+        try:
+            repeater_handler.policy_engine = PolicyEngine.from_runtime_config(self.config)
+        except Exception as e:
+            logger.warning(f"Failed to apply runtime policy engine update: {e}")
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def policy(self, **kwargs):
+        """GET/POST policy.yaml next to config.yaml.
+
+        GET: returns policy document and file metadata.
+        POST: writes policy document and applies runtime policy engine refresh.
+        """
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        policy_path = self._get_policy_file_path()
+
+        if cherrypy.request.method == "GET":
+            doc, exists = self._load_policy_document()
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            normalized = self._normalize_policy_engine(doc.get("policy_engine", {}))
+            return self._success(
+                {
+                    "policy_file": policy_path,
+                    "exists": exists,
+                    "policy_engine": normalized,
+                    "groups": doc.get("groups", self._default_policy_document().get("groups", {})),
+                }
+            )
+
+        if cherrypy.request.method != "POST":
+            return self._error("Method not supported")
+
+        try:
+            self._require_post()
+            body = cherrypy.request.json or {}
+
+            if not isinstance(body, dict):
+                return self._error("Invalid payload: expected JSON object")
+
+            if isinstance(body.get("policy_engine"), dict):
+                policy_engine_cfg = body.get("policy_engine")
+            else:
+                # Allow posting the policy_engine object directly.
+                policy_engine_cfg = body
+
+            existing_doc, _ = self._load_policy_document()
+            groups_from_body = body.get("groups")
+            if groups_from_body is None:
+                normalized_groups = self._normalize_policy_groups(existing_doc.get("groups", {}))
+            else:
+                normalized_groups = self._normalize_policy_groups(groups_from_body)
+
+            normalized = self._normalize_policy_engine(policy_engine_cfg)
+            if "objects" not in policy_engine_cfg and isinstance(
+                existing_doc.get("policy_engine", {}).get("objects"), dict
+            ):
+                normalized["objects"] = dict(
+                    existing_doc.get("policy_engine", {}).get("objects", {})
+                )
+
+            doc_to_write = {
+                "policy_engine": normalized,
+                "groups": normalized_groups,
+            }
+            doc_to_write = self._sync_policy_engine_objects_from_groups(doc_to_write)
+            self._write_policy_document(doc_to_write)
+
+            # Validate via PolicyEngine construction and apply live.
+            PolicyEngine(doc_to_write.get("policy_engine", {}))
+            self._apply_policy_runtime(doc_to_write.get("policy_engine", {}))
+
+            logger.info("Policy updated and saved to %s", policy_path)
+            return self._success(
+                {
+                    "policy_file": policy_path,
+                    "policy_engine": doc_to_write.get("policy_engine", {}),
+                    "groups": doc_to_write.get("groups", {}),
+                },
+                message="Policy updated and applied",
+                restart_required=False,
+            )
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating policy: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def policy_validate(self):
+        """Validate policy payload without saving it."""
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            body = cherrypy.request.json or {}
+            if not isinstance(body, dict):
+                return self._error("Invalid payload: expected JSON object")
+
+            if isinstance(body.get("policy_engine"), dict):
+                policy_engine_cfg = body.get("policy_engine")
+            else:
+                policy_engine_cfg = body
+
+            normalized = self._normalize_policy_engine(policy_engine_cfg)
+            engine = PolicyEngine(normalized)
+
+            return self._success(
+                {
+                    "valid": True,
+                    "normalized": normalized,
+                    "effective": {
+                        "enabled": engine.enabled,
+                        "default_action": engine.default_action,
+                        "rule_count": len(engine.rules),
+                    },
+                }
+            )
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Policy validation failed: {e}")
+            return self._success({"valid": False, "error": str(e)})
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in(force=False)
+    def policy_groups(self, **kwargs):
+        """Manage policy groups for channel hashes and pubkeys."""
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        if cherrypy.request.method == "GET":
+            kind = self._normalize_policy_group_kind(cherrypy.request.params.get("kind"))
+            if cherrypy.request.params.get("kind") and not kind:
+                return self._error("Invalid kind. Use 'channel_hashes' or 'pubkeys'")
+
+            doc, exists = self._load_policy_document()
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            groups = doc.get("groups", self._default_policy_document().get("groups", {}))
+
+            data = {
+                "policy_file": self._get_policy_file_path(),
+                "exists": exists,
+                "kind": kind,
+                "groups": groups[kind] if kind else groups,
+            }
+            return self._success(data)
+
+        if cherrypy.request.method not in ("POST", "DELETE"):
+            return self._error("Method not supported")
+
+        try:
+            body = cherrypy.request.json or {}
+            if not isinstance(body, dict):
+                body = {}
+
+            request_params = getattr(cherrypy.request, "params", {}) or {}
+            kind = self._normalize_policy_group_kind(body.get("kind") or request_params.get("kind"))
+            if not kind:
+                return self._error("Invalid kind. Use 'channel_hashes' or 'pubkeys'")
+
+            group_id = self._slugify_policy_id(
+                body.get("group_id")
+                or request_params.get("group_id")
+                or body.get("id")
+                or body.get("name")
+                or body.get("friendly_name"),
+                "group",
+            )
+
+            doc, _ = self._load_policy_document()
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            groups = doc.get("groups", self._default_policy_document().get("groups", {}))
+            group_list = groups.get(kind, [])
+
+            existing_group = next((g for g in group_list if g.get("id") == group_id), None)
+
+            if cherrypy.request.method == "POST":
+                if existing_group:
+                    return self._error(f"Group already exists: {group_id}")
+
+                friendly_name = str(body.get("friendly_name") or body.get("name") or group_id)
+                description = str(body.get("description") or "")
+                new_group = {
+                    "id": group_id,
+                    "friendly_name": friendly_name,
+                    "description": description,
+                    "entries": [],
+                }
+                group_list.append(new_group)
+
+                groups[kind] = group_list
+                doc["groups"] = self._normalize_policy_groups(groups)
+                doc = self._sync_policy_engine_objects_from_groups(doc)
+                self._write_policy_document(doc)
+                self._apply_policy_runtime(doc.get("policy_engine", {}))
+
+                return self._success(
+                    {
+                        "kind": kind,
+                        "group": new_group,
+                        "groups": doc.get("groups", {}),
+                    },
+                    message="Policy group created",
+                    restart_required=False,
+                )
+
+            if not existing_group:
+                return self._error(f"Group not found: {group_id}")
+
+            group_list = [g for g in group_list if g.get("id") != group_id]
+            groups[kind] = group_list
+            doc["groups"] = self._normalize_policy_groups(groups)
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            self._write_policy_document(doc)
+            self._apply_policy_runtime(doc.get("policy_engine", {}))
+
+            return self._success(
+                {
+                    "kind": kind,
+                    "group_id": group_id,
+                    "groups": doc.get("groups", {}),
+                },
+                message="Policy group deleted",
+                restart_required=False,
+            )
+        except Exception as e:
+            logger.error(f"Error managing policy groups: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in(force=False)
+    def policy_group_entries(self, **kwargs):
+        """Manage entries inside policy groups."""
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        if cherrypy.request.method == "GET":
+            kind = self._normalize_policy_group_kind(cherrypy.request.params.get("kind"))
+            if not kind:
+                return self._error("Invalid kind. Use 'channel_hashes' or 'pubkeys'")
+
+            group_id = self._slugify_policy_id(cherrypy.request.params.get("group_id"), "group")
+            doc, _ = self._load_policy_document()
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            groups = doc.get("groups", self._default_policy_document().get("groups", {}))
+            group = next((g for g in groups.get(kind, []) if g.get("id") == group_id), None)
+            if not group:
+                return self._error(f"Group not found: {group_id}")
+
+            return self._success(
+                {
+                    "kind": kind,
+                    "group": group,
+                    "entries": group.get("entries", []),
+                }
+            )
+
+        if cherrypy.request.method not in ("POST", "DELETE"):
+            return self._error("Method not supported")
+
+        try:
+            body = cherrypy.request.json or {}
+            if not isinstance(body, dict):
+                body = {}
+
+            request_params = getattr(cherrypy.request, "params", {}) or {}
+            kind = self._normalize_policy_group_kind(body.get("kind") or request_params.get("kind"))
+            if not kind:
+                return self._error("Invalid kind. Use 'channel_hashes' or 'pubkeys'")
+
+            group_id = self._slugify_policy_id(
+                body.get("group_id") or request_params.get("group_id") or body.get("group"),
+                "group",
+            )
+
+            doc, _ = self._load_policy_document()
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            groups = doc.get("groups", self._default_policy_document().get("groups", {}))
+            group = next((g for g in groups.get(kind, []) if g.get("id") == group_id), None)
+            if not group:
+                return self._error(f"Group not found: {group_id}")
+
+            entries = list(group.get("entries", []))
+
+            if cherrypy.request.method == "POST":
+                entry_value = self._normalize_policy_entry_value(kind, body.get("value"))
+                if any(entry.get("value") == entry_value for entry in entries):
+                    return self._error(f"Entry already exists in group: {entry_value}")
+
+                entry_id = self._slugify_policy_id(
+                    body.get("entry_id")
+                    or body.get("id")
+                    or body.get("name")
+                    or body.get("friendly_name")
+                    or entry_value,
+                    "entry",
+                )
+                if any(entry.get("id") == entry_id for entry in entries):
+                    return self._error(f"Entry id already exists in group: {entry_id}")
+
+                new_entry = {
+                    "id": entry_id,
+                    "friendly_name": str(body.get("friendly_name") or body.get("name") or entry_id),
+                    "value": entry_value,
+                }
+                entries.append(new_entry)
+                group["entries"] = entries
+
+                doc["groups"] = self._normalize_policy_groups(groups)
+                doc = self._sync_policy_engine_objects_from_groups(doc)
+                self._write_policy_document(doc)
+                self._apply_policy_runtime(doc.get("policy_engine", {}))
+
+                return self._success(
+                    {
+                        "kind": kind,
+                        "group_id": group_id,
+                        "entry": new_entry,
+                        "group": group,
+                    },
+                    message="Policy group entry added",
+                    restart_required=False,
+                )
+
+            entry_id = body.get("entry_id") or request_params.get("entry_id") or body.get("id")
+            value = body.get("value") or request_params.get("value")
+            if not entry_id and value is None:
+                return self._error("Provide entry_id or value")
+
+            if value is not None:
+                value = self._normalize_policy_entry_value(kind, value)
+
+            filtered_entries = []
+            removed = None
+            for entry in entries:
+                if entry_id and entry.get("id") == entry_id:
+                    removed = entry
+                    continue
+                if value is not None and entry.get("value") == value:
+                    removed = entry
+                    continue
+                filtered_entries.append(entry)
+
+            if removed is None:
+                return self._error("Entry not found")
+
+            group["entries"] = filtered_entries
+            doc["groups"] = self._normalize_policy_groups(groups)
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            self._write_policy_document(doc)
+            self._apply_policy_runtime(doc.get("policy_engine", {}))
+
+            return self._success(
+                {
+                    "kind": kind,
+                    "group_id": group_id,
+                    "removed": removed,
+                    "group": group,
+                },
+                message="Policy group entry removed",
+                restart_required=False,
+            )
+        except Exception as e:
+            logger.error(f"Error managing policy group entries: {e}", exc_info=True)
+            return self._error(str(e))
+
     # ============================================================================
     # SETUP WIZARD ENDPOINTS
     # ============================================================================
@@ -329,8 +958,6 @@ class APIEndpoints:
         """Check if the repeater needs initial setup configuration"""
         try:
             # Prefer the on-disk config so this reflects current persisted state.
-            import yaml
-
             config = self.config
             config_path = getattr(self, "_config_path", None)
             try:
@@ -487,8 +1114,6 @@ class APIEndpoints:
         try:
             self._require_post()
             data = cherrypy.request.json
-
-            import yaml
 
             # Setup wizard is first-run only. After setup, use /auth/change_password
             # and /api/update_radio_config for subsequent changes.
@@ -1560,8 +2185,6 @@ class APIEndpoints:
             raise cherrypy.HTTPError(405, "Method not allowed. This endpoint requires GET.")
 
         try:
-            import yaml
-
             errors = []
             warnings = []
 
@@ -1866,16 +2489,22 @@ class APIEndpoints:
         from .http_server import _log_buffer
 
         try:
-            logs = list(_log_buffer.logs)
+            if hasattr(_log_buffer, "snapshot"):
+                logs = _log_buffer.snapshot()
+            else:
+                logs = list(getattr(_log_buffer, "logs", []))
             return {
                 "logs": (
                     logs
                     if logs
                     else [
                         {
+                            "id": 0,
                             "message": "No logs available",
                             "timestamp": datetime.now().isoformat(),
                             "level": "INFO",
+                            "logger": "HTTPServer",
+                            "raw_message": "No logs available",
                         }
                     ]
                 )
@@ -1883,6 +2512,89 @@ class APIEndpoints:
         except Exception as e:
             logger.error(f"Error fetching logs: {e}")
             return {"error": str(e), "logs": []}
+
+    @cherrypy.expose
+    def logs_stream(self, since_id: Optional[str] = None):
+        from .http_server import _log_buffer
+
+        cherrypy.response.headers["Content-Type"] = "text/event-stream"
+        cherrypy.response.headers["Cache-Control"] = "no-cache"
+        cherrypy.response.headers["Connection"] = "keep-alive"
+        cherrypy.response.headers["X-Accel-Buffering"] = "no"
+
+        if since_id is None:
+            since_id = cherrypy.request.headers.get("Last-Event-ID")
+
+        try:
+            cursor = int(since_id) if since_id is not None else None
+        except (TypeError, ValueError):
+            cursor = None
+
+        def encode_event(payload, event_name: Optional[str] = None, event_id: Optional[int] = None):
+            lines = []
+            if event_name:
+                lines.append(f"event: {event_name}")
+            if event_id is not None:
+                lines.append(f"id: {event_id}")
+            lines.append(f"data: {json.dumps(payload, default=str)}")
+            return "\n".join(lines) + "\n\n"
+
+        def generate():
+            subscriber = _log_buffer.subscribe()
+            last_sent_id = cursor
+            current_snapshot = _log_buffer.snapshot()
+
+            try:
+                yield encode_event(
+                    {
+                        "type": "connected",
+                        "message": "Connected to logs stream",
+                        "latest_id": current_snapshot[-1]["id"] if current_snapshot else 0,
+                    },
+                    event_name="connected",
+                )
+
+                backlog = _log_buffer.snapshot(since_id=cursor)
+                for entry in backlog:
+                    last_sent_id = entry.get("id", last_sent_id)
+                    yield encode_event(
+                        {"type": "log", "entry": entry}, event_name="log", event_id=entry.get("id")
+                    )
+
+                while True:
+                    try:
+                        entry = subscriber.get(timeout=15.0)
+                    except Exception:
+                        yield encode_event(
+                            {"type": "keepalive"}, event_name="keepalive", event_id=last_sent_id
+                        )
+                        continue
+
+                    entry_id = entry.get("id")
+                    if (
+                        last_sent_id is not None
+                        and entry_id is not None
+                        and entry_id <= last_sent_id
+                    ):
+                        continue
+
+                    last_sent_id = entry_id
+                    yield encode_event(
+                        {"type": "log", "entry": entry}, event_name="log", event_id=entry_id
+                    )
+            except GeneratorExit:
+                logger.debug("Logs SSE stream closed by client")
+            except Exception as exc:
+                logger.error(f"Error serving logs stream: {exc}", exc_info=True)
+                yield encode_event(
+                    {"type": "error", "error": str(exc)}, event_name="error", event_id=last_sent_id
+                )
+            finally:
+                _log_buffer.unsubscribe(subscriber)
+
+        return generate()
+
+    logs_stream._cp_config = {"response.stream": True}
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -2312,6 +3024,7 @@ class APIEndpoints:
                 "rx_count": "Received Packets",
                 "tx_count": "Transmitted Packets",
                 "drop_count": "Dropped Packets",
+                "policy_events": "Policy Events",
                 "avg_rssi": "Average RSSI (dBm)",
                 "avg_snr": "Average SNR (dB)",
                 "avg_length": "Average Packet Length",
@@ -2325,11 +3038,37 @@ class APIEndpoints:
                 requested_metrics = [m.strip() for m in metrics.split(",")]
             else:
                 requested_metrics = list(rrd_data["metrics"].keys())
+                requested_metrics.append("policy_events")
 
             timestamps_ms = [ts * 1000 for ts in rrd_data["timestamps"]]
             series = []
 
             for metric_key in requested_metrics:
+                if metric_key == "policy_events":
+                    bucket_seconds = max(1, int(rrd_data.get("step", 60)))
+                    policy_rows = self._get_storage().get_policy_event_counts(
+                        start_timestamp=rrd_data["start_time"],
+                        end_timestamp=rrd_data["end_time"],
+                        bucket_seconds=bucket_seconds,
+                    )
+                    policy_by_bucket = {
+                        int(row.get("timestamp", 0)): int(row.get("count", 0))
+                        for row in policy_rows
+                    }
+                    chart_data = []
+                    for ts in rrd_data["timestamps"]:
+                        bucket_ts = int(ts / bucket_seconds) * bucket_seconds
+                        chart_data.append([ts * 1000, policy_by_bucket.get(bucket_ts, 0)])
+
+                    series.append(
+                        {
+                            "name": metric_names["policy_events"],
+                            "type": "policy_events",
+                            "data": chart_data,
+                        }
+                    )
+                    continue
+
                 if metric_key in rrd_data["metrics"]:
                     if metric_key in counter_metrics:
                         chart_data = self._process_counter_data(

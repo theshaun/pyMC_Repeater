@@ -6,7 +6,65 @@ from typing import Any, Dict, Optional, overload
 
 import yaml
 
+from repeater.policy_engine import default_policy_engine_config
+
 logger = logging.getLogger("Config")
+
+
+def _resolve_policy_config_path(config: Dict[str, Any], config_path: str) -> Path:
+    policy_section = config.get("policy", {}) if isinstance(config.get("policy"), dict) else {}
+    configured = policy_section.get("policy_file") or "policy.yaml"
+
+    base_dir = Path(config_path).expanduser().resolve().parent
+    p = Path(str(configured)).expanduser()
+    if not p.is_absolute():
+        p = (base_dir / p).resolve()
+    return p
+
+
+def _load_policy_engine_config(config: Dict[str, Any], config_path: str) -> Dict[str, Any]:
+    policy_path = _resolve_policy_config_path(config, config_path)
+    defaults = default_policy_engine_config()
+
+    if not policy_path.exists():
+        logger.info("Policy file not found at %s, policy engine disabled", policy_path)
+        config["policy_engine"] = defaults
+        config["policy_file_path"] = str(policy_path)
+        return config
+
+    try:
+        with open(policy_path) as f:
+            loaded = yaml.safe_load(f) or {}
+
+        if isinstance(loaded, dict) and isinstance(loaded.get("policy_engine"), dict):
+            policy_cfg = loaded.get("policy_engine")
+        elif isinstance(loaded, dict):
+            policy_cfg = loaded
+        else:
+            policy_cfg = {}
+
+        merged = dict(defaults)
+        if isinstance(policy_cfg, dict):
+            merged.update(policy_cfg)
+
+        if not isinstance(merged.get("rules"), list):
+            merged["rules"] = []
+        if not isinstance(merged.get("objects"), dict):
+            merged["objects"] = {}
+
+        config["policy_engine"] = merged
+        config["policy_file_path"] = str(policy_path)
+        logger.info("Loaded policy config from %s", policy_path)
+        return config
+    except Exception as e:
+        logger.warning(
+            "Failed to load policy config from %s: %s. Policy engine disabled.",
+            policy_path,
+            e,
+        )
+        config["policy_engine"] = defaults
+        config["policy_file_path"] = str(policy_path)
+        return config
 
 
 class NullRadio:
@@ -206,6 +264,8 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         if "logging" not in config:
             config["logging"] = {}
         config["logging"]["level"] = os.getenv("PYMC_REPEATER_LOG_LEVEL")
+
+    config = _load_policy_engine_config(config, config_path)
 
     return config
 

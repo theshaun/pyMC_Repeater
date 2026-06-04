@@ -310,6 +310,18 @@ class StorageCollector:
     def get_crc_error_history(self, hours: int = 24, limit: int = None) -> list:
         return self.sqlite_handler.get_crc_error_history(hours, limit)
 
+    def get_policy_event_counts(
+        self,
+        start_timestamp: float,
+        end_timestamp: float,
+        bucket_seconds: int = 60,
+    ) -> list:
+        return self.sqlite_handler.get_policy_event_counts(
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            bucket_seconds=bucket_seconds,
+        )
+
     def get_packet_stats(self, hours: int = 24) -> dict:
         return self.sqlite_handler.get_packet_stats(hours)
 

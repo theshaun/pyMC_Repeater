@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import queue
 import secrets
+import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -43,25 +45,78 @@ class LogBuffer(logging.Handler):
     def __init__(self, max_lines=100):
         super().__init__()
         self.logs = deque(maxlen=max_lines)
+        self._next_id = 1
+        self._lock = threading.Lock()
+        self._subscribers = []
         self.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 
     def emit(self, record):
 
         try:
-            msg = self.format(record)
-            self.logs.append(
-                {
-                    "message": msg,
-                    "timestamp": datetime.fromtimestamp(record.created).isoformat(),
-                    "level": record.levelname,
-                }
-            )
+            formatted_message = self.format(record)
+            entry = {
+                "id": self._next_log_id(),
+                "message": formatted_message,
+                "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+                "level": record.levelname,
+                "logger": record.name,
+                "raw_message": record.getMessage(),
+                "module": record.module,
+                "pathname": record.pathname,
+                "line": record.lineno,
+                "thread": record.threadName,
+                "process": record.processName,
+            }
+
+            if record.exc_info:
+                entry["exception"] = self.formatException(record.exc_info)
+
+            with self._lock:
+                self.logs.append(entry)
+                dead_subscribers = []
+                for subscriber in self._subscribers:
+                    try:
+                        subscriber.put_nowait(entry)
+                    except Exception:
+                        dead_subscribers.append(subscriber)
+
+                if dead_subscribers:
+                    self._subscribers = [
+                        subscriber
+                        for subscriber in self._subscribers
+                        if subscriber not in dead_subscribers
+                    ]
         except Exception:
             self.handleError(record)
 
+    def _next_log_id(self):
+        with self._lock:
+            next_id = self._next_id
+            self._next_id += 1
+            return next_id
+
+    def snapshot(self, since_id=None):
+        with self._lock:
+            records = list(self.logs)
+
+        if since_id is None:
+            return records
+
+        return [record for record in records if record.get("id", 0) > since_id]
+
+    def subscribe(self):
+        subscriber = queue.Queue()
+        with self._lock:
+            self._subscribers.append(subscriber)
+        return subscriber
+
+    def unsubscribe(self, subscriber):
+        with self._lock:
+            self._subscribers = [item for item in self._subscribers if item is not subscriber]
+
 
 # Global log buffer instance
-_log_buffer = LogBuffer(max_lines=100)
+_log_buffer = LogBuffer(max_lines=1000)
 
 
 class DocEndpoint:

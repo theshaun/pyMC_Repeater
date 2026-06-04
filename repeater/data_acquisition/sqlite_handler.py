@@ -860,6 +860,47 @@ class SQLiteHandler:
             logger.error(f"Failed to get CRC error history: {e}")
             return []
 
+    def get_policy_event_counts(
+        self,
+        start_timestamp: float,
+        end_timestamp: float,
+        bucket_seconds: int = 60,
+    ) -> list:
+        """Return policy-blocked packet counts grouped by bucket timestamp.
+
+        A policy event is represented by a packet drop reason that starts with
+        "Policy blocked packet".
+        """
+        try:
+            bucket_seconds = max(1, int(bucket_seconds))
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT
+                        CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+                        COUNT(*) AS count
+                    FROM packets
+                    WHERE timestamp >= ?
+                      AND timestamp <= ?
+                      AND drop_reason LIKE 'Policy blocked packet%'
+                    GROUP BY bucket_ts
+                    ORDER BY bucket_ts ASC
+                    """,
+                    (bucket_seconds, bucket_seconds, start_timestamp, end_timestamp),
+                ).fetchall()
+
+                return [
+                    {
+                        "timestamp": int(row["bucket_ts"]),
+                        "count": int(row["count"]),
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.error(f"Failed to get policy event counts: {e}")
+            return []
+
     def get_packet_stats(self, hours: int = 24) -> dict:
         try:
             now = time.time()

@@ -494,6 +494,26 @@ paths:
                   error:
                     type: string
 
+  /logs_stream:
+    get:
+      tags: [System]
+      summary: Stream system logs
+      description: Server-Sent Events stream of live system log entries.
+      parameters:
+        - name: since_id
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Resume the stream after this log entry id.
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
   /hardware_stats:
     get:
       tags: [System]
@@ -1564,6 +1584,275 @@ paths:
                     type: string
                   error:
                     type: string
+
+  /policy:
+    get:
+      tags: [Network Policy]
+      summary: Get policy document
+      description: Returns normalized policy engine configuration and grouped channel hash/pubkey entries.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Policy document
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      policy_file:
+                        type: string
+                      exists:
+                        type: boolean
+                      policy_engine:
+                        type: object
+                      groups:
+                        type: object
+    post:
+      tags: [Network Policy]
+      summary: Update policy document
+      description: Update policy_engine configuration while preserving or replacing named groups.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Accepts either root-level policy_engine fields or a nested policy_engine object.
+      responses:
+        '200':
+          description: Policy updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /policy_validate:
+    post:
+      tags: [Network Policy]
+      summary: Validate policy payload
+      description: Validate a policy payload without saving it to disk.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      valid:
+                        type: boolean
+                      normalized:
+                        type: object
+                      effective:
+                        type: object
+
+  /policy_groups:
+    get:
+      tags: [Network Policy]
+      summary: List policy groups
+      description: List named channel hash and pubkey groups.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: kind
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [channel_hashes, pubkeys]
+          description: Optional group kind filter.
+      responses:
+        '200':
+          description: Policy groups
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+    post:
+      tags: [Network Policy]
+      summary: Create policy group
+      description: Create a named group for channel hashes or pubkeys.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind:
+                  type: string
+                  enum: [channel_hashes, pubkeys]
+                group_id:
+                  type: string
+                friendly_name:
+                  type: string
+                description:
+                  type: string
+      responses:
+        '200':
+          description: Group created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+    delete:
+      tags: [Network Policy]
+      summary: Delete policy group
+      description: Delete a named group and all of its entries.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, group_id]
+              properties:
+                kind:
+                  type: string
+                  enum: [channel_hashes, pubkeys]
+                group_id:
+                  type: string
+      responses:
+        '200':
+          description: Group deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /policy_group_entries:
+    get:
+      tags: [Network Policy]
+      summary: List group entries
+      description: Return entries for a specific named channel hash/pubkey group.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: kind
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [channel_hashes, pubkeys]
+        - name: group_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Group entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+    post:
+      tags: [Network Policy]
+      summary: Add group entry
+      description: Add a friendly-named entry to a policy group.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, group_id, value]
+              properties:
+                kind:
+                  type: string
+                  enum: [channel_hashes, pubkeys]
+                group_id:
+                  type: string
+                value:
+                  type: string
+                entry_id:
+                  type: string
+                friendly_name:
+                  type: string
+      responses:
+        '200':
+          description: Entry added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+    delete:
+      tags: [Network Policy]
+      summary: Remove group entry
+      description: Remove an entry by entry_id or value from a policy group.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, group_id]
+              properties:
+                kind:
+                  type: string
+                  enum: [channel_hashes, pubkeys]
+                group_id:
+                  type: string
+                entry_id:
+                  type: string
+                value:
+                  type: string
+      responses:
+        '200':
+          description: Entry removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
 
   # ============================================================================
   # Identity Management

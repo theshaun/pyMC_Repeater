@@ -1441,6 +1441,42 @@ def test_noise_floor_and_crc_endpoints(cherrypy_ctx):
     assert err["success"] is False
 
 
+def test_metrics_graph_data_includes_policy_events(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    storage = SimpleNamespace(
+        get_rrd_data=MagicMock(
+            return_value={
+                "start_time": 100,
+                "end_time": 220,
+                "step": 60,
+                "timestamps": [100, 160, 220],
+                "metrics": {
+                    "rx_count": [10, 12, 15],
+                    "tx_count": [8, 9, 11],
+                },
+            }
+        ),
+        get_policy_event_counts=MagicMock(
+            return_value=[
+                {"timestamp": 60, "count": 1},
+                {"timestamp": 120, "count": 3},
+                {"timestamp": 180, "count": 2},
+            ]
+        ),
+    )
+    _attach_storage(api, storage)
+
+    out = api.metrics_graph_data(hours="24", resolution="average", metrics="rx_count,policy_events")
+    assert out["success"] is True
+
+    series_by_type = {item["type"]: item for item in out["data"]["series"]}
+    assert "rx_count" in series_by_type
+    assert "policy_events" in series_by_type
+    assert series_by_type["policy_events"]["name"] == "Policy Events"
+    assert series_by_type["policy_events"]["data"] == [[100000, 1], [160000, 3], [220000, 2]]
+
+
 def test_advert_contact_and_rate_limit_stats_endpoints(cherrypy_ctx):
     del cherrypy_ctx
     api = _make_api()

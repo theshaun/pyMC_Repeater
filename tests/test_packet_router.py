@@ -37,6 +37,7 @@ from repeater.packet_router import (
     _companion_dedup_key,
     _is_direct_final_hop,
 )
+from repeater.policy_engine import PolicyEngine
 
 # ---------------------------------------------------------------------------
 # Minimal daemon stub
@@ -78,6 +79,45 @@ def _make_bridge():
     bridge = MagicMock()
     bridge.process_received_packet = AsyncMock()
     return bridge
+
+
+class _SlottedPacket:
+    __slots__ = (
+        "payload",
+        "header",
+        "rssi",
+        "snr",
+        "timestamp",
+        "_injected_for_tx",
+        "path",
+        "calculate_packet_hash",
+        "mark_do_not_retransmit",
+        "_payload_type",
+    )
+
+    def __init__(self, payload_type: int = 1):
+        self.payload = b"\x00"
+        self.header = 0x00
+        self.rssi = -80
+        self.snr = 5.0
+        self.timestamp = time.time()
+        self._injected_for_tx = False
+        self.path = bytearray()
+        self.calculate_packet_hash = MagicMock(return_value=b"\x01" * 32)
+        self.mark_do_not_retransmit = MagicMock()
+        self._payload_type = payload_type
+
+    def get_payload_type(self):
+        return self._payload_type
+
+    def get_path_hash_size(self):
+        return 0
+
+    def get_path_hash_count(self):
+        return 0
+
+    def get_path_hashes_hex(self):
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +240,44 @@ class TestInFlightCap(unittest.IsolatedAsyncioTestCase):
             daemon.trace_helper.process_trace_packet.assert_not_awaited()
         finally:
             await router.stop()
+
+    async def test_policy_companion_precheck_handles_slotted_packet(self):
+        """Policy companion precheck must not attach attributes to slotted Packet objects."""
+        daemon = _make_daemon()
+        daemon.companion_bridges = {"bridge": _make_bridge()}
+        daemon.repeater_handler.policy_engine = PolicyEngine({"enabled": True, "rules": []})
+        router = PacketRouter(daemon)
+        pkt = _SlottedPacket(payload_type=1)
+        metadata = {"rssi": pkt.rssi, "snr": pkt.snr}
+
+        bridges = router._companion_bridges_for_packet(pkt, metadata)
+
+        self.assertEqual(bridges, daemon.companion_bridges)
+        self.assertIn("_policy_precheck_decision", metadata)
+
+    async def test_route_grp_txt_reuses_policy_precheck_metadata(self):
+        """GRP_TXT should not force a second policy evaluation when the router already pre-checked it."""
+        daemon = _make_daemon()
+        daemon.repeater_handler = AsyncMock(return_value=True)
+        daemon.repeater_handler.storage = MagicMock()
+        daemon.repeater_handler.record_packet_only = MagicMock()
+        daemon.repeater_handler.policy_engine = PolicyEngine({"enabled": True, "rules": []})
+        evaluate_spy = patch.object(
+            daemon.repeater_handler.policy_engine,
+            "evaluate",
+            wraps=daemon.repeater_handler.policy_engine.evaluate,
+        )
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(GroupTextHandler.payload_type())
+
+        with evaluate_spy as mock_evaluate:
+            await router._route_packet(pkt)
+
+        self.assertEqual(mock_evaluate.call_count, 1)
+        bridge.process_received_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_awaited_once()
 
     async def test_non_injected_handler_false_is_logged(self):
         """Inbound packets should log when repeater_handler reports TX failure."""
@@ -475,6 +553,27 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         daemon.advert_helper.process_advert_packet.assert_awaited_once()
         bridge.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_advert_policy_drop_blocks_companion_delivery(self):
+        daemon = _make_daemon()
+        daemon.advert_helper = MagicMock()
+        daemon.advert_helper.process_advert_packet = AsyncMock()
+        daemon.repeater_handler.policy_engine = PolicyEngine(
+            {
+                "enabled": True,
+                "default_action": "drop",
+                "rules": [],
+            }
+        )
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0x42: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(AdvertHandler.payload_type())
+
+        await router._route_packet(pkt)
+
+        daemon.advert_helper.process_advert_packet.assert_awaited_once()
+        bridge.process_received_packet.assert_not_awaited()
 
     async def test_route_login_server_to_companion_marks_processed(self):
         daemon = _make_daemon()

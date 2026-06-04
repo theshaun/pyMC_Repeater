@@ -122,6 +122,11 @@ repeater:
     # Controls how long users stay logged in before needing to re-authenticate
     jwt_expiry_minutes: 60
 
+# Policy engine configuration file.
+# Relative paths are resolved from this config file directory.
+policy:
+  policy_file: "policy.yaml"
+
 # Local GPS receiver. When enabled, the daemon reads NMEA sentences from the
 # configured source and exposes parsed data at /api/gps.
 gps:
