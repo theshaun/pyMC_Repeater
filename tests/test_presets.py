@@ -76,7 +76,7 @@ def test_get_preset_letsmesh_carries_ui_metadata():
 
 
 def test_get_preset_meshmapper_is_single_broker_mc2mqtt():
-    """MeshMapper preset is a single MC2MQTT broker on mqtt.meshmapper.cc.
+    """MeshMapper preset is a single MC2MQTT broker on mqtt.meshmapper.net.
 
     The preset intentionally re-uses the `letsmesh` format value because
     MeshMapper today speaks the standard MC2MQTT wire format with no
@@ -89,8 +89,8 @@ def test_get_preset_meshmapper_is_single_broker_mc2mqtt():
     brokers = preset.get("brokers", [])
     assert len(brokers) == 1
     broker = brokers[0]
-    assert broker["host"] == "mqtt.meshmapper.cc"
-    assert broker["audience"] == "mqtt.meshmapper.cc"
+    assert broker["host"] == "mqtt.meshmapper.net"
+    assert broker["audience"] == "mqtt.meshmapper.net"
     assert broker.get("format") == "letsmesh"
 
 
