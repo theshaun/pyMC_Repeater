@@ -441,7 +441,11 @@ class APIEndpoints:
                         continue
                     try:
                         entry_value = self._normalize_policy_entry_value(kind, entry.get("value"))
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning(
+                            "Skipping invalid policy entry at index %d: %s", ent_idx, exc
+                        )
+
                         continue
 
                     entry_id = self._slugify_policy_id(

@@ -16,7 +16,6 @@ import yaml
 
 from repeater.web.api_endpoints import APIEndpoints
 
-
 # Minimal initial config.yaml the wizard writes into.
 _BASE_CONFIG = {
     "repeater": {"node_name": "mesh-repeater-01", "security": {"admin_password": "admin123"}},
@@ -66,11 +65,11 @@ def wizard_env(tmp_path, monkeypatch):
     # config has no explicit storage_dir set — that's exactly what we want
     # so the wizard finds our radio-settings.json next to config.yaml.
     config = {
+        "storage_dir": str(tmp_path),
         "repeater": {
-            "storage_dir": str(tmp_path),
             "node_name": "mesh-repeater-01",
             "security": {"admin_password": "admin123"},
-        }
+        },
     }
     endpoints = APIEndpoints(config=config, config_path=str(config_path))
 
