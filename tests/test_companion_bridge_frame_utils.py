@@ -147,7 +147,7 @@ async def test_frame_server_persistence_paths_and_stop():
         srv._build_message_frame = MagicMock(return_value=b"frame")
 
         await srv._persist_companion_message({"text": "x"})
-        sqlite.companion_push_message.assert_called_once_with("h", {"text": "x"})
+        sqlite.companion_push_message.assert_called_once_with("h", {"text": "x"}, None)
         bridge.message_queue.pop_last.assert_called_once()
 
         msg = srv._sync_next_from_persistence()

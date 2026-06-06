@@ -15,6 +15,7 @@ import time
 from typing import Optional
 
 import cherrypy
+from pymc_core.companion.constants import DEFAULT_OFFLINE_QUEUE_SIZE
 
 from repeater.companion.utils import validate_companion_node_name
 
@@ -257,6 +258,10 @@ class CompanionAPIEndpoints:
                     "is_running": b.is_running,
                     "contacts_count": b.contacts.get_count(),
                     "channels_count": b.channels.get_count(),
+                    "max_contacts": b.contacts.max_contacts,
+                    "offline_queue_size": getattr(
+                        b.message_queue, "_max_size", DEFAULT_OFFLINE_QUEUE_SIZE
+                    ),
                 }
             )
         return self._success(items)

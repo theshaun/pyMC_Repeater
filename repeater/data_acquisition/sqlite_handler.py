@@ -2331,6 +2331,20 @@ class SQLiteHandler:
             return 0
 
     # Companion persistence methods
+    def companion_count_contacts(self, companion_hash: str) -> int:
+        """Return the number of persisted contacts for a companion."""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "SELECT COUNT(*) FROM companion_contacts WHERE companion_hash = ?",
+                    (companion_hash,),
+                )
+                row = cursor.fetchone()
+                return int(row[0]) if row else 0
+        except Exception as e:
+            logger.error(f"Failed to count companion contacts: {e}")
+            return 0
+
     def companion_load_contacts(self, companion_hash: str) -> List[Dict]:
         """Load contacts for a companion from storage."""
         try:
@@ -2627,13 +2641,18 @@ class SQLiteHandler:
             logger.error(f"Failed to load companion messages: {e}")
             return []
 
-    def companion_push_message(self, companion_hash: str, msg: Dict) -> bool:
+    def companion_push_message(
+        self, companion_hash: str, msg: Dict, max_messages: Optional[int] = None
+    ) -> bool:
         """Append a message to the companion's queue.
 
         Deduplicates by (companion_hash, packet_hash) using INSERT OR IGNORE
         backed by the UNIQUE index added in migration 8.  This replaces the
         previous SELECT + INSERT round-trip (two statements, two SD-card reads)
         with a single atomic statement.
+
+        When ``max_messages`` is set, the oldest rows beyond that retention limit
+        are trimmed after a successful insert (power-user ``offline_queue_size``).
 
         Returns True if inserted, False if the message was a duplicate (skipped).
         """
@@ -2663,8 +2682,23 @@ class SQLiteHandler:
                         time.time(),
                     ),
                 )
+                inserted = cursor.rowcount > 0
+                if inserted and max_messages is not None:
+                    # Keep the newest `max_messages` rows; drop older overflow.
+                    conn.execute(
+                        """
+                        DELETE FROM companion_messages
+                        WHERE companion_hash = ? AND id NOT IN (
+                            SELECT id FROM companion_messages
+                            WHERE companion_hash = ?
+                            ORDER BY created_at DESC, id DESC
+                            LIMIT ?
+                        )
+                        """,
+                        (companion_hash, companion_hash, max_messages),
+                    )
                 conn.commit()
-                return cursor.rowcount > 0
+                return inserted
         except Exception as e:
             logger.error(f"Failed to push companion message: {e}")
             return False

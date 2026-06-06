@@ -59,13 +59,23 @@ class CompanionFrameServer(_BaseFrameServer):
     # -----------------------------------------------------------------
 
     async def _persist_companion_message(self, msg_dict: dict) -> None:
-        """Persist message to SQLite and pop from bridge queue."""
+        """Persist message to SQLite and pop from bridge queue.
+
+        The bridge's ``offline_queue_size`` (``message_queue._max_size``) doubles
+        as the SQLite retention limit: 0 disables offline storage entirely, so the
+        message is dropped instead of persisted.
+        """
         if not self.sqlite_handler:
+            return
+        retention = getattr(self.bridge.message_queue, "_max_size", None)
+        if retention == 0:
+            self.bridge.message_queue.pop_last()
             return
         await asyncio.to_thread(
             self.sqlite_handler.companion_push_message,
             self.companion_hash,
             msg_dict,
+            retention,
         )
         self.bridge.message_queue.pop_last()
 
