@@ -181,17 +181,13 @@ def select_companion_contacts_to_trim(contacts, max_contacts: int):
     contacts = list(contacts)
     if len(contacts) <= max_contacts:
         return contacts, []
-    favourites = [
-        c for c in contacts if int(c.get("flags", 0)) & _CONTACT_FLAG_FAVOURITE
-    ]
+    favourites = [c for c in contacts if int(c.get("flags", 0)) & _CONTACT_FLAG_FAVOURITE]
     if len(favourites) > max_contacts:
         raise ValueError(
             f"Cannot trim to max_contacts={max_contacts}: "
             f"{len(favourites)} favourite contacts cannot be evicted"
         )
-    non_favourites = [
-        c for c in contacts if not int(c.get("flags", 0)) & _CONTACT_FLAG_FAVOURITE
-    ]
+    non_favourites = [c for c in contacts if not int(c.get("flags", 0)) & _CONTACT_FLAG_FAVOURITE]
     # Keep the newest non-favourites by lastmod; evict the oldest.
     non_favourites.sort(key=lambda c: int(c.get("lastmod", 0)))
     keep_count = max_contacts - len(favourites)

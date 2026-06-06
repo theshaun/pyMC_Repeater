@@ -20,6 +20,7 @@ from repeater.companion.utils import (
     trim_companion_contacts_to_fit,
     validate_companion_config_capacity,
 )
+
 # pymc_core defaults (CompanionBridge / ContactStore)
 _DEFAULT_MAX_CONTACTS = 1000
 
@@ -111,9 +112,7 @@ class TestCheckCompanionContactCapacity:
         sqlite = MagicMock()
         sqlite.companion_count_contacts.return_value = 812
         with pytest.raises(CompanionContactCapacityError) as exc:
-            check_companion_contact_capacity(
-                "0xab", 500, sqlite, companion_name="BotCompanion"
-            )
+            check_companion_contact_capacity("0xab", 500, sqlite, companion_name="BotCompanion")
         assert exc.value.stored_count == 812
         assert exc.value.max_contacts == 500
         assert "BotCompanion" in str(exc.value)
@@ -121,9 +120,7 @@ class TestCheckCompanionContactCapacity:
 
 class TestOfflineQueueOff:
     def test_zero_allowed(self):
-        assert parse_companion_bridge_kwargs({"offline_queue_size": 0}) == {
-            "offline_queue_size": 0
-        }
+        assert parse_companion_bridge_kwargs({"offline_queue_size": 0}) == {"offline_queue_size": 0}
 
     def test_max_contacts_zero_still_rejected(self):
         with pytest.raises(ValueError, match="max_contacts"):
@@ -270,6 +267,4 @@ class TestPersistSkipWhenOff:
 
         fs = self._frame_server(7)
         asyncio.run(fs._persist_companion_message({"text": "x"}))
-        fs.sqlite_handler.companion_push_message.assert_called_once_with(
-            "0x01", {"text": "x"}, 7
-        )
+        fs.sqlite_handler.companion_push_message.assert_called_once_with("0x01", {"text": "x"}, 7)

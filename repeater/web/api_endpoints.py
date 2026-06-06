@@ -3656,9 +3656,7 @@ class APIEndpoints:
                 except CompanionContactCapacityError as cap_error:
                     # A restart won't fix a capacity overflow; report the real cause.
                     companion_activation_error = str(cap_error)
-                    logger.warning(
-                        f"Hot reload companion '{name}' not activated: {cap_error}"
-                    )
+                    logger.warning(f"Hot reload companion '{name}' not activated: {cap_error}")
                 except Exception as comp_error:
                     logger.warning(
                         f"Hot reload companion '{name}' failed: {comp_error}. Restart required to activate.",
