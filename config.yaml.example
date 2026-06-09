@@ -383,6 +383,16 @@ radio:
 # kiss:
 #   port: "/dev/ttyUSB0"
 #   baud_rate: 9600
+#   # Optional KISS key-up / CSMA tuning, forwarded to the modem firmware.
+#   # Omit to keep the wrapper/firmware defaults. For a host-managed repeater the
+#   # engine already staggers retransmits, so the firmware's p-persistent CSMA
+#   # backoff is redundant — kiss_persistence: 255 transmits as soon as the channel
+#   # is clear (carrier-sense still prevents talking over a packet already on air).
+#   kiss_persistence: 255        # 0-255; p(tx when clear) = (value+1)/256. Firmware default 63.
+#   kiss_slottime_ms: 20         # CSMA backoff slot; unused at persistence 255. Firmware default 100.
+#   tx_delay_ms: 50              # key-up delay; LoRa needs ~none. Firmware default 500.
+#   # kiss_txtail_ms: 0          # tail after TX (rarely needed)
+#   # kiss_full_duplex: false    # disable carrier-sense/CSMA entirely (not recommended)
 
 # pymc_usb firmware modem over Wi-Fi/TCP (when radio_type: pymc_tcp).
 # Requires pyMC_core with the TCPLoRaRadio driver

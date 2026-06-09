@@ -188,3 +188,64 @@ def test_get_radio_for_board_pymc_usb_requires_port(monkeypatch):
 
     with pytest.raises(ValueError, match="Missing 'port'"):
         get_radio_for_board(board_config)
+
+
+# ─── kiss branch: optional CSMA / key-up tuning forwarding ────────────
+
+
+def _kiss_capture_radio_config(monkeypatch):
+    """Patch KissModemWrapper to capture the radio_config it is built with."""
+    pytest.importorskip("pymc_core.hardware.kiss_modem_wrapper")
+    captured = {}
+
+    class _DummyKissWrapper(_DummyRadio):
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "pymc_core.hardware.kiss_modem_wrapper.KissModemWrapper",
+        _DummyKissWrapper,
+    )
+    return captured
+
+
+def test_get_radio_for_board_kiss_forwards_csma_tuning(monkeypatch):
+    captured = _kiss_capture_radio_config(monkeypatch)
+
+    board_config = {
+        "radio_type": "kiss",
+        "kiss": {
+            "port": "/dev/ttyACM0",
+            "baud_rate": 115200,
+            "kiss_persistence": 255,
+            "kiss_slottime_ms": 20,
+            "tx_delay_ms": 50,
+            "kiss_full_duplex": True,
+        },
+        "radio": _pymc_radio_cfg(),
+    }
+
+    get_radio_for_board(board_config)
+
+    rc = captured["kwargs"]["radio_config"]
+    assert rc["kiss_persistence"] == 255
+    assert rc["kiss_slottime_ms"] == 20
+    assert rc["tx_delay_ms"] == 50
+    assert rc["kiss_full_duplex"] is True
+
+
+def test_get_radio_for_board_kiss_omits_unset_tuning(monkeypatch):
+    captured = _kiss_capture_radio_config(monkeypatch)
+
+    board_config = {
+        "radio_type": "kiss",
+        "kiss": {"port": "/dev/ttyACM0", "baud_rate": 115200},
+        "radio": _pymc_radio_cfg(),
+    }
+
+    get_radio_for_board(board_config)
+
+    rc = captured["kwargs"]["radio_config"]
+    # Unset keys must not be forwarded, so the wrapper keeps its own defaults.
+    for key in ("kiss_persistence", "kiss_slottime_ms", "tx_delay_ms", "kiss_full_duplex"):
+        assert key not in rc

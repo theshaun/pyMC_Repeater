@@ -543,6 +543,18 @@ def get_radio_for_board(board_config: dict):
             "tx_power": int(radio_cfg.get("tx_power", 14)),
             "preamble_length": int(radio_cfg.get("preamble_length", 32)),
         }
+
+        # Optional KISS key-up / CSMA tuning, forwarded to the modem firmware (via
+        # SetHardware) only when present so the wrapper keeps its own defaults otherwise.
+        # For a host-managed repeater the engine already staggers retransmits, so the
+        # firmware's p-persistent CSMA backoff is usually redundant; set
+        # kiss_persistence: 255 to transmit as soon as the channel is clear.
+        for _key in ("tx_delay_ms", "kiss_persistence", "kiss_slottime_ms", "kiss_txtail_ms"):
+            if kiss_config.get(_key) is not None:
+                radio_config[_key] = int(kiss_config[_key])
+        if kiss_config.get("kiss_full_duplex") is not None:
+            radio_config["kiss_full_duplex"] = bool(kiss_config["kiss_full_duplex"])
+
         radio = KissModemWrapper(
             port=port,
             baudrate=baudrate,

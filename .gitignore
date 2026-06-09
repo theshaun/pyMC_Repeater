@@ -54,6 +54,7 @@ htmlcov/
 .env
 config.yaml
 config.yaml.backup
+policy.yaml
 identity.json
 
 # Data
