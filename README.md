@@ -349,91 +349,26 @@ You can now run pyMC Repeater from within a [Docker Container](https://www.docke
 
 Here is what you'll need to do in order to get the container running:
 
-1. Copy the Docker environment example and adjust it for your host if needed.
+1. Copy the `config.yaml.example` to `config.yaml`
 
 ```bash
-cp .env.example .env
+cp ./config.yaml.example ./config.yaml
 ```
 
-2. Configure the [docker compose](./docker-compose.yml) to your specific
-   hardware and file paths. Be sure to comment-out or delete lines that aren't
-   required for your hardware. Please note that your hardware devices might be
-   at a different path than those listed in the docker compose file.
-
-By default, the compose file pulls the published `pymcdev/pymc-repeater:main`
-image and stores config/data in Docker named volumes. This is the recommended
-default for Portainer and fresh installs because Docker keeps the volume
-ownership compatible with the container user.
-
-Do not bind mount `./config.yaml` directly. If you use a bind mount, mount a
-config directory to `/etc/pymc_repeater`, with the config file at
-`config.yaml` inside that directory.
-
-3. If you are using SPI/GPIO hardware, make sure the `GPIO_GID` and `SPI_GID`
-   values match the numeric group IDs on your host. These IDs can vary by OS
-   image, so check the host before starting the container. If the values do
-   not match your host, put the correct numeric IDs in `.env`.
+2. Run the configuration script and follow the prompts.
 
 ```bash
-getent group gpio
-getent group spi
+sudo bash ./setup-radio-config.sh
 ```
 
-Example output:
+3. Modify the `config.yaml` file with a unique web UI password. This allows you to bypass the `/setup` page when logging for the first time. You can find the value under `repeater.security.admin_password`. Change to _anything_ besides the default of `admin123`.
 
-```text
-gpio:x:997:
-spi:x:999:
-```
+4. Configure the [docker compose](./docker-compose.yml) to your specific hardware and file paths. Be sure to comment-out or delete lines that aren't required for your hardware. Please note that your hardware devices might be at a different path than those listed in the docker compose file.
 
-Example `.env` values:
+5. Build and start the container.
 
 ```bash
-GPIO_GID=997
-SPI_GID=999
-```
-
-4. Pull and start the container.
-
-```bash
-docker compose pull
-docker compose up -d
-```
-
-### Optional host bind mounts
-
-If you want config and data stored in normal host folders instead of Docker
-named volumes, create absolute host paths first and make them writable by the
-container user. The image runs as UID/GID `15888` by default.
-
-```bash
-sudo mkdir -p /opt/pymc-repeater/config /opt/pymc-repeater/data
-sudo chown -R 15888:15888 /opt/pymc-repeater/config /opt/pymc-repeater/data
-```
-
-Then set the bind mount paths in `.env`:
-
-```bash
-PYMC_CONFIG_VOLUME=/opt/pymc-repeater/config
-PYMC_DATA_VOLUME=/opt/pymc-repeater/data
-```
-
-You can preconfigure the file before first start:
-
-```bash
-cp ./config.yaml.example /opt/pymc-repeater/config/config.yaml
-sudo bash ./setup-radio-config.sh /opt/pymc-repeater/config
-sudo chown -R 15888:15888 /opt/pymc-repeater/config /opt/pymc-repeater/data
-```
-
-If you skip this, the container will create `config.yaml` from the bundled
-example on first start.
-
-If you are developing locally and want Docker Compose to build the image from
-this checkout instead, use the local build override:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+docker compose up -d --force-recreate --build
 ```
 
 ## Roadmap / Planned Features
