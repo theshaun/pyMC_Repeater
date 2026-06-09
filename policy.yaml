@@ -1,0 +1,20 @@
+policy_engine:
+  enabled: false
+  default_action: allow
+  rules:
+  - id: 1
+    name: Drop GRP_DATA
+    enabled: true
+    if:
+      all:
+      - field: payload_type
+        op: equals
+        value: 6
+    then:
+      action: drop
+  objects:
+    channel_hash_groups: {}
+    pubkey_groups: {}
+groups:
+  channel_hashes: []
+  pubkeys: []
