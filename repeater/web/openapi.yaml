@@ -1862,7 +1862,7 @@ paths:
       tags: [Identities]
       summary: Create new identity
       description: |
-        Create a new repeater or room server identity.
+        Create a new companion or room server identity.
         `name` must be non-empty after trimming leading/trailing whitespace (whitespace-only values are rejected).
       requestBody:
         required: true
@@ -1883,14 +1883,14 @@ paths:
                   example: "General Chat"
                 identity_key:
                   type: string
-                  pattern: '^[0-9a-fA-F]{64}$'
-                  description: 32-byte hex key (64 chars). Omit for auto-generation
-                  example: "abc123def456..."
+                  pattern: '^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{128})$'
+                  description: 32- or 64-byte hex key (64 or 128 chars). Omit for auto-generation
+                  example: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 type:
                   type: string
-                  enum: [repeater, room_server]
+                  enum: [companion, room_server]
                   description: |
-                    - repeater: Repeater identity (only one allowed)
+                    - companion: Companion identity with a TCP endpoint
                     - room_server: Room server for group chat
                   example: room_server
                 settings:
@@ -1914,6 +1914,22 @@ paths:
                       default: 32
                       description: Maximum messages to keep (hard limit 32)
                       example: 32
+                    node_name:
+                      type: string
+                      description: Advertised node name (companion only; defaults to identity name)
+                      example: "My Companion"
+                    tcp_port:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                      default: 5000
+                      description: TCP listener port (companion only)
+                      example: 5000
+                    bind_address:
+                      type: string
+                      default: "0.0.0.0"
+                      description: TCP listener bind address (companion only)
+                      example: "0.0.0.0"
             examples:
               room_server:
                 value:
@@ -1923,11 +1939,15 @@ paths:
                     admin_password: "admin123"
                     guest_password: "guest123"
                     max_posts: 32
-              repeater:
+              companion:
                 value:
-                  name: "My Repeater"
-                  type: repeater
-                  identity_key: "abc123def456..."
+                  name: "My Companion"
+                  type: companion
+                  identity_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                  settings:
+                    node_name: "My Companion"
+                    tcp_port: 5000
+                    bind_address: "0.0.0.0"
       responses:
         '200':
           description: Identity created
