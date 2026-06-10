@@ -11,6 +11,7 @@ import logging
 import time
 
 from pymc_core.node.handlers.text import TextMessageHandler
+from pymc_core.protocol import CryptoUtils, Identity
 
 from .mesh_cli import MeshCLI
 from .room_server import RoomServer
@@ -29,8 +30,8 @@ class TextHelper:
         packet_injector=None,
         acl_dict=None,
         log_fn=None,
-        config_path: str = None,
-        config: dict = None,
+        config_path: str | None = None,
+        config: dict | None = None,
         config_manager=None,
         sqlite_handler=None,
         send_advert_callback=None,
@@ -158,8 +159,8 @@ class TextHelper:
                     packet_injector=self.packet_injector,
                     acl=identity_acl,
                     max_posts=max_posts,
-                    config_path=self.config_path,
-                    config=self.config,
+                    config_path=self.config_path or "",
+                    config=self.config or {},
                     config_manager=self.config_manager,
                 )
 
@@ -273,6 +274,7 @@ class TextHelper:
         # Extract decrypted message if available
         if hasattr(packet, "decrypted") and packet.decrypted:
             message_text = packet.decrypted.get("text", "<unknown>")
+            sender_client = self._resolve_sender_client(dest_hash, src_hash, packet)
 
             # Clean message text - remove null bytes and trailing whitespace
             message_text = message_text.rstrip("\x00").rstrip()
@@ -290,7 +292,7 @@ class TextHelper:
                         try:
                             # Check admin permission
                             is_admin = self._check_admin_permission_for_identity(
-                                src_hash, dest_hash
+                                sender_client, dest_hash
                             )
 
                             if not is_admin:
@@ -300,13 +302,9 @@ class TextHelper:
                                 return
 
                             # Get sender's full pubkey
-                            identity_acl = self.acl_dict.get(dest_hash)
                             sender_pubkey = bytes([src_hash]) + b"\x00" * 31  # Default
-                            if identity_acl:
-                                for client_info in identity_acl.get_all_clients():
-                                    if client_info.id.get_public_key()[0] == src_hash:
-                                        sender_pubkey = client_info.id.get_public_key()
-                                        break
+                            if sender_client is not None:
+                                sender_pubkey = sender_client.id.get_public_key()
 
                             # Handle CLI command
                             reply = room_server.cli.handle_command(
@@ -320,7 +318,12 @@ class TextHelper:
                             # Send reply back to sender
                             handler_info = self.handlers.get(dest_hash)
                             if handler_info:
-                                await self._send_cli_reply(packet, reply, handler_info)
+                                await self._send_cli_reply(
+                                    packet,
+                                    reply,
+                                    handler_info,
+                                    sender_client=sender_client,
+                                )
 
                         except Exception as e:
                             logger.error(
@@ -333,13 +336,9 @@ class TextHelper:
                 # NOT a CLI command - store as regular room post
                 try:
                     # Get sender's full pubkey
-                    identity_acl = self.acl_dict.get(dest_hash)
                     sender_pubkey = bytes([src_hash]) + b"\x00" * 31  # Default
-                    if identity_acl:
-                        for client_info in identity_acl.get_all_clients():
-                            if client_info.id.get_public_key()[0] == src_hash:
-                                sender_pubkey = client_info.id.get_public_key()
-                                break
+                    if sender_client is not None:
+                        sender_pubkey = sender_client.id.get_public_key()
 
                     # Store message as post
                     sender_timestamp = int(time.time())
@@ -363,9 +362,13 @@ class TextHelper:
             # Check if this is a CLI command to the repeater (AFTER decryption)
             if dest_hash == self.repeater_hash and self.cli and self._is_cli_command(message_text):
                 try:
+                    repeater_hash = self.repeater_hash
+                    if repeater_hash is None:
+                        return
+
                     # Check admin permission
                     is_admin = self._check_admin_permission_for_identity(
-                        src_hash, self.repeater_hash
+                        sender_client, repeater_hash
                     )
 
                     # If not admin, log and return without sending reply
@@ -376,13 +379,9 @@ class TextHelper:
                         return
 
                     # Get client for full public key
-                    repeater_acl = self.acl_dict.get(self.repeater_hash)
                     sender_pubkey = bytes([src_hash]) + b"\x00" * 31  # Default
-                    if repeater_acl:
-                        for client_info in repeater_acl.get_all_clients():
-                            if client_info.id.get_public_key()[0] == src_hash:
-                                sender_pubkey = client_info.id.get_public_key()
-                                break
+                    if sender_client is not None:
+                        sender_pubkey = sender_client.id.get_public_key()
 
                     # Handle CLI command
                     reply = self.cli.handle_command(
@@ -396,7 +395,12 @@ class TextHelper:
                     # Send reply back to sender
                     handler_info = self.handlers.get(dest_hash)
                     if handler_info:
-                        await self._send_cli_reply(packet, reply, handler_info)
+                        await self._send_cli_reply(
+                            packet,
+                            reply,
+                            handler_info,
+                            sender_client=sender_client,
+                        )
 
                 except Exception as e:
                     logger.error(f"Error processing CLI command: {e}", exc_info=True)
@@ -473,20 +477,29 @@ class TextHelper:
 
     def _check_admin_permission(self, src_hash: int) -> bool:
         """Check if sender has admin permissions for repeater (legacy method)."""
-        return self._check_admin_permission_for_identity(src_hash, self.repeater_hash)
-
-    def _check_admin_permission_for_identity(self, src_hash: int, identity_hash: int) -> bool:
-        """Check if sender has admin permissions (bit 0x02) for a specific identity."""
-        # Get the identity's ACL
-        identity_acl = self.acl_dict.get(identity_hash)
-        if not identity_acl:
+        repeater_hash = self.repeater_hash
+        if repeater_hash is None:
             return False
 
-        # Get client by hash byte
-        clients = identity_acl.get_all_clients()
-        for client_info in clients:
+        identity_acl = self.acl_dict.get(repeater_hash)
+        if not identity_acl:
+            return False
+        for client_info in identity_acl.get_all_clients():
             pubkey = client_info.id.get_public_key()
             if pubkey[0] == src_hash:
+                return self._check_admin_permission_for_identity(client_info, repeater_hash)
+        return False
+
+    def _check_admin_permission_for_identity(self, sender_client, identity_hash: int) -> bool:
+        """Check if a resolved sender client has admin permissions for a specific identity."""
+        # Get the identity's ACL
+        identity_acl = self.acl_dict.get(identity_hash)
+        if not identity_acl or sender_client is None:
+            return False
+
+        sender_pubkey = sender_client.id.get_public_key()
+        for client_info in identity_acl.get_all_clients():
+            if client_info.id.get_public_key() == sender_pubkey:
                 # Check admin bit (0x02 = PERM_ACL_ADMIN)
                 permissions = getattr(client_info, "permissions", 0)
                 PERM_ACL_ADMIN = 0x02
@@ -494,7 +507,56 @@ class TextHelper:
 
         return False
 
-    async def _send_cli_reply(self, original_packet, reply_text: str, handler_info: dict):
+    def _get_shared_secret_for_client(self, client_info, identity) -> bytes:
+        """Return shared secret for a client, deriving it when ACL cache is absent."""
+        shared_secret = getattr(client_info, "shared_secret", b"") or b""
+        if shared_secret:
+            return bytes(shared_secret)
+
+        if not identity:
+            return b""
+
+        try:
+            peer_pubkey = client_info.id.get_public_key()
+            peer_identity = Identity(peer_pubkey)
+            return peer_identity.calc_shared_secret(identity.get_private_key())
+        except Exception:
+            return b""
+
+    def _resolve_sender_client(self, identity_hash: int, src_hash: int, packet):
+        """Resolve sender client by trying hash-collision candidates until decrypt succeeds."""
+        identity_acl = self.acl_dict.get(identity_hash)
+        handler_info = self.handlers.get(identity_hash)
+        local_identity = handler_info.get("identity") if handler_info else None
+
+        if not identity_acl or not local_identity or len(packet.payload) < 4:
+            return None
+
+        encrypted_data = bytes(packet.payload[2:])
+        for client_info in identity_acl.get_all_clients():
+            pubkey = client_info.id.get_public_key()
+            if pubkey[0] != src_hash:
+                continue
+
+            shared_secret = self._get_shared_secret_for_client(client_info, local_identity)
+            if len(shared_secret) < 16:
+                continue
+
+            try:
+                CryptoUtils.mac_then_decrypt(shared_secret[:16], shared_secret, encrypted_data)
+                return client_info
+            except Exception:
+                continue
+
+        return None
+
+    async def _send_cli_reply(
+        self,
+        original_packet,
+        reply_text: str,
+        handler_info: dict,
+        sender_client=None,
+    ):
         """
         Send CLI reply back to sender using TXT_MSG datagram.
 
@@ -526,12 +588,9 @@ class TextHelper:
                 logger.error(f"No ACL found for identity 0x{dest_hash:02X} for CLI reply")
                 return
 
-            client = None
-            for client_info in identity_acl.get_all_clients():
-                pubkey = client_info.id.get_public_key()
-                if pubkey[0] == src_hash:
-                    client = client_info
-                    break
+            client = sender_client or self._resolve_sender_client(
+                dest_hash, src_hash, original_packet
+            )
 
             if not client:
                 logger.error(

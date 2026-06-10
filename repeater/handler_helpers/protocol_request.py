@@ -72,6 +72,7 @@ class ProtocolRequestHelper:
             local_identity=identity,
             contacts=acl_contacts,
             get_client_fn=lambda src_hash: self._get_client_from_acl(identity_acl, src_hash),
+            get_clients_fn=lambda src_hash: self._get_clients_from_acl(identity_acl, src_hash),
             request_handlers=request_handlers,
             log_fn=logger.info,
         )
@@ -100,10 +101,16 @@ class ProtocolRequestHelper:
 
     def _get_client_from_acl(self, acl, src_hash: int):
         """Get client from ACL by source hash."""
+        clients = self._get_clients_from_acl(acl, src_hash)
+        return clients[0] if clients else None
+
+    def _get_clients_from_acl(self, acl, src_hash: int):
+        """Get all ACL clients whose public-key first byte matches source hash."""
+        matches = []
         for client_info in acl.get_all_clients():
             if client_info.id.get_public_key()[0] == src_hash:
-                return client_info
-        return None
+                matches.append(client_info)
+        return matches
 
     async def process_request_packet(self, packet):
 
