@@ -491,10 +491,25 @@ class TextHelper:
         return False
 
     def _check_admin_permission_for_identity(self, sender_client, identity_hash: int) -> bool:
-        """Check if a resolved sender client has admin permissions for a specific identity."""
+        """Check admin permissions for a specific identity.
+
+        Accepts either a resolved ACL client object (preferred) or a legacy
+        ``src_hash`` int for backwards-compatible helper/unit-test calls.
+        """
         # Get the identity's ACL
         identity_acl = self.acl_dict.get(identity_hash)
         if not identity_acl or sender_client is None:
+            return False
+
+        # Legacy compatibility: caller provided src_hash int instead of client.
+        if isinstance(sender_client, int):
+            src_hash = sender_client & 0xFF
+            for client_info in identity_acl.get_all_clients():
+                pubkey = client_info.id.get_public_key()
+                if pubkey[0] == src_hash:
+                    permissions = getattr(client_info, "permissions", 0)
+                    PERM_ACL_ADMIN = 0x02
+                    return (permissions & 0x02) == PERM_ACL_ADMIN
             return False
 
         sender_pubkey = sender_client.id.get_public_key()
@@ -523,13 +538,32 @@ class TextHelper:
         except Exception:
             return b""
 
-    def _resolve_sender_client(self, identity_hash: int, src_hash: int, packet):
+    def _resolve_sender_client(
+        self,
+        identity_hash: int,
+        src_hash: int,
+        packet,
+        local_identity=None,
+        allow_hash_fallback: bool = False,
+    ):
         """Resolve sender client by trying hash-collision candidates until decrypt succeeds."""
         identity_acl = self.acl_dict.get(identity_hash)
-        handler_info = self.handlers.get(identity_hash)
-        local_identity = handler_info.get("identity") if handler_info else None
+        if local_identity is None:
+            handler_info = self.handlers.get(identity_hash)
+            local_identity = handler_info.get("identity") if handler_info else None
 
-        if not identity_acl or not local_identity or len(packet.payload) < 4:
+        if not identity_acl:
+            return None
+
+        # Optional compatibility path for direct helper calls/tests where we don't
+        # have decryptable payload bytes available; only accept a UNIQUE hash match.
+        if allow_hash_fallback and (not local_identity or len(packet.payload) < 4):
+            matches = [
+                c for c in identity_acl.get_all_clients() if c.id.get_public_key()[0] == src_hash
+            ]
+            return matches[0] if len(matches) == 1 else None
+
+        if not local_identity or len(packet.payload) < 4:
             return None
 
         encrypted_data = bytes(packet.payload[2:])
@@ -589,7 +623,11 @@ class TextHelper:
                 return
 
             client = sender_client or self._resolve_sender_client(
-                dest_hash, src_hash, original_packet
+                dest_hash,
+                src_hash,
+                original_packet,
+                local_identity=handler_info.get("identity"),
+                allow_hash_fallback=True,
             )
 
             if not client:

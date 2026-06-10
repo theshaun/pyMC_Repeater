@@ -1159,8 +1159,8 @@ class APIEndpoints:
                 return {"success": False, "error": "Radio preset selection is required"}
 
             admin_password = data.get("admin_password", "").strip()
-            if not admin_password or len(admin_password) < 6:
-                return {"success": False, "error": "Admin password must be at least 6 characters"}
+            if not admin_password or len(admin_password) < 8:
+                return {"success": False, "error": "Admin password must be at least 8 characters"}
 
             import json
 

@@ -231,3 +231,15 @@ def test_wizard_rejected_after_setup_complete(wizard_env):
 
     assert result["success"] is False
     assert "already complete" in result["error"].lower()
+
+
+def test_wizard_rejects_short_admin_password(wizard_env):
+    _tmp_path, _config_path, endpoints, set_request = wizard_env
+
+    body = dict(_BASE_REQUEST, hardware_key="pymc_tcp", admin_password="short7")
+    set_request(body)
+
+    result = endpoints.setup_wizard()
+
+    assert result["success"] is False
+    assert "at least 8 characters" in result["error"]

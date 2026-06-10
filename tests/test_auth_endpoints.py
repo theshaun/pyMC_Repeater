@@ -6,7 +6,12 @@ from unittest.mock import MagicMock
 import cherrypy
 import pytest
 
-from repeater.web.auth_endpoints import AuthAPIEndpoints, AuthEndpoints, TokensAPIEndpoint
+from repeater.web.auth_endpoints import (
+    AuthAPIEndpoints,
+    AuthEndpoints,
+    TokensAPIEndpoint,
+    _LoginThrottle,
+)
 
 
 @pytest.fixture
@@ -164,6 +169,62 @@ def test_login_paths(cp_ctx):
     cp_ctx(method="POST", body=b"{}")
     out = json.loads(auth.login().decode())
     assert out["success"] is False
+
+
+def test_login_throttle_backoff(cp_ctx):
+    class FakeClock:
+        def __init__(self):
+            self.now = 1000.0
+
+        def monotonic(self):
+            return self.now
+
+    clock = FakeClock()
+    throttle = _LoginThrottle(
+        per_ip_threshold=1,
+        per_user_threshold=1,
+        global_threshold=99,
+        base_backoff_sec=10,
+        max_backoff_sec=10,
+        time_fn=clock.monotonic,
+    )
+
+    auth = AuthEndpoints(
+        config={"repeater": {"security": {"admin_password": "pw"}}},
+        jwt_handler=_jwt_handler(ok=True),
+        token_manager=_token_mgr(),
+        login_throttle=throttle,
+    )
+
+    cp_ctx(
+        method="POST",
+        headers={"X-Forwarded-For": "203.0.113.5"},
+        body=json.dumps({"username": "admin", "password": "bad", "client_id": "abc"}).encode(),
+    )
+    out = json.loads(auth.login().decode())
+    assert out["success"] is False
+    assert "retry_after" in out
+    assert cherrypy.response.status == 429
+
+    # Still blocked immediately afterwards.
+    cp_ctx(
+        method="POST",
+        headers={"X-Forwarded-For": "203.0.113.5"},
+        body=json.dumps({"username": "admin", "password": "pw", "client_id": "abc"}).encode(),
+    )
+    out = json.loads(auth.login().decode())
+    assert out["success"] is False
+    assert cherrypy.response.status == 429
+
+    # After backoff expires, correct credentials work.
+    clock.now += 11
+    cp_ctx(
+        method="POST",
+        headers={"X-Forwarded-For": "203.0.113.5"},
+        body=json.dumps({"username": "admin", "password": "pw", "client_id": "abc"}).encode(),
+    )
+    out = json.loads(auth.login().decode())
+    assert out["success"] is True
 
     cp_ctx(
         method="POST",

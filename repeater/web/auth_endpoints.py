@@ -2,11 +2,106 @@
 Authentication endpoints for login and token management
 """
 
-import cherrypy
 import logging
+import math
+import threading
+import time
+
+import cherrypy
+
 from .auth.middleware import require_auth
 
 logger = logging.getLogger(__name__)
+
+_MIN_ADMIN_PASSWORD_LEN = 8
+
+
+class _LoginThrottle:
+    """In-memory login throttle with exponential backoff."""
+
+    def __init__(
+        self,
+        per_ip_threshold: int = 5,
+        per_user_threshold: int = 5,
+        global_threshold: int = 20,
+        base_backoff_sec: int = 1,
+        max_backoff_sec: int = 60,
+        window_sec: int = 300,
+        time_fn=None,
+    ):
+        self.per_ip_threshold = per_ip_threshold
+        self.per_user_threshold = per_user_threshold
+        self.global_threshold = global_threshold
+        self.base_backoff_sec = base_backoff_sec
+        self.max_backoff_sec = max_backoff_sec
+        self.window_sec = window_sec
+        self._time_fn = time_fn or time.monotonic
+        self._lock = threading.Lock()
+        self._ip_states = {}
+        self._user_states = {}
+        self._global_state = {"failures": 0, "last_failure": 0.0, "blocked_until": 0.0}
+
+    def _state(self, bucket: dict, key: str):
+        if key not in bucket:
+            bucket[key] = {"failures": 0, "last_failure": 0.0, "blocked_until": 0.0}
+        return bucket[key]
+
+    def _maybe_decay(self, state: dict, now: float) -> None:
+        last = state.get("last_failure", 0.0)
+        if last and (now - last) > self.window_sec:
+            state["failures"] = 0
+            state["blocked_until"] = 0.0
+
+    def _record_failure(self, state: dict, threshold: int, now: float) -> None:
+        self._maybe_decay(state, now)
+        state["failures"] = int(state.get("failures", 0)) + 1
+        state["last_failure"] = now
+        if state["failures"] >= threshold:
+            exponent = state["failures"] - threshold
+            delay = min(self.max_backoff_sec, self.base_backoff_sec * (2**exponent))
+            state["blocked_until"] = max(float(state.get("blocked_until", 0.0)), now + delay)
+
+    def _retry_after(self, state: dict, now: float) -> int:
+        self._maybe_decay(state, now)
+        blocked_until = float(state.get("blocked_until", 0.0))
+        if blocked_until <= now:
+            return 0
+        return max(1, math.ceil(blocked_until - now))
+
+    def get_retry_after(self, client_ip: str, username: str) -> int:
+        now = self._time_fn()
+        user_key = (username or "").strip().lower() or "<unknown>"
+        ip_key = client_ip or "<unknown>"
+        with self._lock:
+            ip_retry = self._retry_after(self._state(self._ip_states, ip_key), now)
+            user_retry = self._retry_after(self._state(self._user_states, user_key), now)
+            global_retry = self._retry_after(self._global_state, now)
+            return max(ip_retry, user_retry, global_retry)
+
+    def register_failure(self, client_ip: str, username: str) -> int:
+        now = self._time_fn()
+        user_key = (username or "").strip().lower() or "<unknown>"
+        ip_key = client_ip or "<unknown>"
+        with self._lock:
+            self._record_failure(self._state(self._ip_states, ip_key), self.per_ip_threshold, now)
+            self._record_failure(
+                self._state(self._user_states, user_key), self.per_user_threshold, now
+            )
+            self._record_failure(self._global_state, self.global_threshold, now)
+            ip_retry = self._retry_after(self._state(self._ip_states, ip_key), now)
+            user_retry = self._retry_after(self._state(self._user_states, user_key), now)
+            global_retry = self._retry_after(self._global_state, now)
+            return max(ip_retry, user_retry, global_retry)
+
+    def register_success(self, client_ip: str, username: str) -> None:
+        user_key = (username or "").strip().lower() or "<unknown>"
+        ip_key = client_ip or "<unknown>"
+        with self._lock:
+            self._ip_states.pop(ip_key, None)
+            self._user_states.pop(user_key, None)
+            # So one successful login doesn't hide broad abuse patterns, keep global
+            # state but soften it.
+            self._global_state["failures"] = max(0, int(self._global_state.get("failures", 0)) - 1)
 
 
 class AuthAPIEndpoints:
@@ -125,11 +220,34 @@ class TokensAPIEndpoint:
 
 
 class AuthEndpoints:
-    def __init__(self, config, jwt_handler, token_manager, config_manager=None):
+    def __init__(
+        self,
+        config,
+        jwt_handler,
+        token_manager,
+        config_manager=None,
+        login_throttle=None,
+    ):
         self.config = config
         self.jwt_handler = jwt_handler
         self.token_manager = token_manager
         self.config_manager = config_manager
+        self._login_throttle = login_throttle or _LoginThrottle()
+
+    @staticmethod
+    def _get_request_ip() -> str:
+        """Extract client IP for login throttling/auditing."""
+        xff = cherrypy.request.headers.get("X-Forwarded-For", "")
+        if xff:
+            first = xff.split(",", 1)[0].strip()
+            if first:
+                return first
+
+        remote = getattr(cherrypy.request, "remote", None)
+        if remote and getattr(remote, "ip", None):
+            return str(remote.ip)
+
+        return "unknown"
 
     @cherrypy.expose
     def login(self, **kwargs):
@@ -157,12 +275,31 @@ class AuthEndpoints:
             username = data.get("username", "").strip()
             password = data.get("password", "")
             client_id = data.get("client_id", "").strip()
+            client_ip = self._get_request_ip()
 
             if not username or not password or not client_id:
                 return json.dumps(
                     {
                         "success": False,
                         "error": "Missing required fields: username, password, client_id",
+                    }
+                ).encode("utf-8")
+
+            retry_after = self._login_throttle.get_retry_after(client_ip, username)
+            if retry_after > 0:
+                cherrypy.response.status = 429
+                cherrypy.response.headers["Retry-After"] = str(retry_after)
+                logger.warning(
+                    "Login throttled for user '%s' from %s (retry_after=%ss)",
+                    username,
+                    client_ip,
+                    retry_after,
+                )
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "Too many login attempts. Please wait and try again.",
+                        "retry_after": retry_after,
                     }
                 ).encode("utf-8")
 
@@ -182,12 +319,22 @@ class AuthEndpoints:
                     }
                 ).encode("utf-8")
 
+            if len(config_password) < _MIN_ADMIN_PASSWORD_LEN:
+                logger.warning(
+                    "Weak admin password configured (len=%s). Login remains allowed for compatibility.",
+                    len(config_password),
+                )
+
             if username == "admin" and password == config_password:
+                self._login_throttle.register_success(client_ip, username)
                 # Create JWT token
                 token = self.jwt_handler.create_jwt(username, client_id)
 
                 logger.info(
-                    f"Successful login for user '{username}' from client '{client_id[:8]}...'"
+                    "Successful login for user '%s' from client '%s...' ip=%s",
+                    username,
+                    client_id[:8],
+                    client_ip,
                 )
 
                 return json.dumps(
@@ -199,7 +346,26 @@ class AuthEndpoints:
                     }
                 ).encode("utf-8")
             else:
-                logger.warning(f"Failed login attempt for user '{username}'")
+                retry_after = self._login_throttle.register_failure(client_ip, username)
+                if retry_after > 0:
+                    cherrypy.response.status = 429
+                    cherrypy.response.headers["Retry-After"] = str(retry_after)
+                    logger.warning(
+                        "Failed login attempt throttled for user '%s' from %s (retry_after=%ss)",
+                        username,
+                        client_ip,
+                        retry_after,
+                    )
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": "Too many login attempts. Please wait and try again.",
+                            "retry_after": retry_after,
+                        }
+                    ).encode("utf-8")
+
+                cherrypy.response.status = 401
+                logger.warning("Failed login attempt for user '%s' from %s", username, client_ip)
 
                 # Don't reveal which part was wrong
                 return json.dumps(
