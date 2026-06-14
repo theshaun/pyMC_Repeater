@@ -133,7 +133,24 @@ def test_gps_service_modem_http_source_reads_generic_modem_gps(monkeypatch):
                             "longitude": -71.05888,
                             "altitude_m": 12.5,
                         },
-                        "satellites": {"used_count": 9, "in_view_count": 14},
+                        "satellites": {
+                            "used_count": 9,
+                            "in_view_count": 14,
+                            "in_view": [
+                                {
+                                    "prn": "04",
+                                    "elevation_degrees": 77,
+                                    "azimuth_degrees": 45,
+                                    "snr_db": 42,
+                                },
+                                {
+                                    "prn": "05",
+                                    "elevation_degrees": 13,
+                                    "azimuth_degrees": 180,
+                                    "snr_db": 35,
+                                },
+                            ],
+                        },
                         "time": {"datetime_utc": "2026-06-14T18:25:30+00:00"},
                     },
                 }
@@ -188,6 +205,11 @@ def test_gps_service_modem_http_source_reads_generic_modem_gps(monkeypatch):
     assert snapshot["fix"]["quality"] == 1
     assert snapshot["satellites"]["used_count"] == 9
     assert snapshot["satellites"]["in_view_count"] == 14
+    assert snapshot["satellites"]["in_view"] == [
+        {"prn": "04", "elevation_degrees": 77, "azimuth_degrees": 45, "snr_db": 42.0},
+        {"prn": "05", "elevation_degrees": 13, "azimuth_degrees": 180, "snr_db": 35.0},
+    ]
+    assert snapshot["satellites"]["snr"] == {"min": 35.0, "max": 42.0, "avg": 38.5}
     assert snapshot["time"]["datetime_utc"] == "2026-06-14T18:25:30+00:00"
 
 

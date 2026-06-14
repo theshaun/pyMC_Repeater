@@ -338,6 +338,28 @@ class NMEAParser:
             in_view = _to_int(satellites.get("in_view_count", satellites.get("satellites_in_view")))
             if in_view is not None:
                 self.satellites["in_view_count"] = in_view
+            satellite_details = satellites.get("in_view")
+            if isinstance(satellite_details, list):
+                normalized = []
+                for satellite in satellite_details:
+                    if not isinstance(satellite, dict):
+                        continue
+                    prn = satellite.get("prn", satellite.get("id"))
+                    if prn in (None, ""):
+                        continue
+                    normalized.append(
+                        {
+                            "prn": str(prn),
+                            "elevation_degrees": _to_int(
+                                satellite.get("elevation_degrees", satellite.get("elevation"))
+                            ),
+                            "azimuth_degrees": _to_int(
+                                satellite.get("azimuth_degrees", satellite.get("azimuth"))
+                            ),
+                            "snr_db": _to_float(satellite.get("snr_db", satellite.get("snr"))),
+                        }
+                    )
+                self.satellites["in_view"] = normalized
 
             for key in ("datetime_utc", "utc_time", "date"):
                 value = time_data.get(key) or payload.get(key)
