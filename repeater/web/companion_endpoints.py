@@ -418,9 +418,7 @@ class CompanionAPIEndpoints:
         # that every other path honors. Trim favourite-aware (oldest non-favourites
         # first) so persisted contacts never exceed max_contacts.
         try:
-            removed = trim_companion_contacts_to_fit(
-                sqlite_handler, companion_hash, max_contacts
-            )
+            removed = trim_companion_contacts_to_fit(sqlite_handler, companion_hash, max_contacts)
         except ValueError as exc:
             raise cherrypy.HTTPError(
                 409,

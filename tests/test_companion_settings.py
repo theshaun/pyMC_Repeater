@@ -341,9 +341,7 @@ class TestImportRepeaterContactsCap:
     @classmethod
     def _bridge(cls, max_contacts):
         contacts = SimpleNamespace(max_contacts=max_contacts, loaded=None)
-        contacts.load_from_dicts = lambda records: setattr(
-            contacts, "loaded", list(records)
-        )
+        contacts.load_from_dicts = lambda records: setattr(contacts, "loaded", list(records))
         return SimpleNamespace(_companion_hash=cls._HASH, contacts=contacts)
 
     def test_import_over_cap_trims_to_fit(self, tmp_path):
@@ -396,9 +394,7 @@ class TestImportRepeaterContactsCap:
         import cherrypy
 
         h = self._handler(tmp_path)
-        self._save_contacts(
-            h, [self._contact(i, flags=1, lastmod=i) for i in range(51)]
-        )
+        self._save_contacts(h, [self._contact(i, flags=1, lastmod=i) for i in range(51)])
         self._seed_adverts(h, 1)
         bridge = self._bridge(max_contacts=50)
         ep = self._endpoint(h, bridge, {"companion_name": "c"})
