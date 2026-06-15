@@ -5,7 +5,7 @@ import json
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from .base import SensorBase
 from .registry import SensorRegistry
@@ -29,17 +29,30 @@ class PymcModemSensor(SensorBase):
         base_url = self.settings.get("base_url")
         if base_url:
             base = str(base_url).rstrip("/") + "/"
-            return urljoin(base, self.endpoint.lstrip("/"))
+            return self._validate_url(urljoin(base, self.endpoint.lstrip("/")))
 
         host = str(self.settings.get("host", "") or "").strip()
         if not host:
             raise ValueError("pymc_modem requires settings.host or settings.base_url")
-        scheme = str(self.settings.get("scheme", "http") or "http")
+        scheme = str(self.settings.get("scheme", "http") or "http").lower()
+        if scheme not in {"http", "https"}:
+            raise ValueError("pymc_modem scheme must be http or https")
         port = self.settings.get("port")
         netloc = host
         if port not in (None, ""):
             netloc = f"{host}:{int(port)}"
-        return f"{scheme}://{netloc}{self.endpoint if self.endpoint.startswith('/') else '/' + self.endpoint}"
+        return self._validate_url(
+            f"{scheme}://{netloc}{self.endpoint if self.endpoint.startswith('/') else '/' + self.endpoint}"
+        )
+
+    @staticmethod
+    def _validate_url(url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("pymc_modem URL scheme must be http or https")
+        if not parsed.netloc:
+            raise ValueError("pymc_modem URL must include a host")
+        return url
 
     def _read(self) -> Dict[str, Any]:
         request = urllib.request.Request(self.url, headers={"Accept": "application/json"})
@@ -48,7 +61,7 @@ class PymcModemSensor(SensorBase):
             request.add_header("Authorization", "Basic " + base64.b64encode(raw).decode("ascii"))
 
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # nosec B310
                 status = int(getattr(response, "status", 200) or 200)
                 body = response.read()
         except urllib.error.HTTPError as exc:
@@ -81,7 +94,9 @@ class PymcModemSensor(SensorBase):
         )
         fix = self._first_dict(gps.get("fix"), payload.get("fix"))
         satellites = self._first_dict(gps.get("satellites"), payload.get("satellites"))
-        time_data = self._first_dict(gps.get("time"), gps.get("time_data"), payload.get("time_data"))
+        time_data = self._first_dict(
+            gps.get("time"), gps.get("time_data"), payload.get("time_data")
+        )
         motion = self._first_dict(gps.get("motion"), payload.get("motion"))
 
         out: Dict[str, Any] = {
@@ -107,7 +122,11 @@ class PymcModemSensor(SensorBase):
             ),
         }
 
-        for key in ("battery_voltage_mv", "battery_voltage_v", "solar_charge_rate_percent_per_hour"):
+        for key in (
+            "battery_voltage_mv",
+            "battery_voltage_v",
+            "solar_charge_rate_percent_per_hour",
+        ):
             if key in payload:
                 out[key] = payload[key]
 

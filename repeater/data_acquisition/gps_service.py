@@ -22,6 +22,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse
 
 logger = logging.getLogger("GPSService")
 
@@ -292,11 +293,16 @@ class NMEAParser:
 
         gps = payload.get("gps") if isinstance(payload.get("gps"), dict) else payload
         position = self._first_dict(
-            gps.get("position"), gps.get("gps_position"), gps.get("location"), payload.get("position")
+            gps.get("position"),
+            gps.get("gps_position"),
+            gps.get("location"),
+            payload.get("position"),
         )
         fix = self._first_dict(gps.get("fix"), payload.get("fix"))
         satellites = self._first_dict(gps.get("satellites"), payload.get("satellites"))
-        time_data = self._first_dict(gps.get("time"), gps.get("time_data"), payload.get("time_data"))
+        time_data = self._first_dict(
+            gps.get("time"), gps.get("time_data"), payload.get("time_data")
+        )
         motion = self._first_dict(gps.get("motion"), payload.get("motion"))
 
         latitude = _to_float(position.get("latitude"))
@@ -379,7 +385,9 @@ class NMEAParser:
                 "gps_seen": gps.get("seen"),
                 "battery_voltage_mv": payload.get("battery_voltage_mv"),
                 "battery_voltage_v": payload.get("battery_voltage_v"),
-                "solar_charge_rate_percent_per_hour": payload.get("solar_charge_rate_percent_per_hour"),
+                "solar_charge_rate_percent_per_hour": payload.get(
+                    "solar_charge_rate_percent_per_hour"
+                ),
             }
             self._refresh_derived_unlocked()
             return True
@@ -749,7 +757,7 @@ class GPSService:
         self.modem_http_endpoint = str(gps_config.get("endpoint", "/api/stats") or "/api/stats")
         if not self.modem_http_endpoint.startswith("/"):
             self.modem_http_endpoint = "/" + self.modem_http_endpoint
-        self.modem_http_scheme = str(gps_config.get("scheme", "http") or "http")
+        self.modem_http_scheme = str(gps_config.get("scheme", "http") or "http").lower()
         self.modem_http_username = str(gps_config.get("username", "admin") or "admin")
         self.modem_http_password = gps_config.get("password")
         self.repeater_config = repeater_config
@@ -940,9 +948,15 @@ class GPSService:
                     "device": self.device if self.source == "serial" else None,
                     "baud_rate": self.baud_rate if self.source == "serial" else None,
                     "source_path": self.source_path if self.source == "file" else None,
-                    "host": self.modem_http_host if self.source in ("modem_http", "pymc_modem", "http") else None,
-                    "port": self.modem_http_port if self.source in ("modem_http", "pymc_modem", "http") else None,
-                    "endpoint": self.modem_http_endpoint if self.source in ("modem_http", "pymc_modem", "http") else None,
+                    "host": self.modem_http_host
+                    if self.source in ("modem_http", "pymc_modem", "http")
+                    else None,
+                    "port": self.modem_http_port
+                    if self.source in ("modem_http", "pymc_modem", "http")
+                    else None,
+                    "endpoint": self.modem_http_endpoint
+                    if self.source in ("modem_http", "pymc_modem", "http")
+                    else None,
                     "read_timeout_seconds": self.read_timeout_seconds,
                     "poll_interval_seconds": self.poll_interval_seconds,
                     "stale_after_seconds": self.parser.stale_after_seconds,
@@ -1315,16 +1329,21 @@ class GPSService:
             return
 
         url = f"{self.modem_http_scheme}://{self.modem_http_host}:{self.modem_http_port}{self.modem_http_endpoint}"
+        if not self._is_safe_modem_http_url(url):
+            self._set_source_error(
+                "gps modem_http URL scheme must be http or https and include a host"
+            )
+            self._running = False
+            return
+
         while not self._stop_event.is_set():
             request = urllib.request.Request(url, headers={"Accept": "application/json"})
             if self.modem_http_password not in (None, ""):
                 raw_auth = f"{self.modem_http_username}:{self.modem_http_password}".encode("utf-8")
-                request.add_header(
-                    "Authorization", "Basic " + b64encode(raw_auth).decode("ascii")
-                )
+                request.add_header("Authorization", "Basic " + b64encode(raw_auth).decode("ascii"))
 
             try:
-                with urllib.request.urlopen(request, timeout=self.read_timeout_seconds) as response:
+                with urllib.request.urlopen(request, timeout=self.read_timeout_seconds) as response:  # nosec B310
                     status = int(getattr(response, "status", 200) or 200)
                     body = response.read()
                 if status < 200 or status >= 300:
@@ -1346,6 +1365,11 @@ class GPSService:
             self._stop_event.wait(self.poll_interval_seconds)
 
         self._running = False
+
+    @staticmethod
+    def _is_safe_modem_http_url(url: str) -> bool:
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
     @staticmethod
     def _extract_file_sentences(content: str) -> List[str]:
