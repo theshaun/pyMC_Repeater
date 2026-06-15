@@ -31,7 +31,7 @@
       "tx_power": 22,
       "preamble_length": 32
     },
-     "uconsole_aio_v2": {
+    "uconsole_aio_v2": {
       "name": "uConsole LoRa Module aio v2",
       "bus_id": 1,
       "cs_id": 0,
@@ -303,7 +303,7 @@
       "use_gpiod_backend": true,
       "gpio_chip": 1
     },
-      "ultrapeaterzero-e22": {
+    "ultrapeaterzero-e22": {
       "name": "Zindello Industries UltraPeaterZero E22",
       "bus_id": 0,
       "cs_id": 0,
@@ -321,7 +321,7 @@
       "use_dio3_tcxo": true,
       "preamble_length": 32
     },
-      "ultrapeaterzero-e22p": {
+    "ultrapeaterzero-e22p": {
       "name": "Zindello Industries UltraPeaterZero E22P",
       "bus_id": 0,
       "cs_id": 0,
@@ -338,6 +338,26 @@
       "use_dio2_rf": false,
       "use_dio3_tcxo": true,
       "preamble_length": 32
+    },
+    "bq-station-g3": {
+      "name": "BQ Voyage Station G3",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": -1,
+      "reset_pin": 16,
+      "busy_pin": 24,
+      "irq_pin": 22,
+      "txen_pin": -1,
+      "rxen_pin": -1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 19,
+      "use_dio2_rf": true,
+      "use_dio3_tcxo": true,
+      "dio3_tcxo_voltage": 1.8,
+      "preamble_length": 32,
+      "use_gpiod_backend": true,
+      "gpio_chip": 1
     },
     "pymc_usb": {
       "name": "pymc_usb modem (USB-CDC)",
