@@ -150,7 +150,7 @@
     "zebra-duo-hat-r1": {
       "name": "ZebraHatDuo-R1-1W",
       "bus_id": 0,
-      "cs_id": 0,
+      "cs_id": 1,
       "cs_pin": -1,
       "reset_pin": 17,
       "busy_pin": 27,
