@@ -155,7 +155,6 @@ gps:
   poll_interval_seconds: 2.0
 
   # Modem HTTP source settings (used when source: modem_http)
-  # This is intentionally modem-generic. Today it can point at the Photon
   # modem's HTTP API; later it can point at another board such as Heltec V4
   # if that modem exposes the same GPS JSON shape.
   host: ""
