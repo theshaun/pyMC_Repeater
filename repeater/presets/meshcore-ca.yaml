@@ -30,7 +30,7 @@ brokers:
       enabled: true
       insecure: false
 
-- name: "MeshCore.CA Backup"
+  - name: "MeshCore.CA Backup"
     enabled: true
     host: mqtt2.meshcore.ca
     port: 443
