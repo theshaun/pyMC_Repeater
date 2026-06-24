@@ -160,6 +160,23 @@ def test_hardware_stats_sensor_reads_from_collector(monkeypatch):
     assert reading["data"] == {"cpu": {"usage_percent": 42.0}}
 
 
+def test_hardware_stats_collector_reads_os_kernel_and_arch(tmp_path, monkeypatch):
+    import repeater.data_acquisition.hardware_stats as hardware_stats_module
+
+    os_release = tmp_path / "os-release"
+    os_release.write_text('NAME="Debian GNU/Linux"\nPRETTY_NAME="Debian GNU/Linux 12"\n')
+    monkeypatch.setattr(hardware_stats_module.platform, "release", lambda: "6.8.0-test")
+    monkeypatch.setattr(hardware_stats_module.platform, "machine", lambda: "aarch64")
+
+    info = hardware_stats_module.HardwareStatsCollector._get_system_info(str(os_release))
+
+    assert info == {
+        "os": "Debian GNU/Linux 12",
+        "kernel": "6.8.0-test",
+        "arch": "aarch64",
+    }
+
+
 def test_pymc_modem_sensor_reads_modem_stats(monkeypatch):
     class _Response:
         status = 200
