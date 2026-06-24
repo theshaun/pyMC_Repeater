@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/pymc_repeater}"
-CONFIG_DIR="${CONFIG_DIR:-/etc/pymc_repeater}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/openhop_repeater}"
+CONFIG_DIR="${CONFIG_DIR:-/etc/openhop_repeater}"
 CONFIG_PATH="${PYMC_REPEATER_CONFIG:-${CONFIG_DIR}/config.yaml}"
 EXAMPLE_PATH="${CONFIG_DIR}/config.yaml.example"
 BUNDLED_EXAMPLE_PATH="${INSTALL_DIR}/config.yaml.example"
@@ -22,7 +22,7 @@ fail_bad_config_mount() {
     echo "Invalid Docker config mount: ${CONFIG_PATH} is a directory, but it must be the config file." >&2
     echo "This usually happens when ./config.yaml is bind-mounted before that host file exists." >&2
     echo "Use the supported folder mount instead:" >&2
-    echo "  - ./config:/etc/pymc_repeater" >&2
+    echo "  - ./config:/etc/openhop_repeater" >&2
     echo "Then place the config at ./config/config.yaml." >&2
     print_permission_help
     exit 1
@@ -40,7 +40,7 @@ copy_or_die() {
 
 use_runtime_merged_config() {
     src="$1"
-    runtime_dir="$(mktemp -d /tmp/pymc-repeater-config.XXXXXX)"
+    runtime_dir="$(mktemp -d /tmp/openhop-repeater-config.XXXXXX)"
     runtime_config="${runtime_dir}/config.yaml"
 
     if ! cp "${src}" "${runtime_config}"; then

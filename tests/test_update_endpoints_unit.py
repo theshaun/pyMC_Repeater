@@ -33,7 +33,7 @@ def _fake_thread(*args, **kwargs):
 
 def test_jwt_warning_fix_guard():
     # Guard test file import path and ensure this module executes in suite.
-    assert ue.PACKAGE_NAME == "pymc_repeater"
+    assert ue.PACKAGE_NAME == "openhop_repeater"
 
 
 def test_has_update_paths():

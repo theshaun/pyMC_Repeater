@@ -1,9 +1,9 @@
 from unittest.mock import patch
 
 import yaml
-from pymc_core.protocol.constants import PAYLOAD_TYPE_GRP_TXT
-from pymc_core.protocol.identity import LocalIdentity
-from pymc_core.protocol.packet_builder import PacketBuilder
+from openhop_core.protocol.constants import PAYLOAD_TYPE_GRP_TXT
+from openhop_core.protocol.identity import LocalIdentity
+from openhop_core.protocol.packet_builder import PacketBuilder
 
 from repeater.policy_engine import PolicyEngine
 

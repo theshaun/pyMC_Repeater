@@ -1,5 +1,5 @@
 """
-Trace packet handling helper for pyMC Repeater.
+Trace packet handling helper for openHop Repeater.
 
 This module handles the processing and forwarding of trace packets,
 which are used for network diagnostics to track the path and SNR
@@ -11,10 +11,10 @@ import logging
 import time
 from typing import Any, Dict, List
 
-from pymc_core.hardware.signal_utils import snr_register_to_db
-from pymc_core.node.handlers.trace import TraceHandler
-from pymc_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.hardware.signal_utils import snr_register_to_db
+from openhop_core.node.handlers.trace import TraceHandler
+from openhop_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
+from openhop_core.protocol.packet_utils import PathUtils
 
 logger = logging.getLogger("TraceHelper")
 

@@ -1,5 +1,5 @@
 """
-CLI client for pyMC Repeater.
+CLI client for openHop Repeater.
 Connects to an already-running repeater daemon via its HTTP API.
 Reads admin password and HTTP port from the local config.yaml automatically.
 """
@@ -9,7 +9,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 CONFIG_PATHS = [
-    "/etc/pymc_repeater/config.yaml",
+    "/etc/openhop_repeater/config.yaml",
     "config.yaml",
 ]
 
@@ -79,7 +79,7 @@ def run_client_cli(host: str = "127.0.0.1", port: int = 8000, password: Optional
         print("Error: Authentication failed. Check password or repeater status.")
         sys.exit(1)
 
-    print(f"\npyMC Repeater CLI (connected to {base_url})")
+    print(f"\nopenHop Repeater CLI (connected to {base_url})")
     print("Type 'help' for available commands, 'exit' to quit.\n")
 
     while True:
@@ -123,7 +123,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Connect to a running pyMC Repeater and issue CLI commands"
+        description="Connect to a running openHop Repeater and issue CLI commands"
     )
     parser.add_argument(
         "--config",

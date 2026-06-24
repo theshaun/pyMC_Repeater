@@ -1,6 +1,6 @@
 # Adding a New Sensor Plug-in
 
-Sensors in pyMC_Repeater are self-contained modules that live in `repeater/sensors/`. The subsystem is plug-in based: adding a new sensor requires only one new file. The manager discovers and loads it automatically at runtime by importing the module named after the sensor type.
+Sensors in openhop-repeater are self-contained modules that live in `repeater/sensors/`. The subsystem is plug-in based: adding a new sensor requires only one new file. The manager discovers and loads it automatically at runtime by importing the module named after the sensor type.
 
 ---
 

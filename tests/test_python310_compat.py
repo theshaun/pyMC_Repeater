@@ -1,6 +1,6 @@
 """Regression tests guarding against Python 3.10 compatibility breakage.
 
-pyMC Repeater supports Python 3.10+ (LuckFox Pico Ultra ships with 3.10).
+openHop Repeater supports Python 3.10+ (LuckFox Pico Ultra ships with 3.10).
 These tests scan the source tree statically so regressions are caught in CI
 without needing a 3.10 interpreter in the test environment.
 """

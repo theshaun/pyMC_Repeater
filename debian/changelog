@@ -1,4 +1,4 @@
-pymc-repeater (1.0.5~dev0) unstable; urgency=medium
+openhop-repeater (1.0.5~dev0) unstable; urgency=medium
 
   * Development build from git commit 7112da9
   * Version: 1.0.5.post0

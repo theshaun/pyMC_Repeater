@@ -5,7 +5,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from pymc_core.companion.constants import RESP_CODE_NO_MORE_MESSAGES
+from openhop_core.companion.constants import RESP_CODE_NO_MORE_MESSAGES
 
 from repeater.companion.bridge import RepeaterCompanionBridge, _to_json_safe
 from repeater.companion.frame_server import CompanionFrameServer

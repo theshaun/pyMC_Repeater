@@ -1,5 +1,5 @@
 """
-Integration tests for multi-byte path hash support using real pymc_core protocol objects.
+Integration tests for multi-byte path hash support using real openhop_core protocol objects.
 
 Exercises actual Packet, PathUtils, PacketBuilder, and engine forwarding
 rather than mocking the protocol layer. Covers:
@@ -16,9 +16,9 @@ import struct
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pymc_core.node.handlers.trace import TraceHandler
-from pymc_core.protocol import Packet, PacketBuilder, PathUtils
-from pymc_core.protocol.constants import (
+from openhop_core.node.handlers.trace import TraceHandler
+from openhop_core.protocol import Packet, PacketBuilder, PathUtils
+from openhop_core.protocol.constants import (
     MAX_PATH_SIZE,
     PATH_HASH_COUNT_MASK,
     PATH_HASH_SIZE_SHIFT,
@@ -730,7 +730,7 @@ class TestTraceHelperMultibyte:
     """TraceHelper._should_forward_trace with 2-byte TRACE payload hashes."""
 
     def test_should_forward_when_next_hop_matches_pubkey_prefix(self):
-        from pymc_core.protocol import LocalIdentity
+        from openhop_core.protocol import LocalIdentity
 
         from repeater.handler_helpers.trace import TraceHelper
 
@@ -752,7 +752,7 @@ class TestTraceHelperMultibyte:
         assert th._should_forward_trace(pkt, trace_bytes, flags, hash_width)
 
     def test_should_not_forward_when_next_hop_mismatch(self):
-        from pymc_core.protocol import LocalIdentity
+        from openhop_core.protocol import LocalIdentity
 
         from repeater.handler_helpers.trace import TraceHelper
 

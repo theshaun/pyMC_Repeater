@@ -22,7 +22,7 @@ from repeater.companion.utils import (
     validate_companion_config_capacity,
 )
 
-# pymc_core defaults (CompanionBridge / ContactStore)
+# openhop_core defaults (CompanionBridge / ContactStore)
 _DEFAULT_MAX_CONTACTS = 1000
 
 

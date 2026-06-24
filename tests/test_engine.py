@@ -1,5 +1,5 @@
 """
-tests for pyMC_Repeater engine.py — RepeaterHandler.
+tests for openhop-repeater engine.py — RepeaterHandler.
 
 Covers: flood_forward, direct_forward, process_packet, duplicate detection,
 mark_seen, validate_packet, packet scoring, TX delay, cache management,
@@ -12,8 +12,8 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from pymc_core.protocol import Packet, PacketBuilder
-from pymc_core.protocol.constants import (
+from openhop_core.protocol import Packet, PacketBuilder
+from openhop_core.protocol.constants import (
     MAX_PATH_SIZE,
     PH_ROUTE_MASK,
     PH_TYPE_SHIFT,
@@ -1754,7 +1754,7 @@ class TestMissedEngineBranches:
         pkt = _make_transport_flood_packet(payload=b"\x01\x02", path=b"")
         pkt.transport_codes = [0xCAFE, 0xBEEF]
 
-        with patch("pymc_core.protocol.transport_keys.calc_transport_code", return_value=0xCAFE):
+        with patch("openhop_core.protocol.transport_keys.calc_transport_code", return_value=0xCAFE):
             allowed_1, reason_1 = handler._check_transport_codes(pkt)
             allowed_2, reason_2 = handler._check_transport_codes(pkt)
 

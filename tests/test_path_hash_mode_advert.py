@@ -8,9 +8,9 @@ returns 2 or 3. The dispatcher applies this in send_packet() before transmit.
 
 import pytest
 
-from pymc_core.node.dispatcher import Dispatcher
-from pymc_core.protocol import Packet
-from pymc_core.protocol.constants import (
+from openhop_core.node.dispatcher import Dispatcher
+from openhop_core.protocol import Packet
+from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ADVERT,
     PH_TYPE_SHIFT,
     ROUTE_TYPE_FLOOD,

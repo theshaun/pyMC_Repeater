@@ -47,7 +47,7 @@ class GlassHandler:
         self.verify_tls = True
         self.api_token = ""  # nosec - runtime config value, not a hardcoded credential
         self.inform_interval_seconds = 30
-        self.cert_store_dir = "/etc/pymc_repeater/glass"
+        self.cert_store_dir = "/etc/openhop_repeater/glass"
         self._cert_expires_at: Optional[str] = None
         self.mqtt_enabled = False
         self.mqtt_broker_host = "localhost"
@@ -132,8 +132,8 @@ class GlassHandler:
             int(glass_cfg.get("inform_interval_seconds", self.inform_interval_seconds))
         )
         self.cert_store_dir = str(
-            glass_cfg.get("cert_store_dir", "/etc/pymc_repeater/glass")
-            or "/etc/pymc_repeater/glass"
+            glass_cfg.get("cert_store_dir", "/etc/openhop_repeater/glass")
+            or "/etc/openhop_repeater/glass"
         )
         self.client_cert_path = (
             str(glass_cfg.get("client_cert_path")).strip()

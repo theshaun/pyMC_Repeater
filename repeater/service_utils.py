@@ -1,5 +1,5 @@
 """
-Service management utilities for pyMC Repeater.
+Service management utilities for openHop Repeater.
 Provides functions for service control operations like restart.
 """
 
@@ -12,7 +12,7 @@ import time
 from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger("ServiceUtils")
-INIT_SCRIPT = "/etc/init.d/S80pymc-repeater"
+INIT_SCRIPT = "/etc/init.d/S80openhop-repeater"
 BUILDROOT_METADATA_PATH = "/etc/pymc-image-build-id"
 _CONTAINER_RESTART_DELAY_SECONDS = 1.0
 _SH_BIN = shutil.which("sh") or "sh"
@@ -91,14 +91,14 @@ def get_container_restart_message() -> str:
     """Return the user-facing restart message for containerized installs."""
     return (
         "Container restart initiated. "
-        "If you are running pyMC Repeater via Docker or Home Assistant, pull or rebuild "
+        "If you are running openHop Repeater via Docker or Home Assistant, pull or rebuild "
         "a newer image for packaged image updates to take effect."
     )
 
 
 def restart_service() -> Tuple[bool, str]:
     """
-    Restart the pymc-repeater service.
+    Restart the openhop-repeater service.
 
     On Buildroot/Luckfox, use the shipped init script directly.
     On systemd hosts, try polkit-based restart first (plain systemctl), then
@@ -135,7 +135,7 @@ def restart_service() -> Tuple[bool, str]:
     # Try polkit-based restart first (works on bare metal / VMs with polkit running)
     try:
         result = subprocess.run(
-            [_SYSTEMCTL_BIN, "restart", "pymc-repeater"],
+            [_SYSTEMCTL_BIN, "restart", "openhop-repeater"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -162,10 +162,10 @@ def restart_service() -> Tuple[bool, str]:
     except Exception as e:
         logger.warning(f"Polkit restart attempt failed: {e}")
 
-    # Fallback: use sudo (requires /etc/sudoers.d/pymc-repeater rule)
+    # Fallback: use sudo (requires /etc/sudoers.d/openhop-repeater rule)
     try:
         result = subprocess.run(
-            [_SUDO_BIN, "--non-interactive", _SYSTEMCTL_BIN, "restart", "pymc-repeater"],
+            [_SUDO_BIN, "--non-interactive", _SYSTEMCTL_BIN, "restart", "openhop-repeater"],
             capture_output=True,
             text=True,
             timeout=5,

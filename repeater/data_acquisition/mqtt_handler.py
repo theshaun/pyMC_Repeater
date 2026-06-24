@@ -255,7 +255,7 @@ class _BrokerConnection:
                 )
                 self.base_topic = f"meshcore/{self.iata_code}/{self.public_key}"
 
-        from pymc_core.protocol.utils import PAYLOAD_TYPES
+        from openhop_core.protocol.utils import PAYLOAD_TYPES
 
         disallowed_types = broker.get("disallowed_packet_types", [])
         type_name_map = {name: code for code, name in PAYLOAD_TYPES.items()}
@@ -973,7 +973,7 @@ class MeshCoreToMqttPusher:
             "model": "PyMC-Repeater",
             "firmware_version": self.app_version,
             "radio": radio_config or self.radio_config,
-            "client_version": f"pyMC_repeater/{self.app_version}",
+            "client_version": f"openhop_repeater/{self.app_version}",
             "stats": {**live_stats, "errors": 0, "queue_len": 0, **(extra_stats or {})},
         }
 

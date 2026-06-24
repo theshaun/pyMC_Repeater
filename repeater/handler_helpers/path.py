@@ -12,7 +12,7 @@ class PathHelper:
 
     async def process_path_packet(self, packet):
 
-        from pymc_core.protocol.crypto import CryptoUtils
+        from openhop_core.protocol.crypto import CryptoUtils
 
         try:
             if len(packet.payload) < 2:

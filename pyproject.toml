@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel", "setuptools_scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pymc_repeater"
+name = "openhop_repeater"
 dynamic = ["version"]
 authors = [
     {name = "Rightup", email = "rightup@pymc.dev"},
@@ -29,7 +29,7 @@ keywords = ["mesh", "networking", "lora", "repeater", "daemon", "iot"]
 
 
 dependencies = [
-    "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev",
+    "openhop_core[hardware]",
     "pyyaml>=6.0.0",
     "cherrypy>=18.0.0",
     "paho-mqtt>=1.6.0",
@@ -45,7 +45,7 @@ dependencies = [
 [project.optional-dependencies]
 # SX1262/SPI support (Linux only; required for Raspberry Pi HATs)
 hardware = [
-    "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev",
+    "openhop_core[hardware] @ git+https://github.com/rightup/openhop-core.git@dev",
 ]
 # RRD metrics (Performance Metrics chart); system librrd required (e.g. apt install rrdtool)
 rrd = [
@@ -59,7 +59,7 @@ dev = [
 ]
 
 [project.scripts]
-pymc-repeater = "repeater.main:main"
+openhop-repeater = "repeater.main:main"
 pymc-cli = "repeater.local_cli:main"
 
 [tool.setuptools.packages.find]

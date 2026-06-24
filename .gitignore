@@ -28,9 +28,9 @@ share/python-wheels/
 DEBIAN/
 debian/files
 debian/.debhelper/
-debian/pymc-repeater/
-debian/pymc-repeater.debhelper.log
-debian/pymc-repeater.substvars
+debian/openhop-repeater/
+debian/openhop-repeater.debhelper.log
+debian/openhop-repeater.substvars
 
 # Virtual environments
 .venv/

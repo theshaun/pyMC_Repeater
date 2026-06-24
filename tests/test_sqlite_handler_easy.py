@@ -68,7 +68,7 @@ def test_generate_transport_key_uses_implicit_hashtag_region(tmp_path, monkeypat
     h = _make_handler(tmp_path)
 
     captured = {}
-    fake_transport_keys = types.ModuleType("pymc_core.protocol.transport_keys")
+    fake_transport_keys = types.ModuleType("openhop_core.protocol.transport_keys")
 
     def _fake_get_auto_key_for(name: str) -> bytes:
         captured["name"] = name
@@ -76,15 +76,15 @@ def test_generate_transport_key_uses_implicit_hashtag_region(tmp_path, monkeypat
 
     fake_transport_keys.get_auto_key_for = _fake_get_auto_key_for
 
-    fake_protocol = types.ModuleType("pymc_core.protocol")
+    fake_protocol = types.ModuleType("openhop_core.protocol")
     fake_protocol.transport_keys = fake_transport_keys
 
-    fake_core = types.ModuleType("pymc_core")
+    fake_core = types.ModuleType("openhop_core")
     fake_core.protocol = fake_protocol
 
-    monkeypatch.setitem(sys.modules, "pymc_core", fake_core)
-    monkeypatch.setitem(sys.modules, "pymc_core.protocol", fake_protocol)
-    monkeypatch.setitem(sys.modules, "pymc_core.protocol.transport_keys", fake_transport_keys)
+    monkeypatch.setitem(sys.modules, "openhop_core", fake_core)
+    monkeypatch.setitem(sys.modules, "openhop_core.protocol", fake_protocol)
+    monkeypatch.setitem(sys.modules, "openhop_core.protocol.transport_keys", fake_transport_keys)
 
     generated = h.generate_transport_key("eu")
     generated_bytes = base64.b64decode(generated)

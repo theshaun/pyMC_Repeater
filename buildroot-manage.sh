@@ -1,28 +1,28 @@
 #!/bin/bash
-# Buildroot/Luckfox management entrypoint for pyMC Repeater
+# Buildroot/Luckfox management entrypoint for openHop Repeater
 
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-INSTALL_DIR="/opt/pymc_repeater"
+INSTALL_DIR="/opt/openhop_repeater"
 VENV_DIR="$INSTALL_DIR/venv"
 VENV_PIP="$VENV_DIR/bin/pip"
 VENV_PYTHON="$VENV_DIR/bin/python"
-CONFIG_DIR="/etc/pymc_repeater"
-LOG_DIR="/var/log/pymc_repeater"
-DATA_DIR="/var/lib/pymc_repeater"
+CONFIG_DIR="/etc/openhop_repeater"
+LOG_DIR="/var/log/openhop_repeater"
+DATA_DIR="/var/lib/openhop_repeater"
 SERVICE_USER="root"
-INIT_SCRIPT="/etc/init.d/S80pymc-repeater"
-PIDFILE="/var/run/pymc-repeater.pid"
+INIT_SCRIPT="/etc/init.d/S80openhop-repeater"
+PIDFILE="/var/run/openhop-repeater.pid"
 LOGFILE="$LOG_DIR/repeater.log"
-SERVICE_NAME="pymc-repeater"
+SERVICE_NAME="openhop-repeater"
 SILENT_MODE="${PYMC_SILENT:-${SILENT:-}}"
 
 R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
 PIWHEELS_INDEX_URL="https://www.piwheels.org/simple"
 R2_ENABLED=1
 YQ_VERSION="${YQ_VERSION:-v4.44.3}"
-PYMC_CORE_REPO="${PYMC_CORE_REPO:-https://github.com/rightup/pyMC_core.git}"
+PYMC_CORE_REPO="${PYMC_CORE_REPO:-https://github.com/rightup/openhop-core.git}"
 PYMC_CORE_REF="${PYMC_CORE_REF:-}"
 PYMC_CORE_LOCAL_DIR="${PYMC_CORE_LOCAL_DIR:-}"
 PYMC_SKIP_BUILDROOT_DEP_INSTALL="${PYMC_SKIP_BUILDROOT_DEP_INSTALL:-0}"
@@ -486,9 +486,9 @@ cleanup_legacy_install_state() {
 
     for path in \
         "$INSTALL_DIR/repeater" \
-        "$INSTALL_DIR/pymc_core" \
-        "$INSTALL_DIR/pyMC_Repeater" \
-        "$INSTALL_DIR/pyMC_core"
+        "$INSTALL_DIR/openhop_core" \
+        "$INSTALL_DIR/openhop-repeater" \
+        "$INSTALL_DIR/openhop-core"
     do
         if [ -e "$path" ]; then
             rm -rf "$path"
@@ -641,8 +641,8 @@ install_core_into_venv() {
     local core_repo core_ref core_spec
 
     if [ -n "$PYMC_CORE_LOCAL_DIR" ]; then
-        [ -d "$PYMC_CORE_LOCAL_DIR" ] || fail "Missing local pyMC_core checkout: $PYMC_CORE_LOCAL_DIR"
-        stage "Installing pyMC_core"
+        [ -d "$PYMC_CORE_LOCAL_DIR" ] || fail "Missing local openhop-core checkout: $PYMC_CORE_LOCAL_DIR"
+        stage "Installing openhop-core"
         info "Local dir: ${PYMC_CORE_LOCAL_DIR}"
         "$VENV_PIP" install --upgrade --no-cache-dir --no-deps --no-build-isolation "$PYMC_CORE_LOCAL_DIR"
         return 0
@@ -654,8 +654,8 @@ install_core_into_venv() {
         *) core_repo="${core_repo}.git" ;;
     esac
     core_ref=$(resolve_core_ref)
-    core_spec="pyMC_core[hardware] @ git+${core_repo}@${core_ref}"
-    stage "Installing pyMC_core"
+    core_spec="openhop-core[hardware] @ git+${core_repo}@${core_ref}"
+    stage "Installing openhop-core"
     info "Repo: ${PYMC_CORE_REPO}"
     info "Ref: ${core_ref}"
     "$VENV_PIP" install --upgrade --no-cache-dir --no-deps --no-build-isolation "$core_spec"
@@ -667,7 +667,7 @@ import glob
 import json
 import os
 
-matches = glob.glob("/opt/pymc_repeater/venv/lib/python*/site-packages/pymc_core-*.dist-info/direct_url.json")
+matches = glob.glob("/opt/openhop_repeater/venv/lib/python*/site-packages/openhop_core-*.dist-info/direct_url.json")
 for path in matches:
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -693,7 +693,7 @@ resolve_core_commit() {
 }
 
 install_repeater_package() {
-    stage "Installing pyMC Repeater into venv"
+    stage "Installing openHop Repeater into venv"
     info "Installing checked-out repo without re-resolving dependencies"
     "$VENV_PIP" install --upgrade --no-cache-dir --no-deps --no-build-isolation "$SCRIPT_DIR"
 }
@@ -1232,7 +1232,7 @@ start_or_restart_service() {
 
 get_version() {
     if [ -x "$VENV_PYTHON" ]; then
-        "$VENV_PYTHON" -c "from importlib.metadata import version; print(version('pymc_repeater'))" 2>/dev/null || echo "not installed"
+        "$VENV_PYTHON" -c "from importlib.metadata import version; print(version('openhop_repeater'))" 2>/dev/null || echo "not installed"
     else
         echo "not installed"
     fi
@@ -1355,7 +1355,7 @@ install_repeater() {
     info "Install dir: $INSTALL_DIR"
     info "Config dir: $CONFIG_DIR"
     info "Data dir: $DATA_DIR"
-    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR" "$DATA_DIR/.config/pymc_repeater"
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR" "$DATA_DIR/.config/openhop_repeater"
     chown -R root:root "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR"
     chmod 755 "$INSTALL_DIR" "$DATA_DIR"
     chmod 750 "$CONFIG_DIR" "$LOG_DIR"
@@ -1417,7 +1417,7 @@ upgrade_repeater() {
     git_version=$(prepare_git_version)
     preinstall_r2_wheels
 
-    stage "Upgrading pyMC Repeater"
+    stage "Upgrading openHop Repeater"
     if [ "${PYMC_FORCE_DEPS:-0}" = "1" ]; then
         info "Forcing dependency reinstall"
         install_buildroot_dependencies
@@ -1431,13 +1431,13 @@ upgrade_repeater() {
     target_core_commit=$(resolve_core_commit)
     installed_core_commit=$(get_installed_core_commit)
     if [ -n "$target_core_commit" ] && [ "$installed_core_commit" = "$target_core_commit" ] && [ "${PYMC_FORCE_CORE:-0}" != "1" ]; then
-        info "pyMC_core is already at ${target_core_commit}; skipping reinstall"
+        info "openhop-core is already at ${target_core_commit}; skipping reinstall"
     else
         install_core_into_venv
     fi
 
     if [ "$current_version" = "$git_version" ] && [ "${PYMC_FORCE_REPEATER:-0}" != "1" ]; then
-        info "pyMC Repeater is already at ${git_version}; skipping reinstall"
+        info "openHop Repeater is already at ${git_version}; skipping reinstall"
     else
         ensure_yq >/dev/null 2>&1 || true
         install_repeater_package
@@ -1521,7 +1521,7 @@ Usage: bash buildroot-manage.sh <command>
 
 Commands:
   doctor      Check Buildroot/Luckfox prerequisites
-  install     Install pyMC Repeater on the Buildroot image
+  install     Install openHop Repeater on the Buildroot image
   upgrade     Upgrade the Buildroot installation from the checked-out repo
   config      Prompt for repeater settings and rewrite config.yaml
   configure   Same as config

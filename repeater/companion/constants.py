@@ -1,11 +1,11 @@
-"""Companion frame protocol constants — re-exported from pyMC_core.
+"""Companion frame protocol constants — re-exported from openhop-core.
 
-All protocol constants now live in :mod:`pymc_core.companion.constants`.
+All protocol constants now live in :mod:`openhop_core.companion.constants`.
 This module re-exports them so existing repeater imports continue to work.
 """
 
 # Re-exports; F401 ignored for re-exported names.
-from pymc_core.companion.constants import (  # noqa: F401
+from openhop_core.companion.constants import (  # noqa: F401
     ADV_TYPE_CHAT,
     ADV_TYPE_REPEATER,
     ADV_TYPE_ROOM,

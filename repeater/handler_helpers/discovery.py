@@ -1,5 +1,5 @@
 """
-Discovery request/response handling helper for pyMC Repeater.
+Discovery request/response handling helper for openHop Repeater.
 
 This module handles the processing and response to discovery requests,
 allowing other nodes to discover repeaters on the mesh network.
@@ -9,7 +9,7 @@ import asyncio
 import logging
 import secrets
 
-from pymc_core.node.handlers.control import ControlHandler
+from openhop_core.node.handlers.control import ControlHandler
 
 logger = logging.getLogger("DiscoveryHelper")
 
@@ -133,7 +133,7 @@ class DiscoveryHelper:
         try:
             our_pub_key = self.local_identity.get_public_key()
 
-            from pymc_core.protocol.packet_builder import PacketBuilder
+            from openhop_core.protocol.packet_builder import PacketBuilder
 
             response_packet = PacketBuilder.create_discovery_response(
                 tag=tag,

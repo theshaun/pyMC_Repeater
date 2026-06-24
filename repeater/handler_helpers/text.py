@@ -1,5 +1,5 @@
 """
-Text message (TXT_MSG) handling helper for pyMC Repeater.
+Text message (TXT_MSG) handling helper for openHop Repeater.
 
 This module processes incoming text messages for all managed identities
 (repeater identity + identity manager identities).
@@ -10,8 +10,8 @@ import asyncio
 import logging
 import time
 
-from pymc_core.node.handlers.text import TextMessageHandler
-from pymc_core.protocol import CryptoUtils, Identity
+from openhop_core.node.handlers.text import TextMessageHandler
+from openhop_core.protocol import CryptoUtils, Identity
 
 from .mesh_cli import MeshCLI
 from .room_server import RoomServer
@@ -603,8 +603,8 @@ class TextHelper:
         """
         import time
 
-        from pymc_core.protocol import PacketBuilder
-        from pymc_core.protocol.constants import PAYLOAD_TYPE_TXT_MSG
+        from openhop_core.protocol import PacketBuilder
+        from openhop_core.protocol.constants import PAYLOAD_TYPE_TXT_MSG
 
         try:
             src_hash = original_packet.payload[1]

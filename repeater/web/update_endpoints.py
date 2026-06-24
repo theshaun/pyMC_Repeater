@@ -1,5 +1,5 @@
 """
-OTA Update endpoints for pyMC Repeater.
+OTA Update endpoints for openHop Repeater.
 
 Provides server-side GitHub version checks, background pip-based upgrades with
 SSE progress streaming, and release-channel switching.
@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import ssl
 
 # Required for fixed internal maintenance commands.
@@ -41,10 +42,10 @@ logger = logging.getLogger("HTTPServer")
 # Repository constants
 # ---------------------------------------------------------------------------
 GITHUB_OWNER = "rightup"
-GITHUB_REPO = "pyMC_Repeater"
+GITHUB_REPO = "openhop-repeater"
 GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
 GITHUB_API_BASE = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
-PACKAGE_NAME = "pymc_repeater"
+PACKAGE_NAME = "openhop_repeater"
 
 # How long (seconds) before a cached check result expires
 CHECK_CACHE_TTL = 600  # 10 minutes
@@ -52,6 +53,8 @@ _RM_BIN = "/bin/rm"
 _SED_BIN = "/usr/bin/sed"
 _SYSTEMCTL_BIN = "/bin/systemctl"
 _SUDO_BIN = "/usr/bin/sudo"
+_INSTALL_DIR = "/opt/openhop_repeater"
+_LEGACY_INSTALL_DIR = "/opt/openhop-repeater"
 
 _github_ssl_ctx: Optional[ssl.SSLContext] = None
 _disk_version_mismatch_logged: Optional[tuple] = None
@@ -69,8 +72,9 @@ def _get_github_ssl_context() -> ssl.SSLContext:
 
 def _find_buildroot_upgrade_helper() -> Optional[str]:
     candidates = [
-        "/root/pyMC_Repeater/buildroot-manage.sh",
-        "/opt/pymc_repeater/pyMC_Repeater/buildroot-manage.sh",
+        "/root/openhop-repeater/buildroot-manage.sh",
+        "/opt/openhop_repeater/openhop-repeater/buildroot-manage.sh",
+        "/opt/openhop-repeater/openhop-repeater/buildroot-manage.sh",
         "/root/scripts/buildroot-manage.sh",
     ]
     for path in candidates:
@@ -89,7 +93,7 @@ class _RateLimitError(Exception):
 
 def _get_installed_version(force_refresh: bool = False) -> str:
     """
-    Return the highest dist-info version found for pymc_repeater across all
+    Return the highest dist-info version found for openhop_repeater across all
     directories the running interpreter actually uses.
 
     Search strategy (union of all three to cover venvs, system, dist-packages):
@@ -135,7 +139,7 @@ def _get_installed_version(force_refresh: bool = False) -> str:
         if p and ("site-packages" in p or "dist-packages" in p) and p not in dirs:
             dirs.append(p)
     # Explicitly include the dedicated venv's site-packages
-    _venv_site = "/opt/pymc_repeater/venv/lib"
+    _venv_site = "/opt/openhop_repeater/venv/lib"
     if os.path.isdir(_venv_site):
         for child in os.listdir(_venv_site):
             sp = os.path.join(_venv_site, child, "site-packages")
@@ -228,7 +232,7 @@ def _get_installed_version(force_refresh: bool = False) -> str:
 
 
 # Channels file – persisted so the choice survives daemon restarts
-_CHANNELS_FILE = "/var/lib/pymc_repeater/.update_channel"
+_CHANNELS_FILE = "/var/lib/openhop_repeater/.update_channel"
 
 
 def _detect_channel_from_dist_info() -> Optional[str]:
@@ -466,7 +470,7 @@ def _fetch_url(url: str, timeout: int = 10) -> str:
     Raises _RateLimitError on HTTP 403 so callers can back off gracefully.
     """
     installed = _get_installed_version()
-    headers = {"User-Agent": f"pymc-repeater/{installed}"}
+    headers = {"User-Agent": f"openhop-repeater/{installed}"}
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -565,7 +569,7 @@ def _cleanup_stale_dist_info(allow_sudo: bool = True) -> None:
     except AttributeError:
         pass
     # Also scan the dedicated venv's site-packages
-    _venv_site = "/opt/pymc_repeater/venv/lib"
+    _venv_site = "/opt/openhop_repeater/venv/lib"
     if os.path.isdir(_venv_site):
         for child in os.listdir(_venv_site):
             sp = os.path.join(_venv_site, child, "site-packages")
@@ -574,7 +578,7 @@ def _cleanup_stale_dist_info(allow_sudo: bool = True) -> None:
 
     pkg_glob = PACKAGE_NAME.replace("-", "_") + "-*.dist-info"
 
-    # Collect {path: version_str} for every pymc_repeater dist-info we find
+    # Collect {path: version_str} for every openhop_repeater dist-info we find
     found: dict = {}
     for site_dir in dirs:
         for meta_dir in glob.glob(os.path.join(site_dir, pkg_glob)):
@@ -794,15 +798,24 @@ def _migrate_service_unit() -> None:
         logger.info("[Update] Buildroot image detected, skipping systemd unit migration.")
         return
 
-    _SVC_UNIT = "/etc/systemd/system/pymc-repeater.service"
-    _VENV_PYTHON = "/opt/pymc_repeater/venv/bin/python"
+    _SVC_UNIT = "/etc/systemd/system/openhop-repeater.service"
+    _VENV_PYTHON = "/opt/openhop_repeater/venv/bin/python"
     try:
         subprocess.run([_SED_BIN, "-i", "/^Environment=.*PYTHONPATH/d", _SVC_UNIT], check=False)  # nosec B603
         subprocess.run(
             [
                 _SED_BIN,
                 "-i",
-                "s|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/pymc_repeater|",
+                "s|WorkingDirectory=/opt/openhop_repeater|WorkingDirectory=/var/lib/openhop_repeater|",
+                _SVC_UNIT,
+            ],
+            check=False,
+        )  # nosec B603
+        subprocess.run(
+            [
+                _SED_BIN,
+                "-i",
+                "s|WorkingDirectory=/opt/openhop-repeater|WorkingDirectory=/var/lib/openhop_repeater|",
                 _SVC_UNIT,
             ],
             check=False,
@@ -815,6 +828,68 @@ def _migrate_service_unit() -> None:
         logger.info("[Update] Service unit migration applied (root path).")
     except Exception as exc:
         logger.warning(f"[Update] Service unit migration failed: {exc}")
+
+
+def _merge_tree_missing_only(src: str, dst: str) -> None:
+    """Merge src into dst without overwriting existing files."""
+    if not os.path.isdir(src):
+        return
+
+    for root, dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target_root = dst if rel == "." else os.path.join(dst, rel)
+        os.makedirs(target_root, exist_ok=True)
+
+        for d in dirs:
+            os.makedirs(os.path.join(target_root, d), exist_ok=True)
+
+        for f in files:
+            src_file = os.path.join(root, f)
+            dst_file = os.path.join(target_root, f)
+            if not os.path.exists(dst_file):
+                shutil.copy2(src_file, dst_file)
+
+
+def _migrate_legacy_install_path() -> None:
+    """Handle /opt/openhop-repeater -> /opt/openhop_repeater migration safely."""
+    if not os.path.exists(_LEGACY_INSTALL_DIR):
+        return
+
+    if not os.path.exists(_INSTALL_DIR):
+        os.rename(_LEGACY_INSTALL_DIR, _INSTALL_DIR)
+        _state.append_line(
+            f"[pyMC updater] Migrated legacy install path: {_LEGACY_INSTALL_DIR} -> {_INSTALL_DIR}"
+        )
+        return
+
+    _merge_tree_missing_only(_LEGACY_INSTALL_DIR, _INSTALL_DIR)
+    backup_path = f"{_LEGACY_INSTALL_DIR}.migrated.{time.strftime('%Y%m%d_%H%M%S')}"
+    os.rename(_LEGACY_INSTALL_DIR, backup_path)
+    _state.append_line(f"[pyMC updater] Merged legacy install data into {_INSTALL_DIR}")
+    _state.append_line(f"[pyMC updater] Archived legacy install path at {backup_path}")
+
+
+def _cleanup_stale_source_trees() -> None:
+    stale_paths = [
+        "/opt/openhop_repeater/repeater",
+        "/opt/openhop_repeater/openhop_core",
+        "/opt/openhop_repeater/openhop-repeater",
+        "/opt/openhop_repeater/openhop-core",
+        "/opt/openhop-repeater/repeater",
+        "/opt/openhop-repeater/openhop_core",
+        "/opt/openhop-repeater/openhop-repeater",
+        "/opt/openhop-repeater/openhop-core",
+    ]
+
+    removed_any = False
+    for stale_src in stale_paths:
+        if os.path.isdir(stale_src):
+            removed_any = True
+            _state.append_line(f"[pyMC updater] Removing stale source tree: {stale_src}")
+            shutil.rmtree(stale_src, ignore_errors=True)
+
+    if not removed_any:
+        _state.append_line("[pyMC updater] No stale source-tree paths found")
 
 
 def _do_install() -> None:
@@ -850,7 +925,7 @@ def _do_install() -> None:
     env = _os.environ.copy()
     env["SETUPTOOLS_SCM_PRETEND_VERSION"] = _state.latest_version or "1.0.0"
 
-    _VENV_DIR = "/opt/pymc_repeater/venv"
+    _VENV_DIR = "/opt/openhop_repeater/venv"
     _VENV_PIP = os.path.join(_VENV_DIR, "bin", "pip")
     _VENV_PYTHON = os.path.join(_VENV_DIR, "bin", "python")
 
@@ -874,6 +949,7 @@ def _do_install() -> None:
         )
         cmd = ["/bin/sh", _BUILDROOT_UPGRADE_HELPER, "upgrade"]
     elif is_root:
+        _migrate_legacy_install_path()
         _migrate_service_unit()
 
         # Ensure venv exists (migration from system-pip era)
@@ -883,18 +959,13 @@ def _do_install() -> None:
             _run([_VENV_PIP, "install", "--upgrade", "pip", "setuptools", "wheel"], env=env)
 
         # Clean up system-level packages to avoid shadowing
-        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "pymc_repeater"], env=env)
-        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "pymc_core"], env=env)
+        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "openhop_repeater"], env=env)
+        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "openhop_core"], env=env)
 
-        # Remove stale source tree that could shadow the venv package
-        stale_src = "/opt/pymc_repeater/repeater"
-        if os.path.isdir(stale_src):
-            _state.append_line("[pyMC updater] Removing stale source tree…")
-            import shutil
+        # Remove stale source trees that could shadow the venv package
+        _cleanup_stale_source_trees()
 
-            shutil.rmtree(stale_src, ignore_errors=True)
-
-        install_spec = f"pymc_repeater[hardware] @ git+https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git@{channel}"
+        install_spec = f"openhop_repeater[hardware] @ git+https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git@{channel}"
         _state.append_line("[pyMC updater] Running as root – venv pip install")
         _state.append_line(f"[pyMC updater] Target: {install_spec}")
         cmd = [

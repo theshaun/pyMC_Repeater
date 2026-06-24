@@ -241,7 +241,7 @@ async def test_send_advert_branches_and_success_path():
     )
 
     packet = SimpleNamespace(calculate_packet_hash=lambda: b"\xab" * 16)
-    with patch("pymc_core.protocol.PacketBuilder.create_advert", return_value=packet):
+    with patch("openhop_core.protocol.PacketBuilder.create_advert", return_value=packet):
         ok = await daemon.send_advert()
 
     assert ok is True

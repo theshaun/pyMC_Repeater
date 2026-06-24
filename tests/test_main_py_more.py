@@ -46,7 +46,7 @@ async def test_load_additional_identities_valid_and_invalid_entries():
     daemon.identity_manager = SimpleNamespace(list_identities=lambda: [1, 2])
     daemon._register_identity_everywhere = MagicMock(return_value=True)
 
-    with patch("pymc_core.LocalIdentity", _FakeLocalIdentity):
+    with patch("openhop_core.LocalIdentity", _FakeLocalIdentity):
         await daemon._load_additional_identities()
 
     # Only valid entries should be registered (including 64-byte firmware keys).

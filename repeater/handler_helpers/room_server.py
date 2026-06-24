@@ -4,8 +4,8 @@ import secrets
 import time
 from typing import Dict
 
-from pymc_core.protocol import CryptoUtils, PacketBuilder
-from pymc_core.protocol.constants import PAYLOAD_TYPE_TXT_MSG
+from openhop_core.protocol import CryptoUtils, PacketBuilder
+from openhop_core.protocol.constants import PAYLOAD_TYPE_TXT_MSG
 
 logger = logging.getLogger("RoomServer")
 
@@ -102,8 +102,8 @@ class RoomServer:
                 return False
 
             try:
-                from pymc_core.protocol import PacketBuilder
-                from pymc_core.protocol.constants import (
+                from openhop_core.protocol import PacketBuilder
+                from openhop_core.protocol.constants import (
                     ADVERT_FLAG_HAS_NAME,
                     ADVERT_FLAG_IS_ROOM_SERVER,
                 )
@@ -357,7 +357,7 @@ class RoomServer:
                 timestamp.to_bytes(4, "little") + bytes([flags]) + author_prefix + message_bytes
             )
 
-            # Calculate expected ACK (same algorithm as pymc_core)
+            # Calculate expected ACK (same algorithm as openhop_core)
             attempt = 0
             pack_data = PacketBuilder._pack_timestamp_data(timestamp, attempt, message_bytes)
             ack_hash = CryptoUtils.sha256(pack_data + client_info.id.get_public_key())[:4]

@@ -2,7 +2,7 @@
 
 import pytest
 
-from pymc_core import LocalIdentity
+from openhop_core import LocalIdentity
 
 from repeater.companion.bridge import RepeaterCompanionBridge, _prefs_bytes_from_json
 
