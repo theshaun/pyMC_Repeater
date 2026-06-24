@@ -887,6 +887,22 @@ def _cleanup_stale_source_trees() -> None:
         _state.append_line("[pyMC updater] No stale source-tree paths found")
 
 
+def _disable_legacy_services() -> None:
+    legacy_units = ["pymc-repeater", "pymc-repeater.service"]
+
+    for unit in legacy_units:
+        subprocess.run([_SYSTEMCTL_BIN, "stop", unit], check=False)  # nosec B603
+        subprocess.run([_SYSTEMCTL_BIN, "disable", unit], check=False)  # nosec B603
+
+    if os.path.isfile("/etc/systemd/system/pymc-repeater.service"):
+        try:
+            os.remove("/etc/systemd/system/pymc-repeater.service")
+        except OSError:
+            pass
+
+    subprocess.run([_SYSTEMCTL_BIN, "daemon-reload"], check=False)  # nosec B603
+
+
 def _do_install() -> None:
 
     channel = _state.channel
@@ -944,6 +960,7 @@ def _do_install() -> None:
         )
         cmd = ["/bin/sh", _BUILDROOT_UPGRADE_HELPER, "upgrade"]
     elif is_root:
+        _disable_legacy_services()
         _migrate_pymc_install_dir()
         _migrate_service_unit()
 

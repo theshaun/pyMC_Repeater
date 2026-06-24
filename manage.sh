@@ -230,6 +230,26 @@ is_enabled() {
     systemctl is-enabled "$SERVICE_NAME" >/dev/null 2>&1
 }
 
+# Stop/disable legacy service names that can conflict on GPIO.
+disable_legacy_services() {
+    local legacy_services="pymc-repeater pymc-repeater.service"
+    local svc removed_unit=0
+
+    for svc in $legacy_services; do
+        systemctl stop "$svc" >/dev/null 2>&1 || true
+        systemctl disable "$svc" >/dev/null 2>&1 || true
+    done
+
+    if [ -f /etc/systemd/system/pymc-repeater.service ]; then
+        rm -f /etc/systemd/system/pymc-repeater.service
+        removed_unit=1
+    fi
+
+    if [ "$removed_unit" -eq 1 ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
 # Function to get current version
 get_version() {
     # Read version from the pip-installed package in the venv
@@ -404,6 +424,8 @@ install_repeater() {
     if ! id "$SERVICE_USER" &>/dev/null; then
         useradd --system --home "$DATA_DIR" --shell /sbin/nologin "$SERVICE_USER"
     fi
+
+    disable_legacy_services
 
     (
     echo "10"; echo "# Adding user to hardware groups..."
@@ -838,6 +860,7 @@ upgrade_repeater() {
         echo "=== Upgrade Progress ==="
         echo "[1/9] Stopping service..."
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        disable_legacy_services
 
         echo "[1.5/9] Migrating legacy paths..."
         migrate_legacy_paths
@@ -1372,6 +1395,16 @@ validate_and_update_config() {
     local example_file="config.yaml.example"
     local updated_example="$CONFIG_DIR/config.yaml.example"
 
+    normalize_legacy_paths_in_config() {
+        local target_file="$1"
+        [ -f "$target_file" ] || return 0
+
+        sed -i 's|/var/lib/pymc_repeater|/var/lib/openhop_repeater|g' "$target_file" 2>/dev/null || true
+        sed -i 's|/etc/pymc_repeater|/etc/openhop_repeater|g' "$target_file" 2>/dev/null || true
+        sed -i 's|/var/log/pymc_repeater|/var/log/openhop_repeater|g' "$target_file" 2>/dev/null || true
+        sed -i 's|/opt/pymc_repeater|/opt/openhop_repeater|g' "$target_file" 2>/dev/null || true
+    }
+
     # Ensure destination config directory exists before copy/merge steps.
     mkdir -p "$CONFIG_DIR"
 
@@ -1387,6 +1420,7 @@ validate_and_update_config() {
     if [ ! -f "$config_file" ]; then
         echo "    ⚠ No existing config.yaml found, copying example"
         cp "$updated_example" "$config_file"
+        normalize_legacy_paths_in_config "$config_file"
         return 0
     fi
 
@@ -1427,18 +1461,22 @@ validate_and_update_config() {
         # Verify the merged file is valid YAML
         if "$YQ_CMD" eval '.' "$temp_merged" > /dev/null 2>&1; then
             mv "$temp_merged" "$config_file"
+            normalize_legacy_paths_in_config "$config_file"
             echo "    ✓ Configuration merged successfully"
+            echo "    ✓ Legacy pymc_* paths normalized"
             echo "    ✓ User settings preserved, new options added"
             return 0
         else
             echo "    ✗ Merged config is invalid, restoring backup"
             rm -f "$temp_merged"
             cp "$backup_file" "$config_file"
+            normalize_legacy_paths_in_config "$config_file"
             return 1
         fi
     else
         echo "    ✗ Config merge failed, keeping original"
         rm -f "$temp_merged" "$stripped_user"
+        normalize_legacy_paths_in_config "$config_file"
         return 1
     fi
 }
