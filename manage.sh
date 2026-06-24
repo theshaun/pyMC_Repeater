@@ -118,10 +118,19 @@ migrate_to_venv() {
             sed -i 's|WorkingDirectory=/opt/openhop_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$svc_unit"
             echo "    ✓ Fixed WorkingDirectory in service unit"
         fi
+        if grep -q 'WorkingDirectory=/opt/pymc_repeater\|WorkingDirectory=/var/lib/pymc_repeater' "$svc_unit" 2>/dev/null; then
+            sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$svc_unit"
+            sed -i 's|WorkingDirectory=/var/lib/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$svc_unit"
+            echo "    ✓ Migrated legacy WorkingDirectory to openhop path"
+        fi
         # 4. Ensure ExecStart uses the venv python
         if grep -q 'ExecStart=/usr/bin/python3' "$svc_unit" 2>/dev/null; then
             sed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|" "$svc_unit"
             echo "    ✓ Updated ExecStart to use venv python"
+        fi
+        if grep -q 'ExecStart=/opt/pymc_repeater/venv/bin/python' "$svc_unit" 2>/dev/null; then
+            sed -i "s|ExecStart=/opt/pymc_repeater/venv/bin/python|ExecStart=$VENV_PYTHON|" "$svc_unit"
+            echo "    ✓ Migrated legacy ExecStart to openhop venv"
         fi
         systemctl daemon-reload
     fi
@@ -129,6 +138,8 @@ migrate_to_venv() {
     # 5. Remove the package from system python (best-effort)
     python3 -m pip uninstall -y openhop_repeater 2>/dev/null || true
     python3 -m pip uninstall -y openhop_core 2>/dev/null || true
+    python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
+    python3 -m pip uninstall -y pymc_core 2>/dev/null || true
     echo "    ✓ Cleaned up system-level packages (if any)"
 
     # 6. Remove stale source trees that could shadow the venv package
@@ -546,16 +557,29 @@ if grep -q 'WorkingDirectory=/opt/openhop_repeater' "$SVC_UNIT" 2>/dev/null; the
     sed -i 's|WorkingDirectory=/opt/openhop_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
     systemctl daemon-reload
 fi
+if grep -q 'WorkingDirectory=/opt/pymc_repeater\|WorkingDirectory=/var/lib/pymc_repeater' "$SVC_UNIT" 2>/dev/null; then
+    sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
+    sed -i 's|WorkingDirectory=/var/lib/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
+    systemctl daemon-reload
+fi
 if grep -q 'ExecStart=/usr/bin/python3' "$SVC_UNIT" 2>/dev/null; then
     sed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|" "$SVC_UNIT"
+    systemctl daemon-reload
+fi
+if grep -q 'ExecStart=/opt/pymc_repeater/venv/bin/python' "$SVC_UNIT" 2>/dev/null; then
+    sed -i "s|ExecStart=/opt/pymc_repeater/venv/bin/python|ExecStart=$VENV_PYTHON|" "$SVC_UNIT"
     systemctl daemon-reload
 fi
 # ---- Remove stale source trees that shadow the venv package ----
 [ -d /opt/openhop_repeater/repeater ] && rm -rf /opt/openhop_repeater/repeater
 [ -d /opt/openhop_repeater/openhop-repeater ] && rm -rf /opt/openhop_repeater/openhop-repeater
+[ -d /opt/pymc_repeater/repeater ] && rm -rf /opt/pymc_repeater/repeater
+[ -d /opt/pymc_repeater/pymc-repeater ] && rm -rf /opt/pymc_repeater/pymc-repeater
 # ---- Remove old system-level packages to avoid confusion ----
 python3 -m pip uninstall -y openhop_repeater 2>/dev/null || true
 python3 -m pip uninstall -y openhop_core 2>/dev/null || true
+python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
+python3 -m pip uninstall -y pymc_core 2>/dev/null || true
 # ---- Try R2 wheels first for faster OTA upgrades ----
 R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
 MACHINE_ARCH=$(uname -m)
@@ -967,16 +991,29 @@ if grep -q 'WorkingDirectory=/opt/openhop_repeater' "$SVC_UNIT" 2>/dev/null; the
     sed -i 's|WorkingDirectory=/opt/openhop_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
     systemctl daemon-reload
 fi
+if grep -q 'WorkingDirectory=/opt/pymc_repeater\|WorkingDirectory=/var/lib/pymc_repeater' "$SVC_UNIT" 2>/dev/null; then
+    sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
+    sed -i 's|WorkingDirectory=/var/lib/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
+    systemctl daemon-reload
+fi
 if grep -q 'ExecStart=/usr/bin/python3' "$SVC_UNIT" 2>/dev/null; then
     sed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|" "$SVC_UNIT"
+    systemctl daemon-reload
+fi
+if grep -q 'ExecStart=/opt/pymc_repeater/venv/bin/python' "$SVC_UNIT" 2>/dev/null; then
+    sed -i "s|ExecStart=/opt/pymc_repeater/venv/bin/python|ExecStart=$VENV_PYTHON|" "$SVC_UNIT"
     systemctl daemon-reload
 fi
 # ---- Remove stale source trees that shadow the venv package ----
 [ -d /opt/openhop_repeater/repeater ] && rm -rf /opt/openhop_repeater/repeater
 [ -d /opt/openhop_repeater/openhop-repeater ] && rm -rf /opt/openhop_repeater/openhop-repeater
+[ -d /opt/pymc_repeater/repeater ] && rm -rf /opt/pymc_repeater/repeater
+[ -d /opt/pymc_repeater/pymc-repeater ] && rm -rf /opt/pymc_repeater/pymc-repeater
 # ---- Remove old system-level packages to avoid confusion ----
 python3 -m pip uninstall -y openhop_repeater 2>/dev/null || true
 python3 -m pip uninstall -y openhop_core 2>/dev/null || true
+python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
+python3 -m pip uninstall -y pymc_core 2>/dev/null || true
         # ---- Try R2 wheels first for faster OTA upgrades ----
         R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
         MACHINE_ARCH=$(uname -m)
