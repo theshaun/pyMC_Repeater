@@ -16,8 +16,8 @@ jobs:
   docker:
     if: |
       github.event_name == 'workflow_dispatch' ||
-      github.repository == 'pyMC-dev/openhop-repeater' ||
-      github.repository == 'yellowcooln/openhop-repeater'
+      github.repository == 'openhop-dev/openhop_repeater' ||
+      github.repository == 'yellowcooln/openhop_repeater'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -58,7 +58,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_repository }}" ]; then
             image_repository="${{ inputs.image_repository }}"
-          elif [ "${{ github.repository }}" = "yellowcooln/openhop-repeater" ]; then
+          elif [ "${{ github.repository }}" = "yellowcooln/openhop_repeater" ]; then
             image_repository="yellowcooln/openhop-repeater"
           else
             image_repository="pymcdev/openhop-repeater"
@@ -92,7 +92,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Notify Home Assistant add-on repository
-        if: github.repository == 'pyMC-dev/openhop-repeater'
+        if: github.repository == 'openhop-dev/openhop_repeater'
         env:
           DISPATCH_TOKEN: ${{ secrets.HA_ADDON_REPO_DISPATCH_TOKEN }}
           CHANNEL: ${{ github.ref_name }}
