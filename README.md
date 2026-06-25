@@ -111,7 +111,7 @@ sudo apt install git -y
 ### Clone The Repository
 
 ```bash
-git clone https://github.com/pyMC-dev/openhop-repeater.git
+git clone https://github.com/openhop-dev/openhop-repeater.git
 cd openhop-repeater
 ```
 
@@ -518,7 +518,7 @@ Pre-commit hooks will automatically:
 
 ## Support
 
-- [pyMC Core](https://github.com/pyMC-dev/openhop-core)
+- [pyMC Core](https://github.com/openhop-dev/openhop-core)
 - [MeshCore Discord](https://meshcore.gg)
 
 ## Disclaimer

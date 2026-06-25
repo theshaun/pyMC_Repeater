@@ -6,12 +6,12 @@
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/pyMC-dev/openhop-repeater/main/scripts/proxmox-install.sh)"
 #
 # License: MIT
-# Source: https://github.com/pyMC-dev/openhop-repeater
+# Source: https://github.com/openhop-dev/openhop-repeater
 
 set -euo pipefail
 
 # ── Defaults ───────────────────────────────────────────────────────────────
-REPO="https://github.com/pyMC-dev/openhop-repeater.git"
+REPO="https://github.com/openhop-dev/openhop-repeater.git"
 BRANCH="dev"
 CT_TEMPLATE="debian-12-standard"
 CT_RAM=1024
@@ -210,7 +210,7 @@ OS=\$(. /etc/os-release && echo \"\$NAME\")
 VER=\$(. /etc/os-release && echo \"\$VERSION_ID\")
 echo \"\"
 echo \"    openHop Repeater LXC Container\"
-echo \"    🌐  GitHub: https://github.com/pyMC-dev/openhop-repeater\"
+echo \"    🌐  GitHub: https://github.com/openhop-dev/openhop-repeater\"
 echo \"\"
 echo \"    🖥️   OS: \$OS - Version: \$VER\"
 echo \"    🏠  Hostname: \$HOSTNAME\"
