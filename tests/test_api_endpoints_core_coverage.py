@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, mock_open, patch
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 import cherrypy
 import pytest
@@ -1278,6 +1279,15 @@ def test_send_advert_paths(cherrypy_ctx):
     with patch("asyncio.run_coroutine_threadsafe", return_value=fake_future_fail):
         bad = api.send_advert()
     assert bad["success"] is False
+
+    future_timeout = MagicMock()
+    future_timeout.result.side_effect = FutureTimeoutError()
+    with patch("asyncio.run_coroutine_threadsafe", return_value=future_timeout):
+        timeout = api.send_advert()
+
+    assert timeout["success"] is False
+    assert "Timed out waiting for advert transmission" in timeout["error"]
+    future_timeout.cancel.assert_called_once()
 
 
 def test_set_mode_and_set_duty_cycle_paths(cherrypy_ctx):

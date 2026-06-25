@@ -94,7 +94,10 @@ class LogBuffer(logging.Handler):
             }
 
             if record.exc_info:
-                entry["exception"] = self.formatException(record.exc_info)
+                formatter = self.formatter or logging.Formatter()
+                entry["exception"] = self._sanitize_log_text(
+                    formatter.formatException(record.exc_info)
+                )
 
             with self._lock:
                 self.logs.append(entry)

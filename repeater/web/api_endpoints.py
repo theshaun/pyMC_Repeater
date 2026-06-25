@@ -4,6 +4,7 @@ import os
 import re
 import secrets
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -1587,6 +1588,7 @@ class APIEndpoints:
                 return self._error("Event loop not available")
             import asyncio
 
+            future = None
             future = asyncio.run_coroutine_threadsafe(self.send_advert_func(), self.event_loop)
             result = future.result(timeout=10)
             return (
@@ -1594,11 +1596,22 @@ class APIEndpoints:
                 if result
                 else self._error("Failed to send advert")
             )
+        except FutureTimeoutError:
+            logger.error(
+                "Error sending advert: timeout waiting for advert transmission to complete",
+                exc_info=True,
+            )
+            try:
+                if future is not None:
+                    future.cancel()
+            except Exception:
+                pass
+            return self._error("Timed out waiting for advert transmission after 10 seconds")
         except cherrypy.HTTPError:
             # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
             raise
         except Exception as e:
-            logger.error(f"Error sending advert: {e}", exc_info=True)
+            logger.error("Error sending advert: %s", e, exc_info=True)
             return self._error(e)
 
     @cherrypy.expose

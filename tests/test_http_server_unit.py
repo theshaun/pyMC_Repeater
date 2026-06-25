@@ -1,5 +1,6 @@
 import io
 import logging
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,6 +46,29 @@ def test_log_buffer_emit_redacts_sensitive_values():
     assert "deadbeef" not in entry["message"]
     assert "[REDACTED]" in entry["message"]
     assert "raw_message" not in entry
+
+
+def test_log_buffer_emit_includes_exception_text_without_crashing():
+    buf = hs.LogBuffer(max_lines=5)
+    try:
+        raise RuntimeError("boom password=secret123")
+    except RuntimeError:
+        rec = logging.LogRecord(
+            "x",
+            logging.ERROR,
+            __file__,
+            20,
+            "failure while sending advert",
+            (),
+            sys.exc_info(),
+        )
+
+    buf.emit(rec)
+
+    assert len(buf.logs) == 1
+    assert "exception" in buf.logs[0]
+    assert "RuntimeError" in buf.logs[0]["exception"]
+    assert "secret123" not in buf.logs[0]["exception"]
 
 
 def test_doc_endpoint_routes_and_openapi_json_paths(monkeypatch):
