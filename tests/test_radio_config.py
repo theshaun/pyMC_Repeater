@@ -20,7 +20,7 @@ def test_get_radio_for_board_passes_en_pins(monkeypatch):
             return _DummyRadio()
 
     monkeypatch.setattr(
-        "pymc_core.hardware.sx1262_wrapper.SX1262Radio",
+        "openhop_core.hardware.sx1262_wrapper.SX1262Radio",
         _DummySX1262Radio,
     )
 
@@ -81,7 +81,7 @@ def _pymc_radio_cfg():
 
 
 def test_get_radio_for_board_pymc_tcp(monkeypatch):
-    pytest.importorskip("pymc_core.hardware.tcp_radio")
+    pytest.importorskip("openhop_core.hardware.tcp_radio")
     captured = {}
 
     class _DummyTCPLoRaRadio(_DummyRadio):
@@ -89,7 +89,7 @@ def test_get_radio_for_board_pymc_tcp(monkeypatch):
             captured.update(kwargs)
 
     monkeypatch.setattr(
-        "pymc_core.hardware.tcp_radio.TCPLoRaRadio",
+        "openhop_core.hardware.tcp_radio.TCPLoRaRadio",
         _DummyTCPLoRaRadio,
     )
 
@@ -119,10 +119,10 @@ def test_get_radio_for_board_pymc_tcp(monkeypatch):
 
 
 def test_get_radio_for_board_pymc_tcp_requires_host(monkeypatch):
-    pytest.importorskip("pymc_core.hardware.tcp_radio")
+    pytest.importorskip("openhop_core.hardware.tcp_radio")
 
     monkeypatch.setattr(
-        "pymc_core.hardware.tcp_radio.TCPLoRaRadio",
+        "openhop_core.hardware.tcp_radio.TCPLoRaRadio",
         lambda **kwargs: _DummyRadio(),
     )
 
@@ -137,7 +137,7 @@ def test_get_radio_for_board_pymc_tcp_requires_host(monkeypatch):
 
 
 def test_get_radio_for_board_pymc_usb(monkeypatch):
-    pytest.importorskip("pymc_core.hardware.usb_radio")
+    pytest.importorskip("openhop_core.hardware.usb_radio")
     captured = {}
 
     class _DummyUSBLoRaRadio(_DummyRadio):
@@ -145,7 +145,7 @@ def test_get_radio_for_board_pymc_usb(monkeypatch):
             captured.update(kwargs)
 
     monkeypatch.setattr(
-        "pymc_core.hardware.usb_radio.USBLoRaRadio",
+        "openhop_core.hardware.usb_radio.USBLoRaRadio",
         _DummyUSBLoRaRadio,
     )
 
@@ -170,10 +170,10 @@ def test_get_radio_for_board_pymc_usb(monkeypatch):
 
 
 def test_get_radio_for_board_pymc_usb_requires_port(monkeypatch):
-    pytest.importorskip("pymc_core.hardware.usb_radio")
+    pytest.importorskip("openhop_core.hardware.usb_radio")
 
     monkeypatch.setattr(
-        "pymc_core.hardware.usb_radio.USBLoRaRadio",
+        "openhop_core.hardware.usb_radio.USBLoRaRadio",
         lambda **kwargs: _DummyRadio(),
     )
 
@@ -195,7 +195,7 @@ def test_get_radio_for_board_pymc_usb_requires_port(monkeypatch):
 
 def _kiss_capture_radio_config(monkeypatch):
     """Patch KissModemWrapper to capture the radio_config it is built with."""
-    pytest.importorskip("pymc_core.hardware.kiss_modem_wrapper")
+    pytest.importorskip("openhop_core.hardware.kiss_modem_wrapper")
     captured = {}
 
     class _DummyKissWrapper(_DummyRadio):
@@ -203,7 +203,7 @@ def _kiss_capture_radio_config(monkeypatch):
             captured["kwargs"] = kwargs
 
     monkeypatch.setattr(
-        "pymc_core.hardware.kiss_modem_wrapper.KissModemWrapper",
+        "openhop_core.hardware.kiss_modem_wrapper.KissModemWrapper",
         _DummyKissWrapper,
     )
     return captured

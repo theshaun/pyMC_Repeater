@@ -175,8 +175,8 @@ class RepeaterDaemon:
                 self.radio = NullRadio()
 
         try:
-            from pymc_core import LocalIdentity
-            from pymc_core.node.dispatcher import Dispatcher
+            from openhop_core import LocalIdentity
+            from openhop_core.node.dispatcher import Dispatcher
 
             self.dispatcher = Dispatcher(self.radio)
             logger.info("Dispatcher initialized")
@@ -307,7 +307,7 @@ class RepeaterDaemon:
 
             # Initialize ConfigManager for centralized config management
             self.config_manager = ConfigManager(
-                config_path=getattr(self, "config_path", "/etc/pymc_repeater/config.yaml"),
+                config_path=getattr(self, "config_path", "/etc/openhop_repeater/config.yaml"),
                 config=self.config,
                 daemon_instance=self,
             )
@@ -395,7 +395,7 @@ class RepeaterDaemon:
             # Load companion identities (CompanionBridge + frame server per companion)
             await self._load_companion_identities()
 
-            # Subscribe to raw RX in pyMC_core so we can push PUSH_CODE_LOG_RX_DATA to companion clients
+            # Subscribe to raw RX in openhop-core so we can push PUSH_CODE_LOG_RX_DATA to companion clients
             self.dispatcher.add_raw_rx_subscriber(self._on_raw_rx_for_companions)
             n = len(getattr(self, "companion_frame_servers", []))
             logger.info(
@@ -431,7 +431,7 @@ class RepeaterDaemon:
             raise
 
     async def _load_additional_identities(self):
-        from pymc_core import LocalIdentity
+        from openhop_core import LocalIdentity
 
         identities_config = self.config.get("identities", {})
 
@@ -493,8 +493,8 @@ class RepeaterDaemon:
 
     async def _load_companion_identities(self) -> None:
         """Load companion identities from config and create CompanionBridge + frame server for each."""
-        from pymc_core import LocalIdentity
-        from pymc_core.companion.models import Channel
+        from openhop_core import LocalIdentity
+        from openhop_core.companion.models import Channel
 
         from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
 
@@ -651,7 +651,7 @@ class RepeaterDaemon:
                         for msg_dict in sqlite_handler.companion_load_messages(
                             companion_hash_str, limit=retention or 100
                         ):
-                            from pymc_core.companion.models import QueuedMessage
+                            from openhop_core.companion.models import QueuedMessage
 
                             sk = msg_dict.get("sender_key", b"")
                             if isinstance(sk, str):
@@ -717,8 +717,8 @@ class RepeaterDaemon:
         Creates RepeaterCompanionBridge, CompanionFrameServer, starts the server,
         and registers with identity_manager. Raises on error.
         """
-        from pymc_core import LocalIdentity
-        from pymc_core.companion.models import Channel
+        from openhop_core import LocalIdentity
+        from openhop_core.companion.models import Channel
 
         from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
         from repeater.companion.constants import DEFAULT_PUBLIC_CHANNEL_SECRET
@@ -837,7 +837,7 @@ class RepeaterDaemon:
                 for msg_dict in sqlite_handler.companion_load_messages(
                     companion_hash_str, limit=retention or 100
                 ):
-                    from pymc_core.companion.models import QueuedMessage
+                    from openhop_core.companion.models import QueuedMessage
 
                     sk = msg_dict.get("sender_key", b"")
                     if isinstance(sk, str):
@@ -1139,8 +1139,11 @@ class RepeaterDaemon:
             return False
 
         try:
-            from pymc_core.protocol import PacketBuilder
-            from pymc_core.protocol.constants import ADVERT_FLAG_HAS_NAME, ADVERT_FLAG_IS_REPEATER
+            from openhop_core.protocol import PacketBuilder
+            from openhop_core.protocol.constants import (
+                ADVERT_FLAG_HAS_NAME,
+                ADVERT_FLAG_IS_REPEATER,
+            )
 
             # Get node name and location from config
             repeater_config = self.config.get("repeater", {})
@@ -1332,7 +1335,7 @@ class RepeaterDaemon:
             radio_type_raw = self.config.get("radio_type")
             radio_type = "" if radio_type_raw is None else str(radio_type_raw).lower()
             if radio_type == "sx1262_ch341":
-                from pymc_core.hardware.ch341.ch341_async import CH341Async
+                from openhop_core.hardware.ch341.ch341_async import CH341Async
 
                 CH341Async.reset_instance()
         except Exception as e:
@@ -1402,7 +1405,7 @@ class RepeaterDaemon:
                 config=self.config,
                 event_loop=current_loop,
                 daemon_instance=self,
-                config_path=getattr(self, "config_path", "/etc/pymc_repeater/config.yaml"),
+                config_path=getattr(self, "config_path", "/etc/openhop_repeater/config.yaml"),
             )
 
             try:
@@ -1410,7 +1413,7 @@ class RepeaterDaemon:
             except Exception as e:
                 logger.error(f"Failed to start HTTP server: {e}")
 
-            # Run dispatcher (handles RX/TX via pymc_core)
+            # Run dispatcher (handles RX/TX via openhop_core)
             try:
                 await self.dispatcher.run_forever()
             except asyncio.CancelledError:
@@ -1441,10 +1444,10 @@ def main():
 
     import argparse
 
-    parser = argparse.ArgumentParser(description="pyMC Repeater Daemon")
+    parser = argparse.ArgumentParser(description="openHop Repeater Daemon")
     parser.add_argument(
         "--config",
-        help="Path to config file (default: /etc/pymc_repeater/config.yaml)",
+        help="Path to config file (default: /etc/openhop_repeater/config.yaml)",
     )
     parser.add_argument(
         "--log-level",
@@ -1456,7 +1459,7 @@ def main():
 
     # Load configuration
     config = load_config(args.config)
-    config_path = args.config if args.config else "/etc/pymc_repeater/config.yaml"
+    config_path = args.config if args.config else "/etc/openhop_repeater/config.yaml"
 
     if args.log_level:
         if "logging" not in config:

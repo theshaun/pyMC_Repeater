@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pymc_core.protocol.constants import PAYLOAD_TYPE_ANON_REQ, ROUTE_TYPE_DIRECT
+from openhop_core.protocol.constants import PAYLOAD_TYPE_ANON_REQ, ROUTE_TYPE_DIRECT
 from repeater.handler_helpers.discovery import DiscoveryHelper
 from repeater.handler_helpers.login import LoginHelper
 from repeater.handler_helpers.trace import TraceHelper
@@ -258,7 +258,7 @@ def test_discovery_send_response_without_injector_is_safe():
     helper = DiscoveryHelper(local_identity=FakeIdentity(0x42), packet_injector=None)
 
     with patch(
-        "pymc_core.protocol.packet_builder.PacketBuilder.create_discovery_response",
+        "openhop_core.protocol.packet_builder.PacketBuilder.create_discovery_response",
         return_value=object(),
     ):
         helper._send_discovery_response(tag=5, node_type=2, inbound_snr=1.0, prefix_only=False)

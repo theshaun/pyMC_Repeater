@@ -5,8 +5,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from pymc_core.protocol.constants import PAYLOAD_TYPE_GRP_DATA, PAYLOAD_TYPE_GRP_TXT
-from pymc_core.protocol.crypto import CryptoUtils
+from openhop_core.protocol.constants import PAYLOAD_TYPE_GRP_DATA, PAYLOAD_TYPE_GRP_TXT
+from openhop_core.protocol.crypto import CryptoUtils
 
 logger = logging.getLogger("PolicyEngine")
 

@@ -1,8 +1,8 @@
-# pyMC Repeater
+# openHop Repeater
 
-Lightweight Python MeshCore repeater daemon built on `pymc_core`.
+Lightweight Python MeshCore repeater daemon built on `openhop_core`.
 
-pyMC Repeater is designed to run continuously on low-power Linux hardware such
+openHop Repeater is designed to run continuously on low-power Linux hardware such
 as Raspberry Pi-class devices, Proxmox LXC containers, and network-attached
 radio modems. It forwards LoRa packets, exposes a web dashboard, and provides
 configuration tools for radio setup, policy management, monitoring, and
@@ -29,7 +29,7 @@ integrations.
 ## Overview
 
 The repeater daemon runs as a background service and forwards LoRa packets using
-the `pymc_core` dispatcher and routing stack. The project favors a simple,
+the `openhop_core` dispatcher and routing stack. The project favors a simple,
 hackable architecture:
 
 - CherryPy provides a lightweight HTTP server for the web UI and API.
@@ -59,7 +59,7 @@ Historical statistics and performance metrics.
 
 ## Supported Hardware
 
-pyMC Repeater supports these radio backends:
+openHop Repeater supports these radio backends:
 
 - **SX1262 over Linux SPI**: set `radio_type: sx1262`
 - **SX1262 over CH341 USB-to-SPI**: set `radio_type: sx1262_ch341`
@@ -111,8 +111,8 @@ sudo apt install git -y
 ### Clone The Repository
 
 ```bash
-git clone https://github.com/pyMC-dev/pyMC_Repeater.git
-cd pyMC_Repeater
+git clone https://github.com/openhop-dev/openhop-repeater.git
+cd openhop-repeater
 ```
 
 ### Quick Install
@@ -124,17 +124,17 @@ sudo bash ./manage.sh install
 The installer will:
 
 - Create a dedicated `repeater` service user with hardware access
-- Install application files to `/opt/pymc_repeater`
-- Create the configuration directory at `/etc/pymc_repeater`
-- Create the log directory at `/var/log/pymc_repeater`
+- Install application files to `/opt/openhop_repeater`
+- Create the configuration directory at `/etc/openhop_repeater`
+- Create the log directory at `/var/log/openhop_repeater`
 - Launch the interactive radio and hardware setup wizard
-- Install and enable the `pymc-repeater` systemd service
+- Install and enable the `openhop-repeater` systemd service
 
 After installation:
 
 ```bash
 # View live logs
-sudo journalctl -u pymc-repeater -f
+sudo journalctl -u openhop-repeater -f
 ```
 
 Open the web dashboard at:
@@ -160,7 +160,7 @@ pip install -e ".[dev]"
 The main configuration file is created during installation:
 
 ```text
-/etc/pymc_repeater/config.yaml
+/etc/openhop_repeater/config.yaml
 ```
 
 ### Setup Wizard
@@ -207,19 +207,19 @@ TX power defaults to 14 dBm and can be changed later.
 To reconfigure radio and hardware settings after installation:
 
 ```bash
-sudo bash setup-radio-config.sh /etc/pymc_repeater
+sudo bash setup-radio-config.sh /etc/openhop_repeater
 ```
 
 You can also launch the management menu:
 
 ```bash
 sudo ./manage.sh
-sudo systemctl restart pymc-repeater
+sudo systemctl restart openhop-repeater
 ```
 
 ### Optional pyMC_Glass Integration
 
-pyMC Repeater supports an optional `glass` configuration section for
+openHop Repeater supports an optional `glass` configuration section for
 pyMC_Glass control-plane integration. When enabled, the repeater sends periodic
 `/inform` payloads to pyMC_Glass, receives queued commands, and reports command
 results on the next inform cycle.
@@ -258,7 +258,7 @@ The web interface can upgrade an installation or switch branches.
 ### CLI
 
 ```bash
-cd pyMC_Repeater
+cd openhop-repeater
 sudo bash ./manage.sh upgrade
 ```
 
@@ -272,7 +272,7 @@ The upgrade script will:
 
 ## Proxmox LXC Installation
 
-pyMC Repeater can run inside a Proxmox LXC container using a CH341 USB-to-SPI
+openHop Repeater can run inside a Proxmox LXC container using a CH341 USB-to-SPI
 adapter or a TCP modem. This is useful for headless, always-on deployments
 without dedicating a full Raspberry Pi.
 
@@ -295,7 +295,7 @@ Hardware, choose one:
 Run this command on the Proxmox host, not inside a container:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/pyMC-dev/pyMC_Repeater/main/scripts/proxmox-install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/pyMC-dev/openhop-repeater/main/scripts/proxmox-install.sh)"
 ```
 
 Replace `main` in the URL with another branch name if needed.
@@ -315,7 +315,7 @@ disk, bridge, etc.) and then:
 | Setting | Default |
 |---------|---------|
 | Container ID | Next available |
-| Hostname | `pymc-repeater` |
+| Hostname | `openhop-repeater` |
 | RAM | 1024 MB |
 | Disk | 4 GB |
 | CPU cores | 2 |
@@ -330,10 +330,10 @@ disk, bridge, etc.) and then:
 pct enter <CTID>
 
 # View service logs
-journalctl -u pymc-repeater -f
+journalctl -u openhop-repeater -f
 
 # Manage the repeater
-cd /opt/pymc_repeater
+cd /opt/openhop_repeater
 bash manage.sh
 ```
 
@@ -394,7 +394,7 @@ The script prompts before each optional removal step.
 
 ## Docker Compose
 
-You can run pyMC Repeater in Docker using the published image.
+You can run openHop Repeater in Docker using the published image.
 
 Copy `.env.example` to `.env` before starting:
 
@@ -410,7 +410,7 @@ root-owned `./config` and `./data` bind mount folders on first start. If you
 want host bind mounts, use absolute host paths and pre-create/chown them to
 `15888:15888`.
 
-Do not mount `./config.yaml:/etc/pymc_repeater/config.yaml`; Docker can create
+Do not mount `./config.yaml:/etc/openhop_repeater/config.yaml`; Docker can create
 that source as a directory, which breaks startup.
 
 ### Setup
@@ -430,9 +430,9 @@ docker compose up -d
 
 ```yaml
 services:
-  pymc-repeater:
-    image: ${PYMC_REPEATER_IMAGE:-pymcdev/pymc-repeater:main}
-    container_name: pymc-repeater
+  openhop-repeater:
+    image: ${PYMC_REPEATER_IMAGE:-pymcdev/openhop-repeater:main}
+    container_name: openhop-repeater
     restart: unless-stopped
     ports:
       - 8000:8000
@@ -455,12 +455,12 @@ services:
       - plugdev
 
     volumes:
-      - ${PYMC_CONFIG_VOLUME:-pymc-repeater-config}:/etc/pymc_repeater
-      - ${PYMC_DATA_VOLUME:-pymc-repeater-data}:/var/lib/pymc_repeater
+      - ${PYMC_CONFIG_VOLUME:-openhop-repeater-config}:/etc/openhop_repeater
+      - ${PYMC_DATA_VOLUME:-openhop-repeater-data}:/var/lib/openhop_repeater
 
 volumes:
-  pymc-repeater-config:
-  pymc-repeater-data:
+  openhop-repeater-config:
+  openhop-repeater-data:
 ```
 
 ## Roadmap
@@ -509,7 +509,7 @@ pre-commit run --all-files
 ```
 
 Hardware support for LoRa radio drivers is included in the base installation
-through `pymc_core[hardware]`.
+through `openhop_core[hardware]`.
 
 Pre-commit hooks will automatically:
 - Lint and auto-fix Python issues with Ruff
@@ -518,7 +518,7 @@ Pre-commit hooks will automatically:
 
 ## Support
 
-- [pyMC Core](https://github.com/pyMC-dev/pyMC_core)
+- [pyMC Core](https://github.com/openhop-dev/openhop-core)
 - [MeshCore Discord](https://meshcore.gg)
 
 ## Disclaimer

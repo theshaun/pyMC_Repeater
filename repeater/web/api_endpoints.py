@@ -4,12 +4,13 @@ import os
 import re
 import secrets
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
 import cherrypy
 import yaml
-from pymc_core.protocol import CryptoUtils
+from openhop_core.protocol import CryptoUtils
 
 from repeater import __version__
 from repeater.companion.identity_resolve import (
@@ -198,7 +199,7 @@ class APIEndpoints:
         self.config = config or {}
         self.event_loop = event_loop
         self.daemon_instance = daemon_instance
-        self._config_path = config_path or "/etc/pymc_repeater/config.yaml"
+        self._config_path = config_path or "/etc/openhop_repeater/config.yaml"
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
         # Initialize ConfigManager for centralized config management
@@ -1427,9 +1428,9 @@ class APIEndpoints:
             stats["site_name"] = self.config.get("web", {}).get("site_name", "")
             stats["version"] = __version__
             try:
-                import pymc_core
+                import openhop_core
 
-                stats["core_version"] = pymc_core.__version__
+                stats["core_version"] = openhop_core.__version__
             except ImportError:
                 stats["core_version"] = "unknown"
             image_info = get_buildroot_image_info()
@@ -1587,6 +1588,7 @@ class APIEndpoints:
                 return self._error("Event loop not available")
             import asyncio
 
+            future = None
             future = asyncio.run_coroutine_threadsafe(self.send_advert_func(), self.event_loop)
             result = future.result(timeout=10)
             return (
@@ -1594,11 +1596,22 @@ class APIEndpoints:
                 if result
                 else self._error("Failed to send advert")
             )
+        except FutureTimeoutError:
+            logger.error(
+                "Error sending advert: timeout waiting for advert transmission to complete",
+                exc_info=True,
+            )
+            try:
+                if future is not None:
+                    future.cancel()
+            except Exception:
+                pass
+            return self._error("Timed out waiting for advert transmission after 10 seconds")
         except cherrypy.HTTPError:
             # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
             raise
         except Exception as e:
-            logger.error(f"Error sending advert: {e}", exc_info=True)
+            logger.error("Error sending advert: %s", e, exc_info=True)
             return self._error(e)
 
     @cherrypy.expose
@@ -2162,7 +2175,7 @@ class APIEndpoints:
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def restart_service(self):
-        """Restart the pymc-repeater service via systemctl."""
+        """Restart the openhop-repeater service via systemctl."""
         # Enable CORS for this endpoint only if configured
         self._set_cors_headers()
 
@@ -3819,7 +3832,7 @@ class APIEndpoints:
                 self.config["mesh"]["unscoped_flood_allow"] = unscoped_flood_allow
 
                 # Get the actual config path from daemon instance (same as CAD settings)
-                config_path = getattr(self, "_config_path", "/etc/pymc_repeater/config.yaml")
+                config_path = getattr(self, "_config_path", "/etc/openhop_repeater/config.yaml")
                 if self.daemon_instance and hasattr(self.daemon_instance, "config_path"):
                     config_path = self.daemon_instance.config_path
 
@@ -3932,7 +3945,7 @@ class APIEndpoints:
             trace_tag = secrets.randbits(32)
 
             # Create trace packet
-            from pymc_core.protocol import PacketBuilder
+            from openhop_core.protocol import PacketBuilder
 
             path_bytes = list(target_hash.to_bytes(byte_count, "big"))
             packet = PacketBuilder.create_trace(
@@ -4349,7 +4362,7 @@ class APIEndpoints:
             companion_activation_error = None
             if identity_type == "room_server" and self.daemon_instance:
                 try:
-                    from pymc_core import LocalIdentity
+                    from openhop_core import LocalIdentity
 
                     # Create LocalIdentity from the key (convert hex string to bytes)
                     if isinstance(identity_key, bytes):
@@ -4673,7 +4686,7 @@ class APIEndpoints:
 
             if needs_reload and self.daemon_instance:
                 try:
-                    from pymc_core import LocalIdentity
+                    from openhop_core import LocalIdentity
 
                     final_name = identity["name"]  # Could be new_name
                     identity_key = identity["identity_key"]
@@ -4961,8 +4974,8 @@ class APIEndpoints:
     ):
         """Send advert for a room server identity"""
         try:
-            from pymc_core.protocol import PacketBuilder
-            from pymc_core.protocol.constants import (
+            from openhop_core.protocol import PacketBuilder
+            from openhop_core.protocol.constants import (
                 ADVERT_FLAG_HAS_NAME,
                 ADVERT_FLAG_IS_ROOM_SERVER,
             )
@@ -6588,7 +6601,7 @@ class APIEndpoints:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>pyMC Repeater API Documentation</title>
+    <title>openHop Repeater API Documentation</title>
     <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.0/swagger-ui.css">
     <style>
         body {

@@ -11,9 +11,9 @@ ARG SPI_GID=989
 ARG TARGETARCH
 ARG YQ_VERSION=v4.40.5
 
-ENV INSTALL_DIR=/opt/pymc_repeater \
-    CONFIG_DIR=/etc/pymc_repeater \
-    DATA_DIR=/var/lib/pymc_repeater \
+ENV INSTALL_DIR=/opt/openhop_repeater \
+    CONFIG_DIR=/etc/openhop_repeater \
+    DATA_DIR=/var/lib/openhop_repeater \
     HOME_DIR=/home/${USER} \
     PATH=/home/${USER}/.local/bin:${PATH} \
     PYTHONUNBUFFERED=1 \

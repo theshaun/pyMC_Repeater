@@ -411,7 +411,7 @@
     },
     "kiss": {
       "name": "KISS modem (serial)",
-      "description": "MeshCore KISS modem over serial - requires pyMC_core with KISS support.",
+      "description": "MeshCore KISS modem over serial - requires openhop-core with KISS support.",
       "connection_type": "usb",
       "radio_type": "kiss",
       "tx_power": 14,

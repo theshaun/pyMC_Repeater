@@ -1,8 +1,8 @@
-#Systemd service file template for  Py MC - Meshcore Repeater Daemon.
-#Install as /etc/systemd/system/pymc-repeater.service
+#Systemd service file template for  openHop - Meshcore Repeater Daemon.
+#Install as /etc/systemd/system/openhop-repeater.service
 
 [Unit]
-Description=pyMC Repeater Daemon
+Description=openHop Repeater Daemon
 After=network-online.target dbus.socket
 Wants=network-online.target
 Requires=dbus.socket
@@ -11,10 +11,10 @@ Requires=dbus.socket
 Type=simple
 User=repeater
 Group=repeater
-WorkingDirectory=/var/lib/pymc_repeater
+WorkingDirectory=/var/lib/openhop_repeater
 
 # Start command - use venv python to avoid system package conflicts
-ExecStart=/opt/pymc_repeater/venv/bin/python -m repeater.main --config /etc/pymc_repeater/config.yaml
+ExecStart=/opt/openhop_repeater/venv/bin/python -m repeater.main --config /etc/openhop_repeater/config.yaml
 
 # Restart on failure
 Restart=on-failure
@@ -29,10 +29,10 @@ MemoryHigh=256M
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=pymc-repeater
+SyslogIdentifier=openhop-repeater
 
 # Security (relaxed for service self-restart via sudo)
-ReadWritePaths=/var/log/pymc_repeater /var/lib/pymc_repeater /etc/pymc_repeater
+ReadWritePaths=/var/log/openhop_repeater /var/lib/openhop_repeater /etc/openhop_repeater
 SupplementaryGroups=plugdev dialout
 
 # Allow GPS time sync to update CLOCK_REALTIME without running as root, also allow changing user via polkit or sudo

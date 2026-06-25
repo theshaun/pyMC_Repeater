@@ -2,8 +2,8 @@ import logging
 import time
 from typing import Dict, Optional
 
-from pymc_core.protocol import Identity
-from pymc_core.protocol.constants import PUB_KEY_SIZE
+from openhop_core.protocol import Identity
+from openhop_core.protocol.constants import PUB_KEY_SIZE
 
 logger = logging.getLogger("ACL")
 

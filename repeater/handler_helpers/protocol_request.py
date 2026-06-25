@@ -1,5 +1,5 @@
 """
-Protocol request (REQ) handling helper for pyMC Repeater.
+Protocol request (REQ) handling helper for openHop Repeater.
 
 Provides repeater-specific callbacks for status and telemetry requests.
 """
@@ -9,7 +9,7 @@ import logging
 import struct
 import time
 
-from pymc_core.node.handlers.protocol_request import (
+from openhop_core.node.handlers.protocol_request import (
     REQ_TYPE_GET_ACCESS_LIST,
     REQ_TYPE_GET_NEIGHBOURS,
     REQ_TYPE_GET_OWNER_INFO,
@@ -368,14 +368,14 @@ class ProtocolRequestHelper:
         Matches C++ simple_repeater: sprintf("%s\\n%s\\n%s", FIRMWARE_VERSION, node_name, owner_info)
         """
         repeater_cfg = self.config.get("repeater", {})
-        node_name = repeater_cfg.get("node_name", "pyMC_Repeater")
+        node_name = repeater_cfg.get("node_name", "openhop-repeater")
         owner_info = repeater_cfg.get("owner_info", "")
 
         # Version: use package version if available, fallback to "pyMC"
         try:
             from importlib.metadata import version as pkg_version
 
-            fw_version = pkg_version("pymc-repeater")
+            fw_version = pkg_version("openhop-repeater")
         except Exception:
             fw_version = "pyMC"
 

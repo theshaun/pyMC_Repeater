@@ -15,7 +15,7 @@ import time
 from typing import Optional
 
 import cherrypy
-from pymc_core.companion.constants import DEFAULT_OFFLINE_QUEUE_SIZE
+from openhop_core.companion.constants import DEFAULT_OFFLINE_QUEUE_SIZE
 
 from repeater.companion.utils import (
     trim_companion_contacts_to_fit,

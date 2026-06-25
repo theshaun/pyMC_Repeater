@@ -1,5 +1,5 @@
 #!/bin/bash
-# Radio configuration setup script for pyMC Repeater
+# Radio configuration setup script for openHop Repeater
 
 CONFIG_DIR="${1:-.}"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
@@ -15,7 +15,7 @@ else
     SED_OPTS=(-i)
 fi
 
-echo "=== pyMC Repeater Radio Configuration ==="
+echo "=== openHop Repeater Radio Configuration ==="
 echo ""
 
 # Step 0: Repeater Name
@@ -48,7 +48,7 @@ echo ""
 echo "=== Step 0.5: Select Radio Type ==="
 echo ""
 echo "  1) SX1262 hardware (SPI LoRa module - Raspberry Pi HAT, etc.)"
-echo "  2) KISS modem (serial TNC - requires pyMC_core with KISS support)"
+echo "  2) KISS modem (serial TNC - requires openhop-core with KISS support)"
 echo ""
 read -p "Select radio type (1 or 2): " radio_type_sel
 
@@ -435,7 +435,7 @@ if [ "$RADIO_TYPE" = "sx1262" ] && [ -n "$bus_id" ]; then
 fi
 
 # Enable and start the service
-SERVICE_NAME="pymc-repeater"
+SERVICE_NAME="openhop-repeater"
 if systemctl list-unit-files | grep -q "^$SERVICE_NAME\.service"; then
     echo ""
     echo "Enabling and starting the $SERVICE_NAME service..."

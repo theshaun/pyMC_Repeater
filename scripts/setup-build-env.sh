@@ -1,5 +1,5 @@
 #!/bin/bash
-# Setup Debian/Ubuntu build environment for pyMC_Repeater
+# Setup Debian/Ubuntu build environment for openhop-repeater
 # This script installs all required build dependencies using apt
 
 set -euo pipefail
@@ -28,7 +28,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-log_info "Setting up build environment for pyMC_Repeater..."
+log_info "Setting up build environment for openhop-repeater..."
 
 # Update package list
 log_info "Updating package lists..."

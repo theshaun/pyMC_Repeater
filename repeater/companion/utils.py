@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from pymc_core.companion.constants import DEFAULT_MAX_CONTACTS
+from openhop_core.companion.constants import DEFAULT_MAX_CONTACTS
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +14,7 @@ _INVALID_NODE_NAME_CHARS = "\n\r\x00"
 # Optional per-companion RepeaterCompanionBridge constructor settings (power-user).
 COMPANION_BRIDGE_SETTING_KEYS = frozenset({"max_contacts", "offline_queue_size"})
 
-# Settings that must not be applied from config (fixed at pymc_core defaults).
+# Settings that must not be applied from config (fixed at openhop_core defaults).
 _COMPANION_IGNORED_BRIDGE_KEYS = frozenset({"max_channels", "adv_type"})
 
 # Contact flag bit 0 marks a favourite (protected from forced-trim eviction).
@@ -102,7 +102,7 @@ def parse_companion_bridge_kwargs(settings: dict) -> Dict[str, int]:
 
 
 def effective_max_contacts(bridge_kwargs: Dict[str, int]) -> int:
-    """Return max_contacts from parsed kwargs or pymc_core default."""
+    """Return max_contacts from parsed kwargs or openhop_core default."""
     return bridge_kwargs.get("max_contacts", DEFAULT_MAX_CONTACTS)
 
 
@@ -253,7 +253,7 @@ def format_companion_bridge_limits(bridge_kwargs: Dict[str, int]) -> str:
 
 def companion_hash_str_from_identity_key(identity_key: Any) -> str:
     """Derive companion_hash storage key (0xHH) from an identity_key config value."""
-    from pymc_core import LocalIdentity
+    from openhop_core import LocalIdentity
 
     if isinstance(identity_key, str):
         key_bytes = bytes.fromhex(normalize_companion_identity_key(identity_key))

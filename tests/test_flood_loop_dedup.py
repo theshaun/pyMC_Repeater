@@ -1,7 +1,7 @@
 """
 Tests for flood packet loop detection and duplicate suppression.
 
-Exercises the real RepeaterHandler engine with real pymc_core Packet/PathUtils
+Exercises the real RepeaterHandler engine with real openhop_core Packet/PathUtils
 objects to verify:
   - Duplicate packet suppression via calculate_packet_hash (SHA256-based)
   - Loop detection modes (off, minimal, moderate, strict) with real path bytes
@@ -15,8 +15,8 @@ objects to verify:
 from unittest.mock import MagicMock, patch
 
 
-from pymc_core.protocol import Packet, PathUtils
-from pymc_core.protocol.constants import (
+from openhop_core.protocol import Packet, PathUtils
+from openhop_core.protocol.constants import (
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )

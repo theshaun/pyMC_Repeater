@@ -12,6 +12,7 @@ except ImportError:
     psutil = None
 
 import logging
+import platform
 import time
 
 logger = logging.getLogger("HardwareStats")
@@ -57,6 +58,7 @@ class HardwareStatsCollector:
             # System boot time
             boot_time = psutil.boot_time()
             system_uptime = now - boot_time
+            system_info = self._get_system_info()
 
             # Temperature (if available)
             temperatures = {}
@@ -96,7 +98,13 @@ class HardwareStatsCollector:
                     "packets_sent": net_io.packets_sent,
                     "packets_recv": net_io.packets_recv,
                 },
-                "system": {"uptime": system_uptime, "boot_time": boot_time},
+                "system": {
+                    "uptime": system_uptime,
+                    "boot_time": boot_time,
+                    "os": system_info["os"],
+                    "kernel": system_info["kernel"],
+                    "arch": system_info["arch"],
+                },
             }
 
             # Add temperatures if available
@@ -108,6 +116,25 @@ class HardwareStatsCollector:
         except Exception as e:
             logger.error(f"Error collecting hardware stats: {e}")
             return {"error": str(e)}
+
+    @staticmethod
+    def _get_system_info(os_release_path="/etc/os-release"):
+        os_name = None
+        try:
+            with open(os_release_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    key, sep, value = line.partition("=")
+                    if sep and key == "PRETTY_NAME":
+                        os_name = value.strip().strip('"')
+                        break
+        except OSError:
+            os_name = None
+
+        return {
+            "os": os_name or platform.system(),
+            "kernel": platform.release(),
+            "arch": platform.machine(),
+        }
 
     def get_processes_summary(self, limit=10):
         """

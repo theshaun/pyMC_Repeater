@@ -1,6 +1,6 @@
 services:
-  pymc-repeater:
-    image: pymc-repeater:local
+  openhop-repeater:
+    image: openhop-repeater:local
     build:
       context: .
       dockerfile: dockerfile

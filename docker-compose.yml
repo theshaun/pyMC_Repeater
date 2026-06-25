@@ -1,7 +1,7 @@
 services:
-  pymc-repeater:
-    image: ${PYMC_REPEATER_IMAGE:-pymcdev/pymc-repeater:main}
-    container_name: pymc-repeater
+  openhop-repeater:
+    image: ${PYMC_REPEATER_IMAGE:-pymcdev/openhop-repeater:main}
+    container_name: openhop-repeater
     restart: unless-stopped
     ports:
       - 8000:8000
@@ -21,9 +21,9 @@ services:
       - "${SPI_GID:-989}"
       - plugdev
     volumes:
-      - ${PYMC_CONFIG_VOLUME:-pymc-repeater-config}:/etc/pymc_repeater
-      - ${PYMC_DATA_VOLUME:-pymc-repeater-data}:/var/lib/pymc_repeater
+      - ${PYMC_CONFIG_VOLUME:-openhop-repeater-config}:/etc/openhop_repeater
+      - ${PYMC_DATA_VOLUME:-openhop-repeater-data}:/var/lib/openhop_repeater
 
 volumes:
-  pymc-repeater-config:
-  pymc-repeater-data:
+  openhop-repeater-config:
+  openhop-repeater-data:

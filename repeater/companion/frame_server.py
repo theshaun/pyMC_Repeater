@@ -1,7 +1,7 @@
 """
 Repeater-specific CompanionFrameServer with SQLite persistence.
 
-Thin subclass of :class:`pymc_core.companion.frame_server.CompanionFrameServer`
+Thin subclass of :class:`openhop_core.companion.frame_server.CompanionFrameServer`
 that adds SQLite-backed message, contact, and channel persistence via a
 ``sqlite_handler`` dependency.
 """
@@ -12,9 +12,9 @@ import asyncio
 import logging
 from typing import Optional
 
-from pymc_core.companion.constants import RESP_CODE_NO_MORE_MESSAGES
-from pymc_core.companion.frame_server import CompanionFrameServer as _BaseFrameServer
-from pymc_core.companion.models import QueuedMessage
+from openhop_core.companion.constants import RESP_CODE_NO_MORE_MESSAGES
+from openhop_core.companion.frame_server import CompanionFrameServer as _BaseFrameServer
+from openhop_core.companion.models import QueuedMessage
 
 logger = logging.getLogger("CompanionFrameServer")
 
@@ -45,8 +45,8 @@ class CompanionFrameServer(_BaseFrameServer):
             port=port,
             bind_address=bind_address,
             client_idle_timeout_sec=client_idle_timeout_sec,
-            device_model="pyMC-Repeater-Companion",
-            device_version=None,  # use FIRMWARE_VER_CODE from pyMC_core
+            device_model="openHop-Repeater-Companion",
+            device_version=None,  # use FIRMWARE_VER_CODE from openhop-core
             build_date="13 Feb 2026",
             local_hash=local_hash,
             stats_getter=stats_getter,

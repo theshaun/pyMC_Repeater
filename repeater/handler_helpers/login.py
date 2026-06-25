@@ -1,5 +1,5 @@
 """
-Login/ANON_REQ packet handling helper for pyMC Repeater.
+Login/ANON_REQ packet handling helper for openHop Repeater.
 
 This module processes login requests and manages authentication for all identities.
 """
@@ -8,9 +8,9 @@ import asyncio
 import logging
 import time
 
-from pymc_core.node.handlers.anon_request import AnonRateLimiter, AnonRequestHandler
-from pymc_core.node.handlers.login_server import LoginServerHandler
-from pymc_core.protocol.constants import PAYLOAD_TYPE_ANON_REQ
+from openhop_core.node.handlers.anon_request import AnonRateLimiter, AnonRequestHandler
+from openhop_core.node.handlers.login_server import LoginServerHandler
+from openhop_core.protocol.constants import PAYLOAD_TYPE_ANON_REQ
 
 logger = logging.getLogger("LoginHelper")
 
@@ -167,7 +167,7 @@ class LoginHelper:
         emit the ``*`` wildcard region first (unless unscoped flood is denied),
         then each allow-flood named region with a leading ``#`` stripped, with no
         trailing comma. The firmware wildcard is the always-present default flood
-        scope; pyMC_repeater models that via ``mesh.unscoped_flood_allow``
+        scope; openhop_repeater models that via ``mesh.unscoped_flood_allow``
         (falling back to ``mesh.global_flood_allow``, default allow).
         """
         parts = []

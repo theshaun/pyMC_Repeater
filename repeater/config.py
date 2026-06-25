@@ -140,7 +140,7 @@ def resolve_storage_dir(
     config: Dict[str, Any],
     *,
     config_path: Optional[str] = None,
-    default: str = "/var/lib/pymc_repeater",
+    default: str = "/var/lib/openhop_repeater",
 ) -> Path:
 
     storage_dir_cfg = (
@@ -195,7 +195,7 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if config_path is None:
-        config_path = os.getenv("PYMC_REPEATER_CONFIG", "/etc/pymc_repeater/config.yaml")
+        config_path = os.getenv("PYMC_REPEATER_CONFIG", "/etc/openhop_repeater/config.yaml")
 
     # Check if config file exists
     if not Path(config_path).exists():
@@ -235,7 +235,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "request_timeout_seconds": 10,
             "verify_tls": True,
             "api_token": None,
-            "cert_store_dir": "/etc/pymc_repeater/glass",
+            "cert_store_dir": "/etc/openhop_repeater/glass",
         }
 
     if "gps" not in config:
@@ -323,7 +323,7 @@ def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) 
         True if successful, False otherwise
     """
     if config_path is None:
-        config_path = os.getenv("PYMC_REPEATER_CONFIG", "/etc/pymc_repeater/config.yaml")
+        config_path = os.getenv("PYMC_REPEATER_CONFIG", "/etc/openhop_repeater/config.yaml")
 
     try:
         # Create backup of existing config
@@ -387,16 +387,16 @@ def _load_or_create_identity_key(path: Optional[str] = None) -> bytes:
 
     if path is None:
         # Check system-wide location first (matches config.yaml location)
-        system_key_path = Path("/etc/pymc_repeater/identity.key")
+        system_key_path = Path("/etc/openhop_repeater/identity.key")
         if system_key_path.exists():
             key_path = system_key_path
         else:
             # Follow XDG spec
             xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
             if xdg_config_home:
-                config_dir = Path(xdg_config_home) / "pymc_repeater"
+                config_dir = Path(xdg_config_home) / "openhop_repeater"
             else:
-                config_dir = Path.home() / ".config" / "pymc_repeater"
+                config_dir = Path.home() / ".config" / "openhop_repeater"
             key_path = config_dir / "identity.key"
     else:
         key_path = Path(path)
@@ -475,7 +475,7 @@ def get_radio_for_board(board_config: dict):
         radio_type = "kiss"
 
     if radio_type in ("sx1262", "sx1262_ch341"):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         # Get radio and SPI configuration - all settings must be in config file
         spi_config = board_config.get("sx1262")
@@ -492,8 +492,8 @@ def get_radio_for_board(board_config: dict):
             if not ch341_cfg:
                 raise ValueError("Missing 'ch341' section in configuration file")
 
-            from pymc_core.hardware.lora.LoRaRF.SX126x import set_spi_transport
-            from pymc_core.hardware.transports.ch341_spi_transport import CH341SPITransport
+            from openhop_core.hardware.lora.LoRaRF.SX126x import set_spi_transport
+            from openhop_core.hardware.transports.ch341_spi_transport import CH341SPITransport
 
             vid = _parse_int(ch341_cfg.get("vid"), default=0x1A86)
             pid = _parse_int(ch341_cfg.get("pid"), default=0x5512)
@@ -534,7 +534,7 @@ def get_radio_for_board(board_config: dict):
             combined_config["en_pins"] = en_pins
 
         # Add optional GPIO parameters if specified in config
-        # These wont be supported by older versions of pymc_core
+        # These wont be supported by older versions of openhop_core
         if "gpio_chip" in spi_config:
             combined_config["gpio_chip"] = _parse_int(spi_config["gpio_chip"], default=0)
         if "use_gpiod_backend" in spi_config:
@@ -554,16 +554,16 @@ def get_radio_for_board(board_config: dict):
 
     elif radio_type == "kiss":
         try:
-            from pymc_core.hardware.kiss_modem_wrapper import KissModemWrapper
+            from openhop_core.hardware.kiss_modem_wrapper import KissModemWrapper
         except ImportError:
             try:
-                from pymc_core.hardware.kiss_serial_wrapper import (
+                from openhop_core.hardware.kiss_serial_wrapper import (
                     KissSerialWrapper as KissModemWrapper,
                 )
             except ImportError:
                 raise RuntimeError(
-                    "KISS modem support requires pyMC_core with KISS support. "
-                    "Install your fork with: pip install -e /path/to/pyMC_core"
+                    "KISS modem support requires openhop-core with KISS support. "
+                    "Install your fork with: pip install -e /path/to/openhop-core"
                 ) from None
 
         kiss_config = board_config.get("kiss")
@@ -613,11 +613,11 @@ def get_radio_for_board(board_config: dict):
 
     elif radio_type == "pymc_tcp":
         try:
-            from pymc_core.hardware.tcp_radio import TCPLoRaRadio
+            from openhop_core.hardware.tcp_radio import TCPLoRaRadio
         except ImportError:
             raise RuntimeError(
-                "pymc_tcp radio requires pyMC_core >= the release that includes "
-                "PR pyMC-dev/pyMC_core#68 (merged 2026-05-13). "
+                "pymc_tcp radio requires openhop-core >= the release that includes "
+                "PR pyMC-dev/openhop-core#68 (merged 2026-05-13). "
                 "Reinstall the [hardware] extra to pick it up."
             ) from None
 
@@ -657,11 +657,11 @@ def get_radio_for_board(board_config: dict):
 
     elif radio_type == "pymc_usb":
         try:
-            from pymc_core.hardware.usb_radio import USBLoRaRadio
+            from openhop_core.hardware.usb_radio import USBLoRaRadio
         except ImportError:
             raise RuntimeError(
-                "pymc_usb radio requires pyMC_core >= the release that includes "
-                "PR pyMC-dev/pyMC_core#68 (merged 2026-05-13). "
+                "pymc_usb radio requires openhop-core >= the release that includes "
+                "PR pyMC-dev/openhop-core#68 (merged 2026-05-13). "
                 "Reinstall the [hardware] extra to pick it up."
             ) from None
 

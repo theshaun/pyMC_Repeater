@@ -56,7 +56,8 @@ async def test_path_helper_updates_client_out_path_on_valid_decrypt():
     packet = _PathPacket(payload=b"\x11\x22\xaa\xbb\xcc")
 
     with patch(
-        "pymc_core.protocol.crypto.CryptoUtils.mac_then_decrypt", return_value=b"\x02\x99\x88\x01"
+        "openhop_core.protocol.crypto.CryptoUtils.mac_then_decrypt",
+        return_value=b"\x02\x99\x88\x01",
     ):
         handled = await helper.process_path_packet(packet)
 
@@ -82,7 +83,7 @@ async def test_path_helper_returns_false_for_non_matching_or_invalid_inputs():
         is False
     )
 
-    with patch("pymc_core.protocol.crypto.CryptoUtils.mac_then_decrypt", return_value=None):
+    with patch("openhop_core.protocol.crypto.CryptoUtils.mac_then_decrypt", return_value=None):
         assert await helper.process_path_packet(_PathPacket(payload=b"\x11\x22\xaa\xbb")) is False
 
 
@@ -356,7 +357,7 @@ async def test_text_helper_send_cli_reply_uses_direct_path_from_client():
     reply_packet = SimpleNamespace(path=bytearray(), path_len=0)
 
     with (
-        patch("pymc_core.protocol.PacketBuilder.create_datagram", return_value=reply_packet),
+        patch("openhop_core.protocol.PacketBuilder.create_datagram", return_value=reply_packet),
         patch("repeater.handler_helpers.text.asyncio.sleep", new_callable=AsyncMock),
     ):
         await helper._send_cli_reply(

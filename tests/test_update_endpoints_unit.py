@@ -33,7 +33,7 @@ def _fake_thread(*args, **kwargs):
 
 def test_jwt_warning_fix_guard():
     # Guard test file import path and ensure this module executes in suite.
-    assert ue.PACKAGE_NAME == "pymc_repeater"
+    assert ue.PACKAGE_NAME == "openhop_repeater"
 
 
 def test_has_update_paths():
@@ -250,6 +250,22 @@ def test_channels_set_channel_and_changelog(cherrypy_ctx, isolated_state, monkey
     assert c["commits"][0]["title"] == "t"
 
 
+def test_changelog_guard_when_github_unavailable(cherrypy_ctx, isolated_state, monkeypatch):
+    request, _ = cherrypy_ctx
+    request.method = "GET"
+    api = ue.UpdateAPIEndpoints()
+
+    def _raise_fetch(*_args, **_kwargs):
+        raise RuntimeError("HTTP Error 404: Not Found")
+
+    monkeypatch.setattr(ue, "_fetch_changelog", _raise_fetch)
+
+    out = api.changelog(channel="dev", max="5")
+    assert out["success"] is True
+    assert out["channel"] == "dev"
+    assert out["commits"] == []
+
+
 def test_cors_headers_and_error_helpers(cherrypy_ctx):
     _, response = cherrypy_ctx
     api = ue.UpdateAPIEndpoints()
@@ -370,6 +386,7 @@ def test_do_install_root_install_command_failure_sets_error(isolated_state, monk
     monkeypatch.setattr(ue.os, "geteuid", lambda: 0)
     monkeypatch.setattr(ue, "is_buildroot", lambda: False)
     monkeypatch.setattr(ue, "_migrate_service_unit", lambda: None)
+    monkeypatch.setattr(ue, "_disable_legacy_services", lambda: None)
     monkeypatch.setattr(ue.os.path, "isfile", lambda p: True)
     monkeypatch.setattr(ue.os.path, "isdir", lambda p: False)
 

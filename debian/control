@@ -1,4 +1,4 @@
-Source: pymc-repeater
+Source: openhop-repeater
 Section: net
 Priority: optional
 Maintainer: Rightup <rightup@pymc.dev>
@@ -15,10 +15,10 @@ Build-Depends: debhelper-compat (= 13),
                python3-psutil,
                git
 Standards-Version: 4.6.2
-Homepage: https://github.com/rightup/pyMC_Repeater
+Homepage: https://github.com/rightup/openhop-repeater
 X-Python3-Version: >= 3.9
 
-Package: pymc-repeater
+Package: openhop-repeater
 Architecture: all
 Depends: ${python3:Depends},
          ${misc:Depends},
@@ -36,8 +36,8 @@ Recommends: python3-periphery,
 Description: PyMC Repeater Daemon
  A mesh networking repeater daemon for LoRa devices.
  .
- This package provides the pymc-repeater service for managing
+ This package provides the openhop-repeater service for managing
  mesh network repeater functionality with a web interface.
  .
- Note: This package will install pymc_core, cherrypy-cors, and ws4py
+ Note: This package will install openhop_core, cherrypy-cors, and ws4py
  from PyPI during postinst as they are not available in Debian repos.

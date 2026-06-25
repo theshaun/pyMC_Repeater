@@ -32,7 +32,7 @@ class _FakeIdentity:
 
 
 def _make_config(format_value: str = "letsmesh", iata_code: str = "LAX") -> dict:
-    """Minimal pyMC_Repeater config sufficient to construct MeshCoreToMqttPusher."""
+    """Minimal openhop-repeater config sufficient to construct MeshCoreToMqttPusher."""
     return {
         "repeater": {"node_name": "test-node"},
         "radio": {
