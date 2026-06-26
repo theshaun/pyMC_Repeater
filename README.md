@@ -418,7 +418,7 @@ that source as a directory, which breaks startup.
 ### Setup
 
 1. Copy `.env.example` to `.env`.
-2. Review `.env` and update `PYMC_REPEATER_IMAGE`, `DIALOUT_GID`,
+2. Review `.env` and update `OPENHOP_REPEATER_IMAGE`, `DIALOUT_GID`,
    `GPIO_GID`, or `SPI_GID` if needed.
 3. Configure `docker-compose.yml` for your hardware and device paths.
 4. Uncomment the USB device mapping only if your host has that device path.
@@ -433,7 +433,7 @@ docker compose up -d
 ```yaml
 services:
   openhop-repeater:
-    image: ${PYMC_REPEATER_IMAGE:-pymcdev/openhop-repeater:main}
+    image: ${OPENHOP_REPEATER_IMAGE:-${PYMC_REPEATER_IMAGE:-openhop/openhop-repeater:main}}
     container_name: openhop-repeater
     restart: unless-stopped
     ports:
@@ -457,8 +457,8 @@ services:
       - plugdev
 
     volumes:
-      - ${PYMC_CONFIG_VOLUME:-openhop-repeater-config}:/etc/openhop_repeater
-      - ${PYMC_DATA_VOLUME:-openhop-repeater-data}:/var/lib/openhop_repeater
+      - ${OPENHOP_CONFIG_VOLUME:-${PYMC_CONFIG_VOLUME:-openhop-repeater-config}}:/etc/openhop_repeater
+      - ${OPENHOP_DATA_VOLUME:-${PYMC_DATA_VOLUME:-openhop-repeater-data}}:/var/lib/openhop_repeater
 
 volumes:
   openhop-repeater-config:
