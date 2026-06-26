@@ -30,6 +30,7 @@ def test_list_presets_returns_bundled_names():
     assert "waev" in names
     assert "letsmesh" in names
     assert "meshmapper" in names
+    assert "meshat-se" in names
 
 
 def test_get_preset_waev_uses_alias_for_server_side_failover():
@@ -76,7 +77,7 @@ def test_get_preset_letsmesh_carries_ui_metadata():
 
 
 def test_get_preset_meshmapper_is_single_broker_mc2mqtt():
-    """MeshMapper preset is a single MC2MQTT broker on mqtt.meshmapper.cc.
+    """MeshMapper preset is a single MC2MQTT broker on mqtt.meshmapper.net.
 
     The preset intentionally re-uses the `letsmesh` format value because
     MeshMapper today speaks the standard MC2MQTT wire format with no
@@ -89,8 +90,8 @@ def test_get_preset_meshmapper_is_single_broker_mc2mqtt():
     brokers = preset.get("brokers", [])
     assert len(brokers) == 1
     broker = brokers[0]
-    assert broker["host"] == "mqtt.meshmapper.cc"
-    assert broker["audience"] == "mqtt.meshmapper.cc"
+    assert broker["host"] == "mqtt.meshmapper.net"
+    assert broker["audience"] == "mqtt.meshmapper.net"
     assert broker.get("format") == "letsmesh"
 
 
@@ -318,6 +319,77 @@ def test_connect_failure_schedules_reconnect_with_actual_error_reason(monkeypatc
     conn._on_connect(client=None, userdata=None, flags=None, rc=5)
 
     assert captured["reason"] == "Not authorized (JWT signature/format invalid)"
+
+
+def test_schedule_reconnect_uses_exponential_backoff_and_cap(monkeypatch):
+    conn = _make_broker_connection("letsmesh")
+
+    captured = {"delay": None, "started": False}
+
+    class _Timer:
+        def __init__(self, delay, cb):
+            captured["delay"] = delay
+            self.daemon = False
+            self._cb = cb
+
+        def start(self):
+            captured["started"] = True
+
+        def cancel(self):
+            return None
+
+    monkeypatch.setattr("repeater.data_acquisition.mqtt_handler.threading.Timer", _Timer)
+
+    conn._reconnect_attempts = 0
+    conn._schedule_reconnect("first")
+    assert captured["delay"] == 5
+    assert captured["started"] is True
+
+    # Large attempt count should clamp to max delay.
+    conn._reconnect_attempts = 99
+    conn._schedule_reconnect("later")
+    assert captured["delay"] == conn._max_reconnect_delay
+
+
+def test_on_disconnect_duplicate_callback_does_not_schedule_reconnect(monkeypatch):
+    conn = _make_broker_connection("letsmesh")
+    conn._running = False
+
+    called = {"count": 0}
+
+    def _fake_schedule(reason="connection lost"):
+        called["count"] += 1
+
+    monkeypatch.setattr(conn, "_schedule_reconnect", _fake_schedule)
+
+    # Unexpected disconnect while already disconnected = duplicate callback.
+    conn._on_disconnect(client=None, userdata=None, rc=1)
+    assert called["count"] == 0
+
+
+def test_attempt_reconnect_failure_reschedules(monkeypatch):
+    conn = _make_broker_connection("letsmesh")
+    conn._running = False
+    conn._reconnect_timer = object()
+
+    monkeypatch.setattr(conn, "_set_credentials", lambda: None)
+    monkeypatch.setattr(conn.client, "loop_stop", lambda: None)
+    monkeypatch.setattr(conn.client, "loop_start", lambda: None)
+
+    def _boom_connect(*args, **kwargs):
+        raise RuntimeError("connect failed")
+
+    monkeypatch.setattr(conn.client, "connect", _boom_connect)
+
+    called = {"count": 0}
+
+    def _fake_schedule(reason="connection lost"):
+        called["count"] += 1
+
+    monkeypatch.setattr(conn, "_schedule_reconnect", _fake_schedule)
+
+    conn._attempt_reconnect("network")
+    assert called["count"] == 1
 
 
 def test_on_pre_connect_refreshes_jwt_credentials(monkeypatch):

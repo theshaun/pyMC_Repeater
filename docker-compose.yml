@@ -1,11 +1,7 @@
 services:
-  pymc-repeater:
-    build:
-      context: .
-      args:
-        PUID: ${PUID:-1000}
-        PGID: ${PGID:-1000}
-    container_name: pymc-repeater
+  openhop-repeater:
+    image: ${OPENHOP_REPEATER_IMAGE:-${PYMC_REPEATER_IMAGE:-openhop/openhop-repeater:main}}
+    container_name: openhop-repeater
     restart: unless-stopped
     ports:
       - 8000:8000
@@ -18,9 +14,16 @@ services:
     # SPI DEVICES PERMISSIONS
     cap_add:
       - SYS_RAWIO
-    # USB DEVICSE PERMISSIONS
+    # USB DEVICE PERMISSIONS
     group_add:
-     - plugdev
+      - "${DIALOUT_GID:-20}"
+      - "${GPIO_GID:-986}"
+      - "${SPI_GID:-989}"
+      - plugdev
     volumes:
-      - ./config:/etc/pymc_repeater
-      - ./data:/var/lib/pymc_repeater
+      - ${OPENHOP_CONFIG_VOLUME:-${PYMC_CONFIG_VOLUME:-openhop-repeater-config}}:/etc/openhop_repeater
+      - ${OPENHOP_DATA_VOLUME:-${PYMC_DATA_VOLUME:-openhop-repeater-data}}:/var/lib/openhop_repeater
+
+volumes:
+  openhop-repeater-config:
+  openhop-repeater-data:

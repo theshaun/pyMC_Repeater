@@ -1,4 +1,4 @@
-"""Companion identity support for pyMC Repeater.
+"""Companion identity support for openHop Repeater.
 
 Exposes the MeshCore companion frame protocol over TCP for standard clients.
 """

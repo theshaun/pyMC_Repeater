@@ -1,31 +1,29 @@
 import asyncio
 import copy
 import logging
-import random
-import struct
+import secrets
 import time
 from collections import OrderedDict, deque
 from typing import Optional, Tuple
 
-from pymc_core.node.handlers.base import BaseHandler
-from pymc_core.protocol import Packet
-from pymc_core.protocol.constants import (
+from openhop_core.node.handlers.base import BaseHandler
+from openhop_core.protocol import Packet
+from openhop_core.protocol.constants import (
     MAX_PATH_SIZE,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_TRACE,
     PH_ROUTE_MASK,
-    PH_TYPE_MASK,
-    PH_TYPE_SHIFT,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_DIRECT,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from pymc_core.protocol.packet_utils import PacketHeaderUtils, PacketTimingUtils, PathUtils
+from openhop_core.protocol.packet_utils import PacketHeaderUtils, PathUtils
 
 from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
+from repeater.policy_engine import PolicyDecision, PolicyEngine
 
 logger = logging.getLogger("RepeaterHandler")
 
@@ -47,13 +45,20 @@ LOOP_DETECT_MAX_COUNTERS = {
 
 
 class RepeaterHandler(BaseHandler):
-
     @staticmethod
     def payload_type() -> int:
 
         return 0xFF  # Special marker (not a real payload type)
 
-    def __init__(self, config: dict, dispatcher, local_hash: int, *, local_hash_bytes=None, send_advert_func=None):
+    def __init__(
+        self,
+        config: dict,
+        dispatcher,
+        local_hash: int,
+        *,
+        local_hash_bytes=None,
+        send_advert_func=None,
+    ):
 
         self.config = config
         self.dispatcher = dispatcher
@@ -61,6 +66,7 @@ class RepeaterHandler(BaseHandler):
         self.local_hash_bytes = local_hash_bytes or bytes([local_hash])
         self.send_advert_func = send_advert_func
         self.airtime_mgr = AirtimeManager(config)
+        self.policy_engine = PolicyEngine.from_runtime_config(config)
         self.seen_packets = OrderedDict()
         self.cache_ttl = max(
             300, config.get("repeater", {}).get("cache_ttl", 3600)
@@ -86,7 +92,7 @@ class RepeaterHandler(BaseHandler):
                 "spreading_factor": getattr(radio, "spreading_factor", 8),
                 "bandwidth": getattr(radio, "bandwidth", 125000),
                 "coding_rate": getattr(radio, "coding_rate", 8),
-                "preamble_length": getattr(radio, "preamble_length", 17),
+                "preamble_length": getattr(radio, "preamble_length", 32),
                 "frequency": getattr(radio, "frequency", 915000000),
                 "tx_power": getattr(radio, "tx_power", 14),
             }
@@ -115,7 +121,6 @@ class RepeaterHandler(BaseHandler):
 
         # Storage collector for persistent packet logging
         try:
-
             local_identity = dispatcher.local_identity if dispatcher else None
             self.storage = StorageCollector(config, local_identity, repeater_handler=self)
             logger.info("StorageCollector initialized successfully")
@@ -131,7 +136,7 @@ class RepeaterHandler(BaseHandler):
         self._background_task = None
         self._cached_noise_floor = None
         self._last_crc_error_count = 0  # Track radio counter for delta persistence
-        
+
         # Cache transport keys for efficient lookup
         self._transport_keys_cache = None
         self._transport_keys_cache_time = 0
@@ -159,7 +164,7 @@ class RepeaterHandler(BaseHandler):
 
     async def __call__(
         self, packet: Packet, metadata: Optional[dict] = None, local_transmission: bool = False
-    ) -> None:
+    ) -> bool:
 
         if metadata is None:
             metadata = {}
@@ -175,8 +180,8 @@ class RepeaterHandler(BaseHandler):
             try:
                 rx_airtime_ms = self.airtime_mgr.calculate_airtime(packet.get_raw_length())
                 self.airtime_mgr.record_rx(rx_airtime_ms)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"Failed to record RX airtime: {exc}")
 
         route_type = packet.header & PH_ROUTE_MASK
         pkt_hash_full = packet.calculate_packet_hash().hex().upper()
@@ -187,6 +192,38 @@ class RepeaterHandler(BaseHandler):
             mode = "forward"
         allow_forward = mode == "forward"
         allow_local_tx = mode != "no_tx"
+
+        policy_context = {
+            "route_type": route_type,
+            "payload_type": packet.get_payload_type()
+            if hasattr(packet, "get_payload_type")
+            else None,
+            "payload_length": len(packet.payload or b""),
+            "path_hash_size": packet.get_path_hash_size()
+            if hasattr(packet, "get_path_hash_size")
+            else None,
+            "hop_count": packet.get_path_hash_count()
+            if hasattr(packet, "get_path_hash_count")
+            else None,
+            "rssi": metadata.get("rssi", 0),
+            "snr": metadata.get("snr", 0.0),
+            "local_transmission": local_transmission,
+            "mode": mode,
+        }
+        prechecked_decision = metadata.get("_policy_precheck_decision")
+        if isinstance(prechecked_decision, PolicyDecision):
+            policy_decision = prechecked_decision
+        else:
+            policy_decision = self.policy_engine.evaluate(packet, policy_context)
+        policy_reason = None
+
+        if policy_decision.matched:
+            logger.info(policy_decision.reason)
+
+        if policy_decision.action == "drop":
+            allow_forward = False
+            allow_local_tx = False
+            policy_reason = self._policy_drop_reason(policy_decision)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -256,25 +293,27 @@ class RepeaterHandler(BaseHandler):
                         f"Duty-cycle limit: deferring local TX by {wait_time:.1f}s "
                         f"(airtime={airtime_ms:.1f}ms)"
                     )
-                    self.forwarded_count += 1
-                    transmitted = True
                     tx_task = await self.schedule_retransmit(
                         fwd_pkt, deferred_delay, airtime_ms, local_transmission=True
                     )
                     try:
-                        await tx_task
+                        tx_success = await tx_task
                     except Exception as e:
-                        self.forwarded_count -= 1
                         transmitted = False
                         drop_reason = "TX failed (deferred)"
                         logger.warning(f"Deferred local TX failed: {e}")
                         raise
+                    if not tx_success:
+                        transmitted = False
+                        drop_reason = "TX failed (deferred)"
+                        self.dropped_count += 1
+                    else:
+                        self.forwarded_count += 1
+                        transmitted = True
                     tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
                     if tx_metadata:
                         lbt_attempts = tx_metadata.get("lbt_attempts", 0)
-                        lbt_backoff_delays_ms = tx_metadata.get(
-                            "lbt_backoff_delays_ms", []
-                        )
+                        lbt_backoff_delays_ms = tx_metadata.get("lbt_backoff_delays_ms", [])
                         lbt_channel_busy = tx_metadata.get("lbt_channel_busy", False)
                         if lbt_attempts > 0:
                             total_lbt_delay = sum(lbt_backoff_delays_ms)
@@ -291,19 +330,23 @@ class RepeaterHandler(BaseHandler):
                     self.dropped_count += 1
                     drop_reason = "Duty cycle limit"
             else:
-                self.forwarded_count += 1
-                transmitted = True
                 tx_task = await self.schedule_retransmit(
                     fwd_pkt, delay, airtime_ms, local_transmission=local_transmission
                 )
                 try:
-                    await tx_task
+                    tx_success = await tx_task
                 except Exception as e:
-                    self.forwarded_count -= 1
                     transmitted = False
                     drop_reason = "TX failed"
                     logger.warning(f"Local TX failed: {e}")
                     raise
+                if not tx_success:
+                    transmitted = False
+                    drop_reason = "TX failed"
+                    self.dropped_count += 1
+                else:
+                    self.forwarded_count += 1
+                    transmitted = True
                 tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
                 if tx_metadata:
                     lbt_attempts = tx_metadata.get("lbt_attempts", 0)
@@ -320,9 +363,9 @@ class RepeaterHandler(BaseHandler):
             self.dropped_count += 1
             # Determine drop reason
             if local_transmission and not allow_local_tx:
-                drop_reason = "No TX mode"
+                drop_reason = policy_reason or "No TX mode"
             elif not allow_forward:
-                drop_reason = "Repeat disabled"
+                drop_reason = policy_reason or "Repeat disabled"
             else:
                 # Check if packet has a specific drop reason set by handlers
                 drop_reason = processed_packet.drop_reason or self._get_drop_reason(
@@ -414,6 +457,14 @@ class RepeaterHandler(BaseHandler):
             # Not a duplicate or first occurrence
             self._append_recent_packet(packet_record)
 
+        return transmitted
+
+    @staticmethod
+    def _policy_drop_reason(decision: PolicyDecision) -> str:
+        if decision.rule_id is None:
+            return "Policy blocked packet"
+        return f"Policy blocked packet (rule {decision.rule_id})"
+
     def log_trace_record(self, packet_record: dict) -> None:
         """Manually log a packet trace record (used by external callers)"""
         self._append_recent_packet(packet_record)
@@ -501,9 +552,16 @@ class RepeaterHandler(BaseHandler):
         src_hash, dst_hash = self._packet_record_src_dst(packet, payload_type)
 
         packet_record = self._build_packet_record(
-            packet, payload_type, route_type_parsed, rssi, snr,
-            original_path_hashes, path_hash_size, path_hash,
-            src_hash, dst_hash,
+            packet,
+            payload_type,
+            route_type_parsed,
+            rssi,
+            snr,
+            original_path_hashes,
+            path_hash_size,
+            path_hash,
+            src_hash,
+            dst_hash,
             transmitted=False,
             drop_reason="Duplicate",
             is_duplicate=True,
@@ -667,7 +725,9 @@ class RepeaterHandler(BaseHandler):
 
         if route_type == ROUTE_TYPE_FLOOD:
             # Check if unscoped flood policy blocked it
-            unscoped_flood_allow = self.config.get("mesh", {}).get("unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True))
+            unscoped_flood_allow = self.config.get("mesh", {}).get(
+                "unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True)
+            )
             if not unscoped_flood_allow:
                 return "Unscoped flood policy disabled"
 
@@ -747,8 +807,9 @@ class RepeaterHandler(BaseHandler):
         path = packet.path or bytearray()
         local_hash = self.local_hash_bytes[:hash_size]
         local_count = sum(
-            1 for i in range(hop_count)
-            if bytes(path[i * hash_size:(i + 1) * hash_size]) == local_hash
+            1
+            for i in range(hop_count)
+            if bytes(path[i * hash_size : (i + 1) * hash_size]) == local_hash
         )
         return local_count >= max_counter
 
@@ -757,9 +818,9 @@ class RepeaterHandler(BaseHandler):
         if not self.storage:
             logger.warning("Transport code check failed: no storage available")
             return False, "No storage available for transport key validation"
-        
+
         try:
-            from pymc_core.protocol.transport_keys import calc_transport_code
+            from openhop_core.protocol.transport_keys import calc_transport_code
 
             # Check cache validity
             current_time = time.time()
@@ -770,31 +831,24 @@ class RepeaterHandler(BaseHandler):
                 # Refresh cache
                 self._transport_keys_cache = self.storage.get_transport_keys()
                 self._transport_keys_cache_time = current_time
-            
+
             transport_keys = self._transport_keys_cache
-            
+
             if not transport_keys:
                 return False, "No transport keys configured"
-            
+
             # Check if packet has transport codes
             if not packet.has_transport_codes():
                 return False, "No transport codes present"
 
             transport_code_0 = packet.transport_codes[0]  # First transport code
 
-            payload = packet.get_payload()
-            payload_type = (
-                packet.get_payload_type()
-                if hasattr(packet, "get_payload_type")
-                else ((packet.header & 0x3C) >> 2)
-            )
-
             # Check packet against each transport key
             for key_record in transport_keys:
                 transport_key_encoded = key_record.get("transport_key")
                 key_name = key_record.get("name", "unknown")
                 flood_policy = key_record.get("flood_policy", "deny")
-                
+
                 if not transport_key_encoded:
                     continue
 
@@ -865,17 +919,19 @@ class RepeaterHandler(BaseHandler):
             if not packet.drop_reason:
                 packet.drop_reason = "Marked do not retransmit"
             return None
-        
+
         # Check unscoped flood policy
-        unscoped_flood_allow = self.config.get("mesh", {}).get("unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True))
+        unscoped_flood_allow = self.config.get("mesh", {}).get(
+            "unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True)
+        )
         route_type = packet.header & PH_ROUTE_MASK
         if route_type == ROUTE_TYPE_FLOOD:
             if not unscoped_flood_allow:
                 packet.drop_reason = "Unscoped flood policy disabled"
                 return None
 
-        #Check transport scopes flood policy    
-        if route_type == ROUTE_TYPE_TRANSPORT_FLOOD:             
+        # Check transport scopes flood policy
+        if route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             allowed, check_reason = self._check_transport_codes(packet)
             if not allowed:
                 packet.drop_reason = "Transport code not allowed to flood"
@@ -1006,7 +1062,7 @@ class RepeaterHandler(BaseHandler):
             # Flood packets: random(0-5) * (airtime * 52/50 / 2) * tx_delay_factor
             # This creates collision avoidance with tunable delay
             base_delay_ms = (airtime_ms * 52 / 50) / 2.0  # From C++ implementation
-            random_mult = random.uniform(0, 5)  # Random multiplier for collision avoidance
+            random_mult = secrets.randbelow(5001) / 1000.0
             delay_ms = base_delay_ms * random_mult * self.tx_delay_factor
             delay_s = delay_ms / 1000.0
         else:  # DIRECT
@@ -1119,13 +1175,21 @@ class RepeaterHandler(BaseHandler):
                         can_tx_now, _ = self.airtime_mgr.can_transmit(airtime_ms)
                         if not can_tx_now:
                             logger.warning(
-                                "Packet dropped at TX time: duty-cycle exceeded "
-                                "(airtime=%.1fms)", airtime_ms,
+                                "Packet dropped at TX time: duty-cycle exceeded (airtime=%.1fms)",
+                                airtime_ms,
                             )
-                            return
+                            return False
 
                     try:
-                        await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
+                        sent = await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
+                        if not sent:
+                            logger.warning(
+                                "Retransmit failed (attempt %d): dispatcher returned false",
+                                attempt + 1,
+                            )
+                            if local_transmission and attempt == 0:
+                                continue
+                            return False
                         self._record_packet_sent(fwd_pkt)
                         if airtime_ms > 0:
                             self.airtime_mgr.record_tx(airtime_ms)
@@ -1134,13 +1198,14 @@ class RepeaterHandler(BaseHandler):
                             f"Retransmitted packet ({packet_size} bytes, "
                             f"{airtime_ms:.1f}ms airtime)"
                         )
-                        return
+                        return True
                     except Exception as e:
                         logger.error(f"Retransmit failed (attempt {attempt + 1}): {e}")
                         if local_transmission and attempt == 0:
                             pass  # release lock, outer loop sleeps, then retries
                         else:
                             raise
+            return False
 
         return asyncio.create_task(delayed_send())
 
@@ -1254,7 +1319,10 @@ class RepeaterHandler(BaseHandler):
                 "web": self.config.get("web", {}),  # Include web configuration
                 "mesh": {
                     "loop_detect": self.config.get("mesh", {}).get("loop_detect", "off"),
-                    "unscoped_flood_allow": self.config.get("mesh", {}).get("unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True)),
+                    "unscoped_flood_allow": self.config.get("mesh", {}).get(
+                        "unscoped_flood_allow",
+                        self.config.get("mesh", {}).get("global_flood_allow", True),
+                    ),
                     "path_hash_mode": self.config.get("mesh", {}).get("path_hash_mode", 0),
                 },
                 "mqtt_brokers": self.config.get("mqtt_brokers", {}),
@@ -1298,8 +1366,7 @@ class RepeaterHandler(BaseHandler):
                     if self.storage:
                         try:
                             retention_days = (
-                                self.config
-                                .get("storage", {})
+                                self.config.get("storage", {})
                                 .get("retention", {})
                                 .get("sqlite_cleanup_days", 31)
                             )
@@ -1390,10 +1457,10 @@ class RepeaterHandler(BaseHandler):
             self.loop_detect_mode = self._normalize_loop_detect_mode(
                 self.config.get("mesh", {}).get("loop_detect", LOOP_DETECT_OFF)
             )
-            
+
             # Note: Radio config changes require restart as they affect hardware
             # Note: Airtime manager has its own config reference that gets updated
-            
+
             logger.info("Runtime configuration reloaded successfully")
         except Exception as e:
             logger.error(f"Error reloading runtime config: {e}")
@@ -1413,5 +1480,5 @@ class RepeaterHandler(BaseHandler):
     def __del__(self):
         try:
             self.cleanup()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"Engine cleanup during __del__ failed: {exc}")

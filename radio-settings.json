@@ -13,7 +13,7 @@
       "txled_pin": -1,
       "rxled_pin": -1,
       "tx_power": 22,
-      "preamble_length": 17,
+      "preamble_length": 32,
       "is_waveshare": true
     },
     "uconsole_aiov1": {
@@ -29,9 +29,9 @@
       "txled_pin": -1,
       "rxled_pin": -1,
       "tx_power": 22,
-      "preamble_length": 17
+      "preamble_length": 32
     },
-     "uconsole_aio_v2": {
+    "uconsole_aio_v2": {
       "name": "uConsole LoRa Module aio v2",
       "bus_id": 1,
       "cs_id": 0,
@@ -44,7 +44,7 @@
       "txled_pin": -1,
       "rxled_pin": -1,
       "tx_power": 22,
-      "preamble_length": 17,
+      "preamble_length": 32,
       "use_dio3_tcxo": true,
       "use_dio2_rf": true
     },
@@ -60,9 +60,9 @@
       "rxen_pin": 12,
       "txled_pin": -1,
       "rxled_pin": -1,
-      "tx_power": 22,
+      "tx_power": 18,
       "use_dio3_tcxo": true,
-      "preamble_length": 17
+      "preamble_length": 32
     },
     "pimesh-1w-v2": {
       "name": "PiMesh-1W (V2)",
@@ -77,10 +77,10 @@
       "txled_pin": -1,
       "rxled_pin": -1,
       "en_pin": 26,
-      "tx_power": 22,
+      "tx_power": 18,
       "use_dio3_tcxo": true,
       "use_dio2_rf": true,
-      "preamble_length": 17
+      "preamble_length": 32
     },
     "meshadv-mini": {
       "name": "MeshAdv Mini",
@@ -95,7 +95,7 @@
       "txled_pin": -1,
       "rxled_pin": -1,
       "tx_power": 22,
-      "preamble_length": 17
+      "preamble_length": 32
     },
     "meshadv": {
       "name": "MeshAdv",
@@ -111,7 +111,7 @@
       "rxled_pin": -1,
       "tx_power": 22,
       "use_dio3_tcxo": true,
-      "preamble_length": 17
+      "preamble_length": 32
     },
     "zebra": {
       "name": "ZebraHat-1W",
@@ -128,7 +128,41 @@
       "tx_power": 18,
       "use_dio3_tcxo": true,
       "use_dio2_rf": true,
-      "preamble_length": 17
+      "preamble_length": 32
+    },
+    "zebra-duo-hat-r0": {
+      "name": "ZebraHatDuo-R0-1W",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": -1,
+      "reset_pin": 18,
+      "busy_pin": 23,
+      "irq_pin": 24,
+      "txen_pin": -1,
+      "rxen_pin": -1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 18,
+      "use_dio3_tcxo": true,
+      "use_dio2_rf": true,
+      "preamble_length": 32
+    },
+    "zebra-duo-hat-r1": {
+      "name": "ZebraHatDuo-R1-1W",
+      "bus_id": 0,
+      "cs_id": 1,
+      "cs_pin": -1,
+      "reset_pin": 17,
+      "busy_pin": 27,
+      "irq_pin": 22,
+      "txen_pin": -1,
+      "rxen_pin": -1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 18,
+      "use_dio3_tcxo": true,
+      "use_dio2_rf": true,
+      "preamble_length": 32
     },
     "femtofox-1W-SX": {
       "name": "FemtoFox SX1262 (1W)",
@@ -136,7 +170,6 @@
       "cs_id": 0,
       "cs_pin": 16,
       "gpio_chip": 1,
-      "use_gpiod_backend": true,
       "reset_pin": 25,
       "busy_pin": 22,
       "irq_pin": 23,
@@ -144,9 +177,9 @@
       "rxen_pin": 24,
       "txled_pin": -1,
       "rxled_pin": -1,
-      "tx_power": 30,
+      "tx_power": 22,
       "use_dio3_tcxo": true,
-      "preamble_length": 17
+      "preamble_length": 32
     },
     "femtofox-2W-SX": {
       "name": "FemtoFox SX1262 (2W)",
@@ -154,7 +187,6 @@
       "cs_id": 0,
       "cs_pin": 16,
       "gpio_chip": 1,
-      "use_gpiod_backend": true,
       "reset_pin": 25,
       "busy_pin": 22,
       "irq_pin": 23,
@@ -181,7 +213,24 @@
       "tx_power": 8,
       "use_dio3_tcxo": true,
       "use_dio2_rf": true,
-      "preamble_length": 17
+      "preamble_length": 32
+    },
+    "nebra-duo-hat": {
+      "name": "NebraDuo-E22P-1W",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": -1,
+      "reset_pin": 22,
+      "busy_pin": 23,
+      "irq_pin": 24,
+      "txen_pin": -1,
+      "rxen_pin": 1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 18,
+      "use_dio3_tcxo": true,
+      "use_dio2_rf": true,
+      "preamble_length": 32
     },
     "ch341-usb-sx1262": {
       "name": "CH341 USB-SPI + SX1262 (example)",
@@ -204,7 +253,7 @@
       "use_dio2_rf": true,
       "use_dio3_tcxo": true,
       "dio3_tcxo_voltage": 1.8,
-      "preamble_length": 17,
+      "preamble_length": 32,
       "is_waveshare": false
     },
     "ultrapeater-e22": {
@@ -222,7 +271,7 @@
       "tx_power": 22,
       "use_dio2_rf": false,
       "use_dio3_tcxo": true,
-      "preamble_length": 17,
+      "preamble_length": 32,
       "use_gpiod_backend": true,
       "gpio_chip": 1
     },
@@ -242,7 +291,7 @@
       "tx_power": 22,
       "use_dio2_rf": false,
       "use_dio3_tcxo": true,
-      "preamble_length": 17,
+      "preamble_length": 32,
       "use_gpiod_backend": true,
       "gpio_chip": 1
     },
@@ -263,7 +312,7 @@
       "use_dio2_rf": true,
       "use_dio3_tcxo": true,
       "dio3_tcxo_voltage": 1.8,
-      "preamble_length": 17,
+      "preamble_length": 32,
       "use_gpiod_backend": true,
       "gpio_chip": 1
     },
@@ -284,11 +333,11 @@
       "use_dio2_rf": true,
       "use_dio3_tcxo": true,
       "dio3_tcxo_voltage": 1.8,
-      "preamble_length": 17,
+      "preamble_length": 32,
       "use_gpiod_backend": true,
       "gpio_chip": 1
     },
-      "ultrapeaterzero-e22": {
+    "ultrapeaterzero-e22": {
       "name": "Zindello Industries UltraPeaterZero E22",
       "bus_id": 0,
       "cs_id": 0,
@@ -304,9 +353,9 @@
       "tx_power": 22,
       "use_dio2_rf": false,
       "use_dio3_tcxo": true,
-      "preamble_length": 17
+      "preamble_length": 32
     },
-      "ultrapeaterzero-e22p": {
+    "ultrapeaterzero-e22p": {
       "name": "Zindello Industries UltraPeaterZero E22P",
       "bus_id": 0,
       "cs_id": 0,
@@ -322,7 +371,27 @@
       "tx_power": 22,
       "use_dio2_rf": false,
       "use_dio3_tcxo": true,
-      "preamble_length": 17
+      "preamble_length": 32
+    },
+    "bq-station-g3": {
+      "name": "BQ Voyage Station G3",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": -1,
+      "reset_pin": 16,
+      "busy_pin": 24,
+      "irq_pin": 22,
+      "txen_pin": -1,
+      "rxen_pin": -1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 19,
+      "use_dio2_rf": true,
+      "use_dio3_tcxo": true,
+      "dio3_tcxo_voltage": 1.8,
+      "preamble_length": 32,
+      "use_gpiod_backend": true,
+      "gpio_chip": 1
     },
     "pymc_usb": {
       "name": "pymc_usb modem (USB-CDC)",
@@ -330,7 +399,7 @@
       "connection_type": "usb",
       "radio_type": "pymc_usb",
       "tx_power": 22,
-      "preamble_length": 16
+      "preamble_length": 32
     },
     "pymc_tcp": {
       "name": "pymc_tcp modem (Wi-Fi / Ethernet)",
@@ -338,15 +407,15 @@
       "connection_type": "network",
       "radio_type": "pymc_tcp",
       "tx_power": 22,
-      "preamble_length": 16
+      "preamble_length": 32
     },
     "kiss": {
       "name": "KISS modem (serial)",
-      "description": "MeshCore KISS modem over serial - requires pyMC_core with KISS support.",
+      "description": "MeshCore KISS modem over serial - requires openhop-core with KISS support.",
       "connection_type": "usb",
       "radio_type": "kiss",
       "tx_power": 14,
-      "preamble_length": 17
+      "preamble_length": 32
     }
   }
 }

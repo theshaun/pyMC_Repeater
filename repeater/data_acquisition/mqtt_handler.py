@@ -2,22 +2,13 @@ import base64
 import binascii
 import json
 import logging
-import string
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 import paho.mqtt.client as mqtt
-from nacl.signing import SigningKey
 
-# Try to import datetime.UTC (Python 3.11+) otherwise fallback to timezone.utc
-try:
-    from datetime import UTC
-except Exception:
-    from datetime import timezone
-    UTC = timezone.utc
-
-from repeater import __version__, config
+from repeater import __version__
 from repeater.presets import get_preset
 
 # Try to import paho-mqtt error code mappings
@@ -30,6 +21,16 @@ except ImportError:
     HAS_REASON_CODES = False
 
 logger = logging.getLogger("MQTTHandler")
+
+# Custom ultra-verbose level for high-frequency per-broker publish logs.
+# Keeps default DEBUG useful while allowing deep diagnostics when needed.
+TRACE_LEVEL = 5
+logging.addLevelName(TRACE_LEVEL, "TRACE")
+
+
+def _trace(message: str):
+    if logger.isEnabledFor(TRACE_LEVEL):
+        logger.log(TRACE_LEVEL, message)
 
 
 # --------------------------------------------------------------------
@@ -173,7 +174,7 @@ class _BrokerConnection:
         broker_index: int,
         node_name: str,
         on_connect_callback: Optional[Callable] = None,
-        on_disconnect_callback: Optional[Callable] = None
+        on_disconnect_callback: Optional[Callable] = None,
     ):
         self.broker = broker
         self.local_identity = local_identity
@@ -191,31 +192,50 @@ class _BrokerConnection:
         self._reconnect_attempts = 0
         self._reconnect_timer = None
         self._max_reconnect_delay = 300  # 5 minutes max
-        self._keepalive = broker.get("keepalive", 30)  # default tighter than paho's 60s to beat NAT/proxy timeouts
+        self._keepalive = broker.get(
+            "keepalive", 30
+        )  # default tighter than paho's 60s to beat NAT/proxy timeouts
         self._jwt_refresh_timer = None
         self._shutdown_requested = False
         self._last_jwt_claims = None
-        self.transport = broker.get('transport', 'websockets')
-        
-        self.use_jwt_auth = broker.get('use_jwt_auth', False)
-        self.username = broker.get('username', None)
-        self.password = broker.get('password', None)
+        self.transport = broker.get("transport", "websockets")
 
-        self.format=broker.get("format", "letsmesh") 
-        self.tls=broker.get("tls", {
-            "enabled": False,
-            "insecure": False,
-        })
-        
+        self.use_jwt_auth = broker.get("use_jwt_auth", False)
+        self.username = broker.get("username", None)
+        self.password = broker.get("password", None)
+
+        self.format = broker.get("format", "letsmesh")
+        self.tls = broker.get(
+            "tls",
+            {
+                "enabled": False,
+                "insecure": False,
+            },
+        )
+
         client_id = f"meshcore_{self.public_key}_{broker['host']}_{self.format}"
-        self.client = mqtt.Client(client_id=client_id, transport=self.transport)
+        client_kwargs = {
+            "client_id": client_id,
+            "transport": self.transport,
+        }
+        # Prefer callback API v2 when available (paho-mqtt>=2.x) to avoid
+        # deprecation warnings from the legacy callback API v1.
+        callback_api = getattr(mqtt, "CallbackAPIVersion", None)
+        if callback_api is not None and hasattr(callback_api, "VERSION2"):
+            client_kwargs["callback_api_version"] = callback_api.VERSION2
+        try:
+            self.client = mqtt.Client(**client_kwargs)
+        except TypeError:
+            # Backward-compatibility fallback for older paho versions.
+            client_kwargs.pop("callback_api_version", None)
+            self.client = mqtt.Client(**client_kwargs)
         if hasattr(self.client, "on_pre_connect"):
             self.client.on_pre_connect = self._on_pre_connect
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
 
         # If None, will be use defaults depending on the format value
-        self.base_topic=broker.get("base_topic", None)
+        self.base_topic = broker.get("base_topic", None)
 
         self.enabled = broker.get("enabled", False)
         self.retain_status = broker.get("retain_status", False)
@@ -230,21 +250,24 @@ class _BrokerConnection:
                 # MC2MQTT family: canonical meshcoretomqtt topic structure.
                 self.base_topic = f"meshcore/{self.iata_code}/{self.public_key}"
             else:
-                logger.warning(f"Unknown broker format '{self.format}' for {self.broker['name']}, defaulting to MC2MQTT topic structure")
+                logger.warning(
+                    f"Unknown broker format '{self.format}' for {self.broker['name']}, defaulting to MC2MQTT topic structure"
+                )
                 self.base_topic = f"meshcore/{self.iata_code}/{self.public_key}"
-        
-        from pymc_core.protocol.utils import PAYLOAD_TYPES
-        
+
+        from openhop_core.protocol.utils import PAYLOAD_TYPES
+
         disallowed_types = broker.get("disallowed_packet_types", [])
         type_name_map = {name: code for code, name in PAYLOAD_TYPES.items()}
-        
+
         self.disallowed_types = [type_name_map.get(name.upper(), None) for name in disallowed_types]
-        self.disallowed_types = [val for val in self.disallowed_types if val is not None]  # Filter out invalid names
-    
+        self.disallowed_types = [
+            val for val in self.disallowed_types if val is not None
+        ]  # Filter out invalid names
 
     def _generate_jwt(self) -> str:
         """Generate MeshCore-style Ed25519 JWT token"""
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
 
         header = {"alg": "Ed25519", "typ": "JWT"}
 
@@ -259,7 +282,12 @@ class _BrokerConnection:
             payload["aud"] = self.broker["audience"]
 
         # Only include email/owner for verified TLS connections
-        if self.tls and self.tls.get("enabled", False) and self._tls_verified and (self.email or self.owner):
+        if (
+            self.tls
+            and self.tls.get("enabled", False)
+            and self._tls_verified
+            and (self.email or self.owner)
+        ):
             payload["email"] = self.email
             payload["owner"] = self.owner
         else:
@@ -295,9 +323,10 @@ class _BrokerConnection:
 
         return token
 
-    def _on_connect(self, client, userdata, flags, rc):
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
         """MQTT connection callback"""
-        if rc == 0:
+        rc_value = int(getattr(rc, "value", rc)) if rc is not None else -1
+        if rc_value == 0:
             logger.info(f"Connected to {self.broker['name']}")
             self._running = True
             self._reconnect_attempts = 0  # Reset counter on success
@@ -310,7 +339,7 @@ class _BrokerConnection:
             if self._on_connect_callback:
                 self._on_connect_callback(self.broker["name"])
         else:
-            error_msg = get_mqtt_error_message(rc, is_disconnect=False)
+            error_msg = get_mqtt_error_message(rc_value, is_disconnect=False)
             logger.error(f"Failed to connect to {self.broker['name']}: {error_msg}")
             self._schedule_reconnect(reason=error_msg)
 
@@ -321,8 +350,14 @@ class _BrokerConnection:
         if self.use_jwt_auth:
             self._set_credentials()
 
-    def _on_disconnect(self, client, userdata, rc):
+    def _on_disconnect(self, client, userdata, rc, *extra):
         """MQTT disconnection callback"""
+        # Callback API v2 passes: (client, userdata, disconnect_flags, reason_code, properties)
+        # while API v1 passes: (client, userdata, rc). Normalize to integer rc.
+        if not isinstance(rc, (int, float)) and extra:
+            rc = extra[0]
+        rc_value = int(getattr(rc, "value", rc)) if rc is not None else -1
+
         was_running = self._running
         self._running = False
 
@@ -332,14 +367,16 @@ class _BrokerConnection:
                 self._on_disconnect_callback(self.broker["name"])
             return
 
-        if rc != 0:  # Unexpected disconnect
-            error_msg = get_mqtt_error_message(rc, is_disconnect=True)
+        if rc_value != 0:  # Unexpected disconnect
+            error_msg = get_mqtt_error_message(rc_value, is_disconnect=True)
             if was_running:
-                logger.warning(f"Disconnected from {self.broker['name']} (rc={rc}): {error_msg}")
+                logger.warning(
+                    f"Disconnected from {self.broker['name']} (rc={rc_value}): {error_msg}"
+                )
             else:
                 logger.debug(
                     f"Duplicate disconnect callback from {self.broker['name']} while already disconnected "
-                    f"(rc={rc}): {error_msg}"
+                    f"(rc={rc_value}): {error_msg}"
                 )
             if was_running:  # Only reconnect if we were intentionally connected
                 self._schedule_reconnect(reason=error_msg)
@@ -386,8 +423,10 @@ class _BrokerConnection:
             # Stop the loop if it's still running (websocket mode requires clean restart)
             try:
                 self.client.loop_stop()
-            except:
-                pass
+            except Exception as e:
+                logger.debug(
+                    f"loop_stop during reconnect was ignored for {self.broker['name']}: {e}"
+                )
 
             self._set_credentials()
 
@@ -412,13 +451,17 @@ class _BrokerConnection:
                     f"user=v1_{self.public_key[:8]}...{self.public_key[-8:]}"
                 )
             elif self.username and self.password:
-                logger.info(f"Using provided credentials for {self.broker['name']} (username: {self.username})")
+                logger.info(
+                    f"Using provided credentials for {self.broker['name']} (username: {self.username})"
+                )
                 self.client.username_pw_set(username=self.username, password=self.password)
             else:
-                logger.info(f"No credentials set for {self.broker['name']} (JWT auth disabled and no username/password provided)")
-            
-            self._connect_time = datetime.now(UTC)
-            
+                logger.info(
+                    f"No credentials set for {self.broker['name']} (JWT auth disabled and no username/password provided)"
+                )
+
+            self._connect_time = datetime.now(timezone.utc)
+
         except Exception as e:
             logger.error(f"Failed to set JWT credentials for {self.broker['name']}: {e}")
             raise
@@ -428,26 +471,27 @@ class _BrokerConnection:
         self._shutdown_requested = False
 
         # Conditional TLS setup
-        if self.enabled == False:
+        if not self.enabled:
             logger.info(f"Connection to {self.broker['name']} is disabled in configuration")
             return
 
         if self.transport == "websockets":
-                protocol = "ws"
+            protocol = "ws"
         elif self.transport == "tcp":
             protocol = "mqtt"
         else:
             raise ValueError(f"Invalid transport '{self.transport}' for {self.broker['name']}")
-        
+
         # Setup TLS independent of transport - MQTT over TLS can be used with both websockets and raw TCP
         if self.tls and self.tls.get("enabled", False):
             import ssl
+
             self.client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS_CLIENT)
             self.client.tls_insecure_set(self.tls.get("insecure", False))
             self._tls_verified = True
 
             # Ensure to update the protocol is we're running TLS on websockets
-            if( self.transport == "websockets" ):
+            if self.transport == "websockets":
                 protocol = "wss"
 
         # Set JWT credentials before CONNECT handshake
@@ -482,17 +526,19 @@ class _BrokerConnection:
 
     def publish(self, subtopic: str, payload: str, retain: bool = False, qos: int = 0):
         """Publish message to broker"""
-        
+
         # Legacy MQTT config uses singular "packet" topic, while LetsMesh uses "packets". Handle this for compatibility.
         if self.format == "mqtt" and subtopic == "packets":
             subtopic = "packet"
-        
-        if(subtopic == "status"): # Override the status topic retain and qos settings based on broker configuration
+
+        if (
+            subtopic == "status"
+        ):  # Override the status topic retain and qos settings based on broker configuration
             retain = self.retain_status
             qos = 1 if self.retain_status else 0
 
         full_topic = f"{self.base_topic}/{subtopic}"
-        logger.debug(
+        _trace(
             f"Publishing topic='{_truncate_middle(full_topic)}', bytes={len(payload.encode('utf-8'))}, "
             f"running={self._running}, retain={retain}, qos={qos}"
         )
@@ -519,7 +565,7 @@ class _BrokerConnection:
         """Check if connection should be reconnected due to JWT expiry (at 80% of lifetime)"""
         if not self._connect_time:
             return False
-        elapsed = (datetime.now(UTC) - self._connect_time).total_seconds()
+        elapsed = (datetime.now(timezone.utc) - self._connect_time).total_seconds()
         expiry_seconds = self.jwt_expiry_minutes * 60
         # Stagger refresh by 5% per broker to prevent simultaneous disconnects
         # Broker 0: 80%, Broker 1: 85%, Broker 2: 90%, etc.
@@ -539,9 +585,9 @@ class _BrokerConnection:
         refresh_threshold = 0.80 + stagger_offset
         refresh_delay = expiry_seconds * refresh_threshold
 
-        logger.info(
+        _trace(
             f"JWT refresh scheduled for {self.broker['name']} in {refresh_delay:.0f}s "
-            f"({refresh_threshold*100:.0f}% of {self.jwt_expiry_minutes}min token lifetime)"
+            f"({refresh_threshold * 100:.0f}% of {self.jwt_expiry_minutes}min token lifetime)"
         )
         self._jwt_refresh_timer = threading.Timer(refresh_delay, self.reconnect_for_token_expiry)
         self._jwt_refresh_timer.daemon = True
@@ -564,7 +610,6 @@ class _BrokerConnection:
 # MeshCore → MQTT Publisher
 # ====================================================================
 class MeshCoreToMqttPusher:
-
     def __init__(
         self,
         local_identity,
@@ -594,11 +639,11 @@ class MeshCoreToMqttPusher:
         self.stats_provider = stats_provider
         self._status_task = None
         self._running = False
-        self._shutdown_requested = False        
+        self._shutdown_requested = False
         self._lock = threading.Lock()
         self._connect_timers: List[threading.Timer] = []
 
-        # Initialize brokers list        
+        # Initialize brokers list
         mqtt_brokers_config = config.get("mqtt_brokers", {})
         letsmesh_config = config.get("letsmesh", {})
         mqtt_config = config.get("mqtt", {})
@@ -609,7 +654,9 @@ class MeshCoreToMqttPusher:
             brokers.extend(mqtt_brokers_config.get("brokers", []))
 
             if letsmesh_config or mqtt_config:
-                logger.warning("Multiple MQTT broker configurations found (mqtt_brokers, letsmesh, mqtt). Only mqtt_brokers will be used")
+                logger.warning(
+                    "Multiple MQTT broker configurations found (mqtt_brokers, letsmesh, mqtt). Only mqtt_brokers will be used"
+                )
 
         else:
             if mqtt_config:
@@ -651,11 +698,11 @@ class MeshCoreToMqttPusher:
                         )
                         broker_config = {**broker_config, "format": "letsmesh"}
                     self.brokers.append(broker_config)
-                    logger.info(f"Added broker: {broker_config['name']} (format={broker_config.get('format', 'unknown')})")
+                    logger.info(
+                        f"Added broker: {broker_config['name']} (format={broker_config.get('format', 'unknown')})"
+                    )
                 else:
                     logger.warning(f"Skipping invalid broker config: {broker_config}")
-
-
 
         # Create broker connections
         self.connections: List[_BrokerConnection] = []
@@ -685,7 +732,7 @@ class MeshCoreToMqttPusher:
                 "status_interval": self.status_interval,
                 "owner": self.owner,
                 "email": self.email,
-                "brokers": brokers
+                "brokers": brokers,
             }
 
             # Update the configuration with the new configuration
@@ -700,7 +747,7 @@ class MeshCoreToMqttPusher:
             "name": mqtt_cfg["broker"],
             "host": mqtt_cfg["broker"],
             "port": mqtt_cfg["port"],
-            "use_jwt_auth": False, # The legacy MQTT config does not support JWT auth, so we set this to False
+            "use_jwt_auth": False,  # The legacy MQTT config does not support JWT auth, so we set this to False
             "username": mqtt_cfg.get("username", None),
             "password": mqtt_cfg.get("password", None),
             "transport": transport,
@@ -744,23 +791,27 @@ class MeshCoreToMqttPusher:
 
         # Append any user-defined additional brokers as full entries.
         for add_broker in letsmesh_cfg.get("additional_brokers", []):
-            logger.info(f"Imported additional LetsMesh broker from 'letsmesh' config: {add_broker.get('name')}")
-            entries.append({
-                "enabled": enabled,
-                "name": add_broker["name"],
-                "host": add_broker["host"],
-                "port": add_broker["port"],
-                "audience": add_broker["audience"],
-                "use_jwt_auth": add_broker.get("use_jwt_auth", True),
-                "transport": add_broker.get("transport", "websockets"),
-                "format": "letsmesh",
-                "base_topic": None,
-                "retain_status": False,
-                "tls": {
-                    "enabled": add_broker.get("tls", {}).get("enabled", True),
-                    "insecure": add_broker.get("tls", {}).get("insecure", False),
-                },
-            })
+            logger.info(
+                f"Imported additional LetsMesh broker from 'letsmesh' config: {add_broker.get('name')}"
+            )
+            entries.append(
+                {
+                    "enabled": enabled,
+                    "name": add_broker["name"],
+                    "host": add_broker["host"],
+                    "port": add_broker["port"],
+                    "audience": add_broker["audience"],
+                    "use_jwt_auth": add_broker.get("use_jwt_auth", True),
+                    "transport": add_broker.get("transport", "websockets"),
+                    "format": "letsmesh",
+                    "base_topic": None,
+                    "retain_status": False,
+                    "tls": {
+                        "enabled": add_broker.get("tls", {}).get("enabled", True),
+                        "insecure": add_broker.get("tls", {}).get("insecure", False),
+                    },
+                }
+            )
 
         return entries
 
@@ -809,7 +860,7 @@ class MeshCoreToMqttPusher:
                     timer = threading.Timer(delay, lambda c=conn: self._delayed_connect(c))
                     timer.daemon = True
                     timer.start()
-                    self._connect_timers.append(timer)                    
+                    self._connect_timers.append(timer)
             except Exception as e:
                 logger.error(f"Failed to connect to {conn.broker['name']}: {e}")
 
@@ -831,8 +882,8 @@ class MeshCoreToMqttPusher:
         for timer in self._connect_timers:
             try:
                 timer.cancel()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"Error cancelling MQTT connect timer: {exc}")
         self._connect_timers = []
 
         # Stop the heartbeat loop
@@ -840,9 +891,11 @@ class MeshCoreToMqttPusher:
 
         # Publish offline status before disconnecting
         try:
-            self.publish_status(state="offline", origin=self.node_name, radio_config=self.radio_config)
-        except Exception:
-            pass
+            self.publish_status(
+                state="offline", origin=self.node_name, radio_config=self.radio_config
+            )
+        except Exception as exc:
+            logger.debug(f"Failed to publish MQTT offline status during disconnect: {exc}")
 
         # Disconnect all brokers
         for conn in self.connections:
@@ -850,7 +903,7 @@ class MeshCoreToMqttPusher:
                 conn.disconnect()
             except Exception as e:
                 logger.error(f"Error disconnecting from {conn.broker['name']}: {e}")
-        
+
         self._status_task = None
         logger.info("Disconnected from all brokers")
 
@@ -875,7 +928,11 @@ class MeshCoreToMqttPusher:
     # Packet helpers
     # ----------------------------------------------------------------
     def _process_packet(self, pkt: dict) -> dict:
-        return {"timestamp": datetime.now(UTC).isoformat(), "origin_id": self.public_key, **pkt}
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "origin_id": self.public_key,
+            **pkt,
+        }
 
     def publish_packet(self, pkt: dict, subtopic="packets", retain=False):
         return self.publish(subtopic, self._process_packet(pkt), retain)
@@ -910,13 +967,13 @@ class MeshCoreToMqttPusher:
 
         status = {
             "status": state,
-            "timestamp": datetime.now(UTC).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "origin": origin or self.node_name,
             "origin_id": self.public_key,
             "model": "PyMC-Repeater",
             "firmware_version": self.app_version,
             "radio": radio_config or self.radio_config,
-            "client_version": f"pyMC_repeater/{self.app_version}",
+            "client_version": f"openhop_repeater/{self.app_version}",
             "stats": {**live_stats, "errors": 0, "queue_len": 0, **(extra_stats or {})},
         }
 
@@ -930,7 +987,9 @@ class MeshCoreToMqttPusher:
         message = json.dumps(payload)
 
         # _BrokerConnection now handles topic prefixing, so we only log the subtopic here
-        logger.debug(f"Publishing topic='{subtopic}', {_summarize_payload_for_log(payload, message)}")
+        logger.debug(
+            f"Publishing topic='{subtopic}', {_summarize_payload_for_log(payload, message)}"
+        )
 
         packet_type = payload.get("type")
 
@@ -939,19 +998,18 @@ class MeshCoreToMqttPusher:
             for conn in self.connections:
                 if conn.enabled and conn.is_connected():
                     if packet_type in conn.disallowed_types:
-                        logger.debug(f"Skipped publishing packet type 0x{packet_type:02X} (disallowed)")
+                        _trace(f"Skipped publishing packet type 0x{packet_type:02X} (disallowed)")
                         continue
                     result = conn.publish(subtopic, message, retain=retain, qos=qos)
                     results.append((conn.broker["name"], result))
-                    logger.debug(f"Published to {conn.broker['name']} -- {subtopic}")
-                elif conn.enabled == False:
+                    _trace(f"Published to {conn.broker['name']} -- {subtopic}")
+                elif not conn.enabled:
                     results.append((conn.broker["name"], "Skipped due to being disabled"))
 
         if not results:
             logger.warning(f"No active broker connections for publishing to {subtopic}")
 
         return results
-    
 
     def publish_mqtt(self, payload: dict, subtopic: str, retain: bool = False, qos: int = 0):
         """Publish message to brokers using the legacy custom-MQTT format only.
@@ -964,7 +1022,9 @@ class MeshCoreToMqttPusher:
         message = json.dumps(payload)
 
         # _BrokerConnection now handles topic prefixing, so we only log the subtopic here
-        logger.debug(f"Publishing topic='{subtopic}', {_summarize_payload_for_log(payload, message)}")
+        logger.debug(
+            f"Publishing topic='{subtopic}', {_summarize_payload_for_log(payload, message)}"
+        )
 
         results = []
         with self._lock:
@@ -972,7 +1032,7 @@ class MeshCoreToMqttPusher:
                 if conn.enabled and conn.is_connected():
                     if conn.format != "mqtt":
                         # Custom-MQTT-only path; MC2MQTT brokers are intentionally skipped here.
-                        logger.debug(
+                        _trace(
                             f"Skipped publishing to {conn.broker['name']} "
                             f"(intentional: publish_mqtt only targets legacy mqtt format; broker format={conn.format})"
                         )
@@ -980,8 +1040,10 @@ class MeshCoreToMqttPusher:
                         continue
                     result = conn.publish(subtopic, message, retain=retain, qos=qos)
                     results.append((conn.broker["name"], result))
-                    logger.debug(f"Published to {conn.broker['name']} (format={conn.format}) -- {subtopic}")
-                elif conn.enabled == False:
+                    _trace(
+                        f"Published to {conn.broker['name']} (format={conn.format}) -- {subtopic}"
+                    )
+                elif not conn.enabled:
                     results.append((conn.broker["name"], "Skipped due to being disabled"))
 
         if not results:
@@ -1049,7 +1111,6 @@ def get_mqtt_error_message(rc: int, is_disconnect: bool = False) -> str:
         16: "The connection was lost.",
         17: "Client timeout",
         # MQTT v5 codes
-        4: "Disconnect with Will message",
         128: "Unspecified error",
         129: "Malformed packet",
         130: "Protocol error",
@@ -1081,23 +1142,29 @@ def get_mqtt_error_message(rc: int, is_disconnect: bool = False) -> str:
 
     if HAS_REASON_CODES and ReasonCode is not None:
         try:
-
-            reason = ReasonCode(mqtt.CONNACK if not is_disconnect else mqtt.DISCONNECT, identifier=rc)
-            name = reason.getName() if hasattr(reason, 'getName') else str(reason)
+            reason = ReasonCode(
+                mqtt.CONNACK if not is_disconnect else mqtt.DISCONNECT, identifier=rc
+            )
+            name = reason.getName() if hasattr(reason, "getName") else str(reason)
             return f"{name} (code {rc})"
         except Exception as e:
-
             _fallback = (disconnect_errors if is_disconnect else connect_errors).get(rc)
             if _fallback is None:
                 logger.debug(f"Could not decode reason code {rc}: {e}")
 
+    error_dict = disconnect_errors if is_disconnect else connect_errors
     if is_disconnect:
+        mapped = error_dict.get(rc)
+        if mapped is not None:
+            if rc >= 128 and "(code" not in mapped:
+                return f"{mapped} (code {rc})"
+            return mapped
+
         try:
             paho_error = mqtt.error_string(rc)
             if paho_error and paho_error != "Unknown error.":
                 return paho_error
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"Failed to map paho MQTT error string for code {rc}: {exc}")
 
-    error_dict = disconnect_errors if is_disconnect else connect_errors
     return error_dict.get(rc, f"Unknown error code {rc}")

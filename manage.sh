@@ -1,17 +1,23 @@
 #!/bin/bash
-# pyMC Repeater Management Script - Deploy, Upgrade, Uninstall
+# openHop Repeater Management Script - Deploy, Upgrade, Uninstall
 
 set -e
 
-INSTALL_DIR="/opt/pymc_repeater"
+INSTALL_DIR="/opt/openhop_repeater"
 VENV_DIR="$INSTALL_DIR/venv"
 VENV_PIP="$VENV_DIR/bin/pip"
 VENV_PYTHON="$VENV_DIR/bin/python"
-CONFIG_DIR="/etc/pymc_repeater"
-LOG_DIR="/var/log/pymc_repeater"
+CONFIG_DIR="/etc/openhop_repeater"
+LOG_DIR="/var/log/openhop_repeater"
+DATA_DIR="/var/lib/openhop_repeater"
 SERVICE_USER="repeater"
-SERVICE_NAME="pymc-repeater"
+SERVICE_NAME="openhop-repeater"
 SILENT_MODE="${PYMC_SILENT:-${SILENT:-}}"
+
+LEGACY_PYMC_INSTALL_DIR="/opt/pymc_repeater"
+LEGACY_PYMC_CONFIG_DIR="/etc/pymc_repeater"
+LEGACY_PYMC_LOG_DIR="/var/log/pymc_repeater"
+LEGACY_PYMC_DATA_DIR="/var/lib/pymc_repeater"
 
 # R2 Wheels Configuration improves install speed on ARM devices
 R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
@@ -21,14 +27,112 @@ R2_ENABLED=1  # Set to 0 to disable R2 wheels and always build from source
 # Virtual-environment helpers
 # ---------------------------------------------------------------------------
 
-# Create (or re-create) the dedicated venv for pymc_repeater
-ensure_venv() {
-    if [ ! -x "$VENV_PYTHON" ]; then
-        echo ">>> Creating virtual environment at $VENV_DIR ..."
-        python3 -m venv --system-site-packages "$VENV_DIR"
-        # Upgrade pip inside the venv
-        "$VENV_PIP" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+cleanup_stale_source_trees() {
+    local removed=0
+    local path
+
+    for path in \
+        "$INSTALL_DIR/repeater" \
+        "$INSTALL_DIR/openhop_core" \
+        "$INSTALL_DIR/openhop-repeater" \
+        "$INSTALL_DIR/openhop-core" \
+        "$LEGACY_PYMC_INSTALL_DIR/repeater" \
+        "$LEGACY_PYMC_INSTALL_DIR/pymc_core" \
+        "$LEGACY_PYMC_INSTALL_DIR/pymc-repeater" \
+        "$LEGACY_PYMC_INSTALL_DIR/pymc-core"
+    do
+        if [ -e "$path" ]; then
+            rm -rf "$path"
+            removed=1
+            echo "    ✓ Removed stale source tree at $path"
+        fi
+    done
+
+    if [ "$removed" -eq 0 ]; then
+        echo "    ✓ No stale source-tree paths found"
     fi
+}
+
+migrate_legacy_paths() {
+    local timestamp legacy current label backup_path
+    timestamp="$(date +%Y%m%d_%H%M%S)"
+
+    migrate_one_path() {
+        legacy="$1"
+        current="$2"
+        label="$3"
+
+        if [ ! -e "$legacy" ]; then
+            return 0
+        fi
+
+        mkdir -p "$current" 2>/dev/null || true
+
+        if [ ! -e "$current" ] || [ -z "$(ls -A "$current" 2>/dev/null)" ]; then
+            rm -rf "$current" 2>/dev/null || true
+            mv "$legacy" "$current"
+            echo "    ✓ Migrated legacy $label path: $legacy -> $current"
+            return 0
+        fi
+
+        cp -an "$legacy"/. "$current"/ 2>/dev/null || true
+        backup_path="${legacy}.migrated.${timestamp}"
+        mv "$legacy" "$backup_path"
+        echo "    ✓ Merged legacy $label data into $current"
+        echo "    ✓ Archived legacy $label path at $backup_path"
+    }
+
+    migrate_one_path "$LEGACY_PYMC_CONFIG_DIR" "$CONFIG_DIR" "config"
+    migrate_one_path "$LEGACY_PYMC_LOG_DIR" "$LOG_DIR" "log"
+    migrate_one_path "$LEGACY_PYMC_DATA_DIR" "$DATA_DIR" "data"
+    migrate_one_path "$LEGACY_PYMC_INSTALL_DIR" "$INSTALL_DIR" "install"
+}
+
+ensure_service_user_home() {
+    local current_home
+
+    if ! id "$SERVICE_USER" &>/dev/null; then
+        return 0
+    fi
+
+    current_home="$(getent passwd "$SERVICE_USER" | cut -d: -f6)"
+    if [ -z "$current_home" ]; then
+        return 0
+    fi
+
+    if [ "$current_home" != "$DATA_DIR" ]; then
+        mkdir -p "$DATA_DIR" 2>/dev/null || true
+        usermod -d "$DATA_DIR" "$SERVICE_USER" 2>/dev/null || true
+        echo "    ✓ Updated $SERVICE_USER home directory: $current_home -> $DATA_DIR"
+    fi
+}
+
+# Create (or re-create) the dedicated venv for openhop_repeater
+ensure_venv() {
+    local recreate=0
+
+    if [ ! -x "$VENV_PYTHON" ]; then
+        recreate=1
+    elif ! "$VENV_PYTHON" -c 'import sys; print(sys.executable)' >/dev/null 2>&1; then
+        # Venv python exists but points to a missing interpreter (stale venv).
+        recreate=1
+    elif ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
+        # Pip script/shebang can break after Python upgrades; treat as stale.
+        recreate=1
+    fi
+
+    if [ "$recreate" -eq 1 ]; then
+        if [ -d "$VENV_DIR" ]; then
+            echo ">>> Rebuilding broken virtual environment at $VENV_DIR ..."
+            rm -rf "$VENV_DIR"
+        else
+            echo ">>> Creating virtual environment at $VENV_DIR ..."
+        fi
+        python3 -m venv --system-site-packages "$VENV_DIR"
+    fi
+
+    # Always use python -m pip so we don't rely on a potentially stale pip wrapper.
+    "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
 }
 
 # Migrate an existing system-pip install into the venv.
@@ -38,37 +142,46 @@ migrate_to_venv() {
 
     # 1. Ensure the venv exists
     ensure_venv
+    ensure_service_user_home
 
     # 2. Remove legacy PYTHONPATH from the service unit
-    local svc_unit="/etc/systemd/system/pymc-repeater.service"
+    local svc_unit="/etc/systemd/system/openhop-repeater.service"
     if [ -f "$svc_unit" ]; then
         if grep -q 'PYTHONPATH' "$svc_unit" 2>/dev/null; then
             sed -i '/^Environment=.*PYTHONPATH/d' "$svc_unit"
             echo "    ✓ Removed legacy PYTHONPATH from service unit"
         fi
         # 3. Fix WorkingDirectory if still pointing at old source
-        if grep -q 'WorkingDirectory=/opt/pymc_repeater' "$svc_unit" 2>/dev/null; then
-            sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/pymc_repeater|' "$svc_unit"
+        if grep -q 'WorkingDirectory=/opt/openhop_repeater' "$svc_unit" 2>/dev/null; then
+            sed -i 's|WorkingDirectory=/opt/openhop_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$svc_unit"
             echo "    ✓ Fixed WorkingDirectory in service unit"
+        fi
+        if grep -q 'WorkingDirectory=/opt/pymc_repeater\|WorkingDirectory=/var/lib/pymc_repeater' "$svc_unit" 2>/dev/null; then
+            sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$svc_unit"
+            sed -i 's|WorkingDirectory=/var/lib/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$svc_unit"
+            echo "    ✓ Migrated legacy WorkingDirectory to openhop path"
         fi
         # 4. Ensure ExecStart uses the venv python
         if grep -q 'ExecStart=/usr/bin/python3' "$svc_unit" 2>/dev/null; then
             sed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|" "$svc_unit"
             echo "    ✓ Updated ExecStart to use venv python"
         fi
+        if grep -q 'ExecStart=/opt/pymc_repeater/venv/bin/python' "$svc_unit" 2>/dev/null; then
+            sed -i "s|ExecStart=/opt/pymc_repeater/venv/bin/python|ExecStart=$VENV_PYTHON|" "$svc_unit"
+            echo "    ✓ Migrated legacy ExecStart to openhop venv"
+        fi
         systemctl daemon-reload
     fi
 
     # 5. Remove the package from system python (best-effort)
+    python3 -m pip uninstall -y openhop_repeater 2>/dev/null || true
+    python3 -m pip uninstall -y openhop_core 2>/dev/null || true
     python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
     python3 -m pip uninstall -y pymc_core 2>/dev/null || true
     echo "    ✓ Cleaned up system-level packages (if any)"
 
     # 6. Remove stale source trees that could shadow the venv package
-    if [ -d "$INSTALL_DIR/repeater" ]; then
-        rm -rf "$INSTALL_DIR/repeater"
-        echo "    ✓ Removed stale source tree from $INSTALL_DIR/repeater"
-    fi
+    cleanup_stale_source_trees
 }
 
 is_silent_flag() {
@@ -117,22 +230,22 @@ fi
 
 # Function to show info box
 show_info() {
-    $DIALOG --backtitle "pyMC Repeater Management" --title "$1" --msgbox "$2" 12 70
+    $DIALOG --backtitle "openHop Repeater Management" --title "$1" --msgbox "$2" 12 70
 }
 
 # Function to show error box
 show_error() {
-    $DIALOG --backtitle "pyMC Repeater Management" --title "Error" --msgbox "$1" 8 60
+    $DIALOG --backtitle "openHop Repeater Management" --title "Error" --msgbox "$1" 8 60
 }
 
 # Function to ask yes/no question
 ask_yes_no() {
-    $DIALOG --backtitle "pyMC Repeater Management" --title "$1" --yesno "$2" 10 70
+    $DIALOG --backtitle "openHop Repeater Management" --title "$1" --yesno "$2" 10 70
 }
 
 # Function to show progress
 show_progress() {
-    echo "$2" | $DIALOG --backtitle "pyMC Repeater Management" --title "$1" --gauge "$3" 8 70 0
+    echo "$2" | $DIALOG --backtitle "openHop Repeater Management" --title "$1" --gauge "$3" 8 70 0
 }
 
 # Function to check if service exists
@@ -155,15 +268,35 @@ is_enabled() {
     systemctl is-enabled "$SERVICE_NAME" >/dev/null 2>&1
 }
 
+# Stop/disable legacy service names that can conflict on GPIO.
+disable_legacy_services() {
+    local legacy_services="pymc-repeater pymc-repeater.service"
+    local svc removed_unit=0
+
+    for svc in $legacy_services; do
+        systemctl stop "$svc" >/dev/null 2>&1 || true
+        systemctl disable "$svc" >/dev/null 2>&1 || true
+    done
+
+    if [ -f /etc/systemd/system/pymc-repeater.service ]; then
+        rm -f /etc/systemd/system/pymc-repeater.service
+        removed_unit=1
+    fi
+
+    if [ "$removed_unit" -eq 1 ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
 # Function to get current version
 get_version() {
     # Read version from the pip-installed package in the venv
     if [ -x "$VENV_PYTHON" ]; then
-        "$VENV_PYTHON" -c "from importlib.metadata import version; print(version('pymc_repeater'))" 2>/dev/null \
+        "$VENV_PYTHON" -c "from importlib.metadata import version; print(version('openhop_repeater'))" 2>/dev/null \
             || echo "not installed"
     else
         # Fallback: try system python for pre-migration installs
-        python3 -c "from importlib.metadata import version; print(version('pymc_repeater'))" 2>/dev/null \
+        python3 -c "from importlib.metadata import version; print(version('openhop_repeater'))" 2>/dev/null \
             || echo "not installed"
     fi
 }
@@ -183,11 +316,11 @@ get_status_display() {
 show_main_menu() {
     local status=$(get_status_display)
 
-    CHOICE=$($DIALOG --backtitle "pyMC Repeater Management" --title "pyMC Repeater Management" --menu "\nCurrent Status: $status\n\nChoose an action:" 18 70 9 \
-        "install" "Install pyMC Repeater" \
+    CHOICE=$($DIALOG --backtitle "openHop Repeater Management" --title "openHop Repeater Management" --menu "\nCurrent Status: $status\n\nChoose an action:" 18 70 9 \
+        "install" "Install openHop Repeater" \
         "upgrade" "Upgrade existing installation" \
         "reset" "reset existing installation to defaults" \
-        "uninstall" "Remove pyMC Repeater completely" \
+        "uninstall" "Remove openHop Repeater completely" \
         "config" "Configure radio settings" \
         "start" "Start the service" \
         "stop" "Stop the service" \
@@ -199,7 +332,7 @@ show_main_menu() {
     case $CHOICE in
         "install")
             if is_installed; then
-                show_error "pyMC Repeater is already installed!\n\nUse 'upgrade' to update or 'uninstall' first."
+                show_error "openHop Repeater is already installed!\n\nUse 'upgrade' to update or 'uninstall' first."
             else
                 install_repeater
             fi
@@ -208,21 +341,21 @@ show_main_menu() {
             if is_installed; then
                 upgrade_repeater "false"
             else
-                show_error "pyMC Repeater is not installed!\n\nUse 'install' first."
+                show_error "openHop Repeater is not installed!\n\nUse 'install' first."
             fi
             ;;
         "reset")
             if is_installed; then
                 reset_repeater
             else
-                show_error "pyMC Repeater is not installed!\n\nUse 'install' first."
+                show_error "openHop Repeater is not installed!\n\nUse 'install' first."
             fi
             ;;
         "uninstall")
             if is_installed; then
                 uninstall_repeater
             else
-                show_error "pyMC Repeater is not installed."
+                show_error "openHop Repeater is not installed."
             fi
             ;;
         "config")
@@ -240,7 +373,7 @@ show_main_menu() {
         "logs")
             clear
             echo -e "\033[1;36m╔══════════════════════════════════════════════════════════════════════╗\033[0m"
-            echo -e "\033[1;36m║\033[0m                  \033[1;37mpyMC Repeater - Live Logs\033[0m                     \033[1;36m║\033[0m"
+            echo -e "\033[1;36m║\033[0m                  \033[1;37mopenHop Repeater - Live Logs\033[0m                     \033[1;36m║\033[0m"
             echo -e "\033[1;36m║\033[0m                  \033[0;90m(Press Ctrl+C to return)\033[0m                      \033[1;36m║\033[0m"
             echo -e "\033[1;36m╚══════════════════════════════════════════════════════════════════════╝\033[0m"
             echo ""
@@ -265,7 +398,7 @@ install_repeater() {
 
     # Welcome screen (Bypass if the script was passd with the "install" option, assume we want a silent install)
     if [[ "${1:-}" != "install" ]]; then
-        $DIALOG --backtitle "pyMC Repeater Management" --title "Welcome" --msgbox "\nWelcome to pyMC Repeater Setup\n\nThis installer will configure your Linux system as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
+        $DIALOG --backtitle "openHop Repeater Management" --title "Welcome" --msgbox "\nWelcome to openHop Repeater Setup\n\nThis installer will configure your Linux system as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
     fi
 
     # SPI Check - Universal approach that works on all boards (skip for CH341 USB-SPI adapter)
@@ -321,14 +454,17 @@ install_repeater() {
     # Installation progress
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
-    echo "        Installing pyMC Repeater"
+    echo "        Installing openHop Repeater"
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
     
     echo ">>> Creating service user..."
     if ! id "$SERVICE_USER" &>/dev/null; then
-        useradd --system --home /var/lib/pymc_repeater --shell /sbin/nologin "$SERVICE_USER"
+        useradd --system --home "$DATA_DIR" --shell /sbin/nologin "$SERVICE_USER"
     fi
+    ensure_service_user_home
+
+    disable_legacy_services
 
     (
     echo "10"; echo "# Adding user to hardware groups..."
@@ -336,8 +472,12 @@ install_repeater() {
         getent group "$grp" >/dev/null 2>&1 && usermod -a -G "$grp" "$SERVICE_USER" 2>/dev/null || true
     done
 
-    echo "20"; echo "# Creating directories..."
-    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
+    echo "20"; echo "# Migrating legacy paths..."
+    migrate_legacy_paths
+    cleanup_stale_source_trees
+
+    echo "23"; echo "# Creating directories..."
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR"
 
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
@@ -367,9 +507,9 @@ install_repeater() {
 
     echo "29"; echo "# Installing files..."
     cp "$SCRIPT_DIR/manage.sh" "$INSTALL_DIR/" 2>/dev/null || true
-    cp "$SCRIPT_DIR/pymc-repeater.service" "$INSTALL_DIR/" 2>/dev/null || true
-    cp "$SCRIPT_DIR/radio-settings.json" /var/lib/pymc_repeater/ 2>/dev/null || true
-    cp "$SCRIPT_DIR/radio-presets.json" /var/lib/pymc_repeater/ 2>/dev/null || true
+    cp "$SCRIPT_DIR/openhop-repeater.service" "$INSTALL_DIR/" 2>/dev/null || true
+    cp "$SCRIPT_DIR/radio-settings.json" "$DATA_DIR/" 2>/dev/null || true
+    cp "$SCRIPT_DIR/radio-presets.json" "$DATA_DIR/" 2>/dev/null || true
 
     echo "45"; echo "# Installing configuration..."
     cp "$SCRIPT_DIR/config.yaml.example" "$CONFIG_DIR/config.yaml.example"
@@ -378,28 +518,28 @@ install_repeater() {
     fi
 
     echo "55"; echo "# Installing systemd service..."
-    cp "$SCRIPT_DIR/pymc-repeater.service" /etc/systemd/system/
+    cp "$SCRIPT_DIR/openhop-repeater.service" /etc/systemd/system/
     systemctl daemon-reload
 
     echo "58"; echo "# Installing udev rules for CH341..."
-    if [ -f "$SCRIPT_DIR/../pyMC_core/99-ch341.rules" ]; then
-        cp "$SCRIPT_DIR/../pyMC_core/99-ch341.rules" /etc/udev/rules.d/99-ch341.rules
+    if [ -f "$SCRIPT_DIR/../openhop-core/99-ch341.rules" ]; then
+        cp "$SCRIPT_DIR/../openhop-core/99-ch341.rules" /etc/udev/rules.d/99-ch341.rules
         udevadm control --reload-rules 2>/dev/null || true
         udevadm trigger 2>/dev/null || true
     fi
 
     echo "65"; echo "# Setting permissions..."
     # Venv stays root-owned (pip runs as root); service user only needs read+execute
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
-    chmod 750 "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR"
+    chmod 750 "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR"
     # Ensure manage.sh and support files in INSTALL_DIR are accessible
     chown root:root "$INSTALL_DIR"
     chmod 755 "$INSTALL_DIR"
     # Ensure the service user can create subdirectories in their home directory
-    chmod 755 /var/lib/pymc_repeater
+    chmod 755 "$DATA_DIR"
     # Pre-create the .config directory that the service will need
-    mkdir -p /var/lib/pymc_repeater/.config/pymc_repeater
-    chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/pymc_repeater/.config
+    mkdir -p "$DATA_DIR/.config/openhop_repeater"
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/.config"
 
     # Configure polkit for passwordless service restart
 
@@ -410,38 +550,38 @@ install_repeater() {
         echo "Polkit 0.106 or greater detected, using rules file"
         echo ">>> Configuring polkit for service management..."
         mkdir -p /etc/polkit-1/rules.d
-        cat > /etc/polkit-1/rules.d/10-pymc-repeater.rules <<'EOF'
+        cat > /etc/polkit-1/rules.d/10-openhop-repeater.rules <<'EOF'
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
-        action.lookup("unit") == "pymc-repeater.service" &&
+        action.lookup("unit") == "openhop-repeater.service" &&
         subject.user == "repeater") {
         return polkit.Result.YES;
     }
 });
 EOF
-        chmod 0644 /etc/polkit-1/rules.d/10-pymc-repeater.rules
+        chmod 0644 /etc/polkit-1/rules.d/10-openhop-repeater.rules
     else
         echo "Polkit 0.105 or less detected, using pkla file"
         mkdir -p /etc/polkit-1/localauthority/50-local.d
-        cat > /etc/polkit-1/localauthority/50-local.d/10-pymc-repeater.pkla <<'EOF'
-[Allow repeater to restart pymc-repeater service]
+        cat > /etc/polkit-1/localauthority/50-local.d/10-openhop-repeater.pkla <<'EOF'
+[Allow repeater to restart openhop-repeater service]
 Identity=unix-user:repeater
 Action=org.freedesktop.systemd1.manage-units
 ResultAny=yes
 ResultInactive=yes
 ResultActive=yes
 EOF
-        chmod 0644 /etc/polkit-1/localauthority/50-local.d/10-pymc-repeater.pkla
+        chmod 0644 /etc/polkit-1/localauthority/50-local.d/10-openhop-repeater.pkla
     fi
 
     # Also configure sudoers as fallback for service restart
     echo ">>> Configuring sudoers for service management..."
     mkdir -p /etc/sudoers.d
-    cat > /etc/sudoers.d/pymc-repeater <<'EOF'
-# Allow repeater user to manage the pymc-repeater service without password
-repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart pymc-repeater, /usr/bin/systemctl stop pymc-repeater, /usr/bin/systemctl start pymc-repeater, /usr/bin/systemctl status pymc-repeater, /usr/local/bin/pymc-do-upgrade
+    cat > /etc/sudoers.d/openhop-repeater <<'EOF'
+# Allow repeater user to manage the openhop-repeater service without password
+repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/local/bin/pymc-do-upgrade
 EOF
-    chmod 0440 /etc/sudoers.d/pymc-repeater
+    chmod 0440 /etc/sudoers.d/openhop-repeater
 
     echo ">>> Installing OTA upgrade wrapper..."
     cat > /usr/local/bin/pymc-do-upgrade <<'UPGRADEEOF'
@@ -451,7 +591,7 @@ EOF
 set -e
 CHANNEL="${1:-main}"
 PRETEND_VERSION="${2:-}"
-VENV_DIR="/opt/pymc_repeater/venv"
+VENV_DIR="/opt/openhop_repeater/venv"
 VENV_PIP="$VENV_DIR/bin/pip"
 VENV_PYTHON="$VENV_DIR/bin/python"
 # Validate: only allow safe git ref characters
@@ -466,25 +606,39 @@ fi
 if [ ! -x "$VENV_PYTHON" ]; then
     echo "[pymc-do-upgrade] Creating venv at $VENV_DIR ..."
     python3 -m venv --system-site-packages "$VENV_DIR"
-    "$VENV_PIP" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+    "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
 fi
 # ---- Migration: clean up legacy service unit issues ----
-SVC_UNIT=/etc/systemd/system/pymc-repeater.service
+SVC_UNIT=/etc/systemd/system/openhop-repeater.service
 if grep -q 'PYTHONPATH' "$SVC_UNIT" 2>/dev/null; then
     sed -i '/^Environment=.*PYTHONPATH/d' "$SVC_UNIT"
     systemctl daemon-reload
 fi
-if grep -q 'WorkingDirectory=/opt/pymc_repeater' "$SVC_UNIT" 2>/dev/null; then
-    sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/pymc_repeater|' "$SVC_UNIT"
+if grep -q 'WorkingDirectory=/opt/openhop_repeater' "$SVC_UNIT" 2>/dev/null; then
+    sed -i 's|WorkingDirectory=/opt/openhop_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
+    systemctl daemon-reload
+fi
+if grep -q 'WorkingDirectory=/opt/pymc_repeater\|WorkingDirectory=/var/lib/pymc_repeater' "$SVC_UNIT" 2>/dev/null; then
+    sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
+    sed -i 's|WorkingDirectory=/var/lib/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
     systemctl daemon-reload
 fi
 if grep -q 'ExecStart=/usr/bin/python3' "$SVC_UNIT" 2>/dev/null; then
     sed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|" "$SVC_UNIT"
     systemctl daemon-reload
 fi
+if grep -q 'ExecStart=/opt/pymc_repeater/venv/bin/python' "$SVC_UNIT" 2>/dev/null; then
+    sed -i "s|ExecStart=/opt/pymc_repeater/venv/bin/python|ExecStart=$VENV_PYTHON|" "$SVC_UNIT"
+    systemctl daemon-reload
+fi
 # ---- Remove stale source trees that shadow the venv package ----
+[ -d /opt/openhop_repeater/repeater ] && rm -rf /opt/openhop_repeater/repeater
+[ -d /opt/openhop_repeater/openhop-repeater ] && rm -rf /opt/openhop_repeater/openhop-repeater
 [ -d /opt/pymc_repeater/repeater ] && rm -rf /opt/pymc_repeater/repeater
+[ -d /opt/pymc_repeater/pymc-repeater ] && rm -rf /opt/pymc_repeater/pymc-repeater
 # ---- Remove old system-level packages to avoid confusion ----
+python3 -m pip uninstall -y openhop_repeater 2>/dev/null || true
+python3 -m pip uninstall -y openhop_core 2>/dev/null || true
 python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
 python3 -m pip uninstall -y pymc_core 2>/dev/null || true
 # ---- Try R2 wheels first for faster OTA upgrades ----
@@ -500,13 +654,22 @@ if [ -n "$ARCH_TAG" ]; then
     PY_TAG=$("$VENV_PYTHON" -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
     WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
     echo "[pymc-do-upgrade] Trying dependencies from R2 wheels..."
-    "$VENV_PIP" install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null || true
+    "$VENV_PYTHON" -m pip install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null || true
 fi
-# ---- Install pymc_repeater from git ----
-exec "$VENV_PIP" install \
+# ---- Install openhop_repeater from git ----
+if "$VENV_PYTHON" -m pip install \
     --upgrade \
     --no-cache-dir \
-    "pymc_repeater[hardware] @ git+https://github.com/rightup/pyMC_Repeater.git@${CHANNEL}"
+    "openhop_repeater[hardware] @ git+https://github.com/openhop-dev/openhop_repeater.git@${CHANNEL}"; then
+    # Keep web/OTA updates aligned with manage.sh install/upgrade defaults.
+    RADIO_BASE_URL="https://raw.githubusercontent.com/openhop-dev/openhop_repeater/${CHANNEL}"
+    RADIO_STORAGE_DIR="/var/lib/openhop_repeater"
+    mkdir -p "$RADIO_STORAGE_DIR"
+    wget -qO "$RADIO_STORAGE_DIR/radio-settings.json" "${RADIO_BASE_URL}/radio-settings.json" 2>/dev/null || true
+    wget -qO "$RADIO_STORAGE_DIR/radio-presets.json" "${RADIO_BASE_URL}/radio-presets.json" 2>/dev/null || true
+else
+    exit 1
+fi
 UPGRADEEOF
     chmod 0755 /usr/local/bin/pymc-do-upgrade
 
@@ -514,13 +677,13 @@ UPGRADEEOF
     systemctl enable "$SERVICE_NAME"
 
     echo "90"; echo "# Installation files complete..."
-    ) | $DIALOG --backtitle "pyMC Repeater Management" --title "Installing" --gauge "Setting up pyMC Repeater..." 8 70 0
+    ) | $DIALOG --backtitle "openHop Repeater Management" --title "Installing" --gauge "Setting up openHop Repeater..." 8 70 0
 
     # Install Python package outside of progress gauge for better error handling
     clear
     echo "=== Installing Python Dependencies ==="
     echo ""
-    echo "Installing pymc_repeater and dependencies (including pymc_core from PyPI)..."
+    echo "Installing openhop_repeater and dependencies (including openhop_core from PyPI)..."
     echo "This may take a few minutes..."
     echo ""
 
@@ -547,7 +710,7 @@ UPGRADEEOF
     # Ensure venv exists
     ensure_venv
 
-    echo "Installing pymc_repeater into venv ($VENV_DIR)..."
+    echo "Installing openhop_repeater into venv ($VENV_DIR)..."
     
     # Attempt R2 wheels first for faster installation
     if [ "$R2_ENABLED" -eq 1 ]; then
@@ -563,7 +726,7 @@ UPGRADEEOF
             WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
             echo "  Checking for R2 wheels (${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG})..."
             echo "  Trying install from R2 pre-built wheels..."
-            "$VENV_PIP" install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null && R2_SUCCESS=1 || R2_SUCCESS=0
+            "$VENV_PYTHON" -m pip install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null && R2_SUCCESS=1 || R2_SUCCESS=0
             if [ "$R2_SUCCESS" -eq 1 ]; then
                 echo "  ✓ R2 wheels installed"
             else
@@ -572,7 +735,7 @@ UPGRADEEOF
         fi
     fi
     
-    if "$VENV_PIP" install --upgrade --no-cache-dir .[hardware]; then
+    if "$VENV_PYTHON" -m pip install --upgrade --no-cache-dir .[hardware]; then
         echo ""
         echo "✓ Python package installation completed successfully!"
 
@@ -651,7 +814,7 @@ reset_repeater() {
 
     local current_version=$(get_version)
 
-    if ask_yes_no "Confirm Reset of pyMC Repeater restoring to default configuration.\n\nContinue?"; then
+    if ask_yes_no "Confirm Reset of openHop Repeater restoring to default configuration.\n\nContinue?"; then
 
         # Show info that upgrade is starting
         show_info "Reseting" "Starting reset process...\n\nProgress will be shown in the terminal."
@@ -722,7 +885,7 @@ upgrade_repeater() {
     local current_version=$(get_version)
 
     if [[ "$silent" != "true" ]]; then
-        if ! ask_yes_no "Confirm Upgrade" "Current version: $current_version\n\nThis will upgrade pyMC Repeater while preserving your configuration.\n\nContinue?"; then
+        if ! ask_yes_no "Confirm Upgrade" "Current version: $current_version\n\nThis will upgrade openHop Repeater while preserving your configuration.\n\nContinue?"; then
             return 0
         fi
 
@@ -736,6 +899,15 @@ upgrade_repeater() {
         echo "=== Upgrade Progress ==="
         echo "[1/9] Stopping service..."
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        disable_legacy_services
+
+        echo "[1.5/9] Migrating legacy paths..."
+        migrate_legacy_paths
+        cleanup_stale_source_trees
+
+        echo "[1.6/9] Ensuring required directories..."
+        mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR"
+        ensure_service_user_home
 
         echo "[2/9] Backing up configuration..."
         if [ -d "$CONFIG_DIR" ]; then
@@ -768,11 +940,11 @@ upgrade_repeater() {
 
         echo "[4/9] Installing files..."
         SCRIPT_DIR="$(dirname "$0")"
-        if ! cp "$SCRIPT_DIR/pymc-repeater.service" /etc/systemd/system/; then
+        if ! cp "$SCRIPT_DIR/openhop-repeater.service" /etc/systemd/system/; then
             echo "    ⚠ Warning: Failed to update service file – old service file may remain"
         fi
-        cp "$SCRIPT_DIR/radio-settings.json" /var/lib/pymc_repeater/ 2>/dev/null || true
-        cp "$SCRIPT_DIR/radio-presets.json" /var/lib/pymc_repeater/ 2>/dev/null || true
+        cp "$SCRIPT_DIR/radio-settings.json" "$DATA_DIR/" 2>/dev/null || true
+        cp "$SCRIPT_DIR/radio-presets.json" "$DATA_DIR/" 2>/dev/null || true
         echo "    ✓ Files updated"
 
         echo "[5/9] Validating and updating configuration..."
@@ -788,8 +960,8 @@ upgrade_repeater() {
         done
         # Install/update CH341 udev rules
         SCRIPT_DIR_UPGRADE="$(cd "$(dirname "$0")" && pwd)"
-        if [ -f "$SCRIPT_DIR_UPGRADE/../pyMC_core/99-ch341.rules" ]; then
-            cp "$SCRIPT_DIR_UPGRADE/../pyMC_core/99-ch341.rules" /etc/udev/rules.d/99-ch341.rules
+        if [ -f "$SCRIPT_DIR_UPGRADE/../openhop-core/99-ch341.rules" ]; then
+            cp "$SCRIPT_DIR_UPGRADE/../openhop-core/99-ch341.rules" /etc/udev/rules.d/99-ch341.rules
             udevadm control --reload-rules 2>/dev/null || true
             udevadm trigger 2>/dev/null || true
             echo "    ✓ CH341 udev rules updated"
@@ -801,15 +973,15 @@ upgrade_repeater() {
         echo "[6/9] Fixing permissions..."
         
         # Venv stays root-owned (pip runs as root); service user only needs read+execute
-        chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater 2>/dev/null || true
+        chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR" 2>/dev/null || true
         chown root:root "$INSTALL_DIR" 2>/dev/null || true
         chmod 755 "$INSTALL_DIR" 2>/dev/null || true
         chmod 750 "$CONFIG_DIR" "$LOG_DIR" 2>/dev/null || true
-        chmod 755 /var/lib/pymc_repeater 2>/dev/null || true
+        chmod 755 "$DATA_DIR" 2>/dev/null || true
         
         # Pre-create the .config directory that the service will need
-        mkdir -p /var/lib/pymc_repeater/.config/pymc_repeater 2>/dev/null || true
-        chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/pymc_repeater/.config 2>/dev/null || true
+        mkdir -p "$DATA_DIR/.config/openhop_repeater" 2>/dev/null || true
+        chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/.config" 2>/dev/null || true
         
         # Configure polkit for passwordless service restart
         POLKIT_VERSION=$(pkaction --version 2>/dev/null | awk '{print $NF}')
@@ -817,36 +989,36 @@ upgrade_repeater() {
             echo "Polkit 0.106 or greater detected, using rules file"
             echo ">>> Configuring polkit for service management..."
             mkdir -p /etc/polkit-1/rules.d
-            cat > /etc/polkit-1/rules.d/10-pymc-repeater.rules <<'EOF'
+            cat > /etc/polkit-1/rules.d/10-openhop-repeater.rules <<'EOF'
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
-        action.lookup("unit") == "pymc-repeater.service" &&
+        action.lookup("unit") == "openhop-repeater.service" &&
         subject.user == "repeater") {
         return polkit.Result.YES;
     }
 });
 EOF
-            chmod 0644 /etc/polkit-1/rules.d/10-pymc-repeater.rules
+            chmod 0644 /etc/polkit-1/rules.d/10-openhop-repeater.rules
         else
             echo "Polkit 0.105 or less detected, using pkla file"
             mkdir -p /etc/polkit-1/localauthority/50-local.d
-            cat > /etc/polkit-1/localauthority/50-local.d/10-pymc-repeater.pkla <<'EOF'
-[Allow repeater to restart pymc-repeater service]
+            cat > /etc/polkit-1/localauthority/50-local.d/10-openhop-repeater.pkla <<'EOF'
+[Allow repeater to restart openhop-repeater service]
 Identity=unix-user:repeater
 Action=org.freedesktop.systemd1.manage-units
 ResultAny=yes
 ResultInactive=yes
 ResultActive=yes
 EOF
-            chmod 0644 /etc/polkit-1/localauthority/50-local.d/10-pymc-repeater.pkla
+            chmod 0644 /etc/polkit-1/localauthority/50-local.d/10-openhop-repeater.pkla
         fi
         # Also configure sudoers as fallback for service restart
         mkdir -p /etc/sudoers.d
-        cat > /etc/sudoers.d/pymc-repeater <<'EOF'
-# Allow repeater user to manage the pymc-repeater service without password
-repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart pymc-repeater, /usr/bin/systemctl stop pymc-repeater, /usr/bin/systemctl start pymc-repeater, /usr/bin/systemctl status pymc-repeater, /usr/local/bin/pymc-do-upgrade
+        cat > /etc/sudoers.d/openhop-repeater <<'EOF'
+# Allow repeater user to manage the openhop-repeater service without password
+repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/local/bin/pymc-do-upgrade
 EOF
-        chmod 0440 /etc/sudoers.d/pymc-repeater
+        chmod 0440 /etc/sudoers.d/openhop-repeater
         # Install / refresh OTA upgrade wrapper
         cat > /usr/local/bin/pymc-do-upgrade <<'UPGRADEEOF'
 #!/bin/bash
@@ -855,7 +1027,7 @@ EOF
 set -e
 CHANNEL="${1:-main}"
 PRETEND_VERSION="${2:-}"
-VENV_DIR="/opt/pymc_repeater/venv"
+VENV_DIR="/opt/openhop_repeater/venv"
 VENV_PIP="$VENV_DIR/bin/pip"
 VENV_PYTHON="$VENV_DIR/bin/python"
 # Validate: only allow safe git ref characters
@@ -870,25 +1042,39 @@ fi
 if [ ! -x "$VENV_PYTHON" ]; then
     echo "[pymc-do-upgrade] Creating venv at $VENV_DIR ..."
     python3 -m venv --system-site-packages "$VENV_DIR"
-    "$VENV_PIP" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+    "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
 fi
 # ---- Migration: clean up legacy service unit issues ----
-SVC_UNIT=/etc/systemd/system/pymc-repeater.service
+SVC_UNIT=/etc/systemd/system/openhop-repeater.service
 if grep -q 'PYTHONPATH' "$SVC_UNIT" 2>/dev/null; then
     sed -i '/^Environment=.*PYTHONPATH/d' "$SVC_UNIT"
     systemctl daemon-reload
 fi
-if grep -q 'WorkingDirectory=/opt/pymc_repeater' "$SVC_UNIT" 2>/dev/null; then
-    sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/pymc_repeater|' "$SVC_UNIT"
+if grep -q 'WorkingDirectory=/opt/openhop_repeater' "$SVC_UNIT" 2>/dev/null; then
+    sed -i 's|WorkingDirectory=/opt/openhop_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
+    systemctl daemon-reload
+fi
+if grep -q 'WorkingDirectory=/opt/pymc_repeater\|WorkingDirectory=/var/lib/pymc_repeater' "$SVC_UNIT" 2>/dev/null; then
+    sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
+    sed -i 's|WorkingDirectory=/var/lib/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|' "$SVC_UNIT"
     systemctl daemon-reload
 fi
 if grep -q 'ExecStart=/usr/bin/python3' "$SVC_UNIT" 2>/dev/null; then
     sed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|" "$SVC_UNIT"
     systemctl daemon-reload
 fi
+if grep -q 'ExecStart=/opt/pymc_repeater/venv/bin/python' "$SVC_UNIT" 2>/dev/null; then
+    sed -i "s|ExecStart=/opt/pymc_repeater/venv/bin/python|ExecStart=$VENV_PYTHON|" "$SVC_UNIT"
+    systemctl daemon-reload
+fi
 # ---- Remove stale source trees that shadow the venv package ----
+[ -d /opt/openhop_repeater/repeater ] && rm -rf /opt/openhop_repeater/repeater
+[ -d /opt/openhop_repeater/openhop-repeater ] && rm -rf /opt/openhop_repeater/openhop-repeater
 [ -d /opt/pymc_repeater/repeater ] && rm -rf /opt/pymc_repeater/repeater
+[ -d /opt/pymc_repeater/pymc-repeater ] && rm -rf /opt/pymc_repeater/pymc-repeater
 # ---- Remove old system-level packages to avoid confusion ----
+python3 -m pip uninstall -y openhop_repeater 2>/dev/null || true
+python3 -m pip uninstall -y openhop_core 2>/dev/null || true
 python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
 python3 -m pip uninstall -y pymc_core 2>/dev/null || true
         # ---- Try R2 wheels first for faster OTA upgrades ----
@@ -904,13 +1090,22 @@ python3 -m pip uninstall -y pymc_core 2>/dev/null || true
             PY_TAG=$("$VENV_PYTHON" -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
             WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
             echo "[pymc-do-upgrade] Trying dependencies from R2 wheels..."
-            "$VENV_PIP" install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null || true
+            "$VENV_PYTHON" -m pip install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null || true
         fi
-        # ---- Install pymc_repeater from git ----
-        exec "$VENV_PIP" install \
+        # ---- Install openhop_repeater from git ----
+        if "$VENV_PYTHON" -m pip install \
             --upgrade \
             --no-cache-dir \
-            "pymc_repeater[hardware] @ git+https://github.com/rightup/pyMC_Repeater.git@${CHANNEL}"
+            "openhop_repeater[hardware] @ git+https://github.com/openhop-dev/openhop_repeater.git@${CHANNEL}"; then
+            # Keep web/OTA updates aligned with manage.sh install/upgrade defaults.
+            RADIO_BASE_URL="https://raw.githubusercontent.com/openhop-dev/openhop_repeater/${CHANNEL}"
+            RADIO_STORAGE_DIR="/var/lib/openhop_repeater"
+            mkdir -p "$RADIO_STORAGE_DIR"
+            wget -qO "$RADIO_STORAGE_DIR/radio-settings.json" "${RADIO_BASE_URL}/radio-settings.json" 2>/dev/null || true
+            wget -qO "$RADIO_STORAGE_DIR/radio-presets.json" "${RADIO_BASE_URL}/radio-presets.json" 2>/dev/null || true
+        else
+            exit 1
+        fi
 UPGRADEEOF
         chmod 0755 /usr/local/bin/pymc-do-upgrade
         echo "    ✓ Permissions updated"
@@ -921,7 +1116,7 @@ UPGRADEEOF
 
         echo "=== Installing Python Dependencies ==="
         echo ""
-        echo "Updating pymc_repeater and dependencies (including pymc_core from PyPI)..."
+        echo "Updating openhop_repeater and dependencies (including openhop_core from PyPI)..."
         echo "This may take a few minutes..."
         echo ""
 
@@ -951,7 +1146,7 @@ UPGRADEEOF
         migrate_to_venv
 
         # Install into the venv (clean, no system-packages flags needed)
-        echo "Upgrading pymc_repeater into venv ($VENV_DIR)..."
+        echo "Upgrading openhop_repeater into venv ($VENV_DIR)..."
         
         # Attempt R2 wheels first for faster installation
         if [ "$R2_ENABLED" -eq 1 ]; then
@@ -967,7 +1162,7 @@ UPGRADEEOF
                 WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
                 echo "  Checking for R2 wheels (${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG})..."
                 echo "  Trying install from R2 pre-built wheels..."
-                "$VENV_PIP" install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null && R2_SUCCESS=1 || R2_SUCCESS=0
+                "$VENV_PYTHON" -m pip install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null && R2_SUCCESS=1 || R2_SUCCESS=0
                 if [ "$R2_SUCCESS" -eq 1 ]; then
                     echo "  ✓ R2 wheels installed"
                 else
@@ -976,7 +1171,7 @@ UPGRADEEOF
             fi
         fi
         
-        if "$VENV_PIP" install --upgrade --no-cache-dir .[hardware]; then
+        if "$VENV_PYTHON" -m pip install --upgrade --no-cache-dir .[hardware]; then
             echo ""
             echo "✓ Package and dependencies upgraded successfully!"
         else
@@ -1073,10 +1268,10 @@ uninstall_repeater() {
         return
     fi
 
-    if ask_yes_no "Confirm Uninstall" "This will completely remove pyMC Repeater including:\n\n- Service and files\n- Configuration (backup will be created)\n- Logs and data\n\nThis action cannot be undone!\n\nContinue?"; then
+    if ask_yes_no "Confirm Uninstall" "This will completely remove openHop Repeater including:\n\n- Service and files\n- Configuration (backup will be created)\n- Logs and data\n\nThis action cannot be undone!\n\nContinue?"; then
         echo ""
         echo "═══════════════════════════════════════════════════════════════"
-        echo "        Uninstalling pyMC Repeater"
+        echo "        Uninstalling openHop Repeater"
         echo "═══════════════════════════════════════════════════════════════"
         echo ""
         
@@ -1087,24 +1282,28 @@ uninstall_repeater() {
         (
         echo "20"; echo "# Backing up configuration..."
         if [ -d "$CONFIG_DIR" ]; then
-            cp -r "$CONFIG_DIR" "/tmp/pymc_repeater_config_backup_$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+            cp -r "$CONFIG_DIR" "/tmp/openhop_repeater_config_backup_$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
         fi
 
         echo "40"; echo "# Removing service files..."
-        rm -f /etc/systemd/system/pymc-repeater.service
+        rm -f /etc/systemd/system/openhop-repeater.service
         systemctl daemon-reload
 
         echo "50"; echo "# Removing polkit and sudoers rules..."
-        rm -f /etc/polkit-1/rules.d/10-pymc-repeater.rules || true
-        rm -f /etc/polkit-1/localauthority/50-local.d/10-pymc-repeater.pkla || true
-        rm -f /etc/sudoers.d/pymc-repeater
+        rm -f /etc/polkit-1/rules.d/10-openhop-repeater.rules || true
+        rm -f /etc/polkit-1/localauthority/50-local.d/10-openhop-repeater.pkla || true
+        rm -f /etc/sudoers.d/openhop-repeater
         rm -f /usr/local/bin/pymc-do-upgrade
 
         echo "60"; echo "# Removing installation..."
         rm -rf "$INSTALL_DIR"
         rm -rf "$CONFIG_DIR"
         rm -rf "$LOG_DIR"
-        rm -rf /var/lib/pymc_repeater
+        rm -rf "$DATA_DIR"
+        rm -rf "$LEGACY_PYMC_INSTALL_DIR"
+        rm -rf "$LEGACY_PYMC_CONFIG_DIR"
+        rm -rf "$LEGACY_PYMC_LOG_DIR"
+        rm -rf "$LEGACY_PYMC_DATA_DIR"
 
         echo "80"; echo "# Removing service user..."
         if id "$SERVICE_USER" &>/dev/null; then
@@ -1112,9 +1311,9 @@ uninstall_repeater() {
         fi
 
         echo "100"; echo "# Uninstall complete!"
-        ) | $DIALOG --backtitle "pyMC Repeater Management" --title "Uninstalling" --gauge "Removing pyMC Repeater..." 8 70 0
+        ) | $DIALOG --backtitle "openHop Repeater Management" --title "Uninstalling" --gauge "Removing openHop Repeater..." 8 70 0
 
-        show_info "Uninstall Complete" "\npyMC Repeater has been completely removed.\n\nConfiguration backup saved to /tmp/\n\nThank you for using pyMC Repeater!"
+        show_info "Uninstall Complete" "\nopenHop Repeater has been completely removed.\n\nConfiguration backup saved to /tmp/\n\nThank you for using openHop Repeater!"
     fi
 }
 
@@ -1149,9 +1348,9 @@ manage_service() {
             systemctl start "$SERVICE_NAME"
             if is_running; then
                 if [[ "$silent" == "true" ]]; then
-                    echo "✓ pyMC Repeater service has been started successfully."
+                    echo "✓ openHop Repeater service has been started successfully."
                 else
-                    show_info "Service Started" "\n✓ pyMC Repeater service has been started successfully."
+                    show_info "Service Started" "\n✓ openHop Repeater service has been started successfully."
                 fi
             else
                 if [[ "$silent" == "true" ]]; then
@@ -1165,18 +1364,18 @@ manage_service() {
         "stop")
             systemctl stop "$SERVICE_NAME"
             if [[ "$silent" == "true" ]]; then
-                echo "✓ pyMC Repeater service has been stopped."
+                echo "✓ openHop Repeater service has been stopped."
             else
-                show_info "Service Stopped" "\n✓ pyMC Repeater service has been stopped."
+                show_info "Service Stopped" "\n✓ openHop Repeater service has been stopped."
             fi
             ;;
         "restart")
             systemctl restart "$SERVICE_NAME"
             if is_running; then
                 if [[ "$silent" == "true" ]]; then
-                    echo "✓ pyMC Repeater service has been restarted successfully."
+                    echo "✓ openHop Repeater service has been restarted successfully."
                 else
-                    show_info "Service Restarted" "\n✓ pyMC Repeater service has been restarted successfully."
+                    show_info "Service Restarted" "\n✓ openHop Repeater service has been restarted successfully."
                 fi
             else
                 if [[ "$silent" == "true" ]]; then
@@ -1236,6 +1435,19 @@ validate_and_update_config() {
     local example_file="config.yaml.example"
     local updated_example="$CONFIG_DIR/config.yaml.example"
 
+    normalize_legacy_paths_in_config() {
+        local target_file="$1"
+        [ -f "$target_file" ] || return 0
+
+        sed -i 's|/var/lib/pymc_repeater|/var/lib/openhop_repeater|g' "$target_file" 2>/dev/null || true
+        sed -i 's|/etc/pymc_repeater|/etc/openhop_repeater|g' "$target_file" 2>/dev/null || true
+        sed -i 's|/var/log/pymc_repeater|/var/log/openhop_repeater|g' "$target_file" 2>/dev/null || true
+        sed -i 's|/opt/pymc_repeater|/opt/openhop_repeater|g' "$target_file" 2>/dev/null || true
+    }
+
+    # Ensure destination config directory exists before copy/merge steps.
+    mkdir -p "$CONFIG_DIR"
+
     # Copy the new example file
     if [ -f "$example_file" ]; then
         cp "$example_file" "$updated_example"
@@ -1248,6 +1460,7 @@ validate_and_update_config() {
     if [ ! -f "$config_file" ]; then
         echo "    ⚠ No existing config.yaml found, copying example"
         cp "$updated_example" "$config_file"
+        normalize_legacy_paths_in_config "$config_file"
         return 0
     fi
 
@@ -1288,32 +1501,36 @@ validate_and_update_config() {
         # Verify the merged file is valid YAML
         if "$YQ_CMD" eval '.' "$temp_merged" > /dev/null 2>&1; then
             mv "$temp_merged" "$config_file"
+            normalize_legacy_paths_in_config "$config_file"
             echo "    ✓ Configuration merged successfully"
+            echo "    ✓ Legacy pymc_* paths normalized"
             echo "    ✓ User settings preserved, new options added"
             return 0
         else
             echo "    ✗ Merged config is invalid, restoring backup"
             rm -f "$temp_merged"
             cp "$backup_file" "$config_file"
+            normalize_legacy_paths_in_config "$config_file"
             return 1
         fi
     else
         echo "    ✗ Config merge failed, keeping original"
         rm -f "$temp_merged" "$stripped_user"
+        normalize_legacy_paths_in_config "$config_file"
         return 1
     fi
 }
 
 # Main script logic
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-    echo "pyMC Repeater Management Script"
+    echo "openHop Repeater Management Script"
     echo ""
     echo "Usage: $0 [action]"
     echo ""
     echo "Actions:"
-    echo "  install   - Install pyMC Repeater"
+    echo "  install   - Install openHop Repeater"
     echo "  upgrade   - Upgrade existing installation (CLI is silent by default; use --interactive to show dialogs)"
-    echo "  uninstall - Remove pyMC Repeater"
+    echo "  uninstall - Remove openHop Repeater"
     echo "  config    - Configure radio settings"
     echo "  start     - Start the service (CLI is silent by default; use --interactive to show dialogs)"
     echo "  stop      - Stop the service (CLI is silent by default; use --interactive to show dialogs)"
@@ -1337,7 +1554,7 @@ if [ "$1" = "debug" ]; then
     echo "Script: $0"
     echo ""
     echo "Testing dialog..."
-    $DIALOG --backtitle "pyMC Repeater Management" --title "Test" --msgbox "Dialog test successful!" 8 40
+    $DIALOG --backtitle "openHop Repeater Management" --title "Test" --msgbox "Dialog test successful!" 8 40
     echo "Dialog test completed."
     exit 0
 fi
@@ -1375,7 +1592,7 @@ case "$1" in
     "logs")
         clear
         echo -e "\033[1;36m╔══════════════════════════════════════════════════════════════════════╗\033[0m"
-        echo -e "\033[1;36m║\033[0m                  \033[1;37mpyMC Repeater - Live Logs\033[0m                     \033[1;36m║\033[0m"
+        echo -e "\033[1;36m║\033[0m                  \033[1;37mopenHop Repeater - Live Logs\033[0m                     \033[1;36m║\033[0m"
         echo -e "\033[1;36m║\033[0m                  \033[0;90m(Press Ctrl+C to return)\033[0m                      \033[1;36m║\033[0m"
         echo -e "\033[1;36m╚══════════════════════════════════════════════════════════════════════╝\033[0m"
         echo ""

@@ -6,7 +6,65 @@ from typing import Any, Dict, Optional, overload
 
 import yaml
 
+from repeater.policy_engine import default_policy_engine_config
+
 logger = logging.getLogger("Config")
+
+
+def _resolve_policy_config_path(config: Dict[str, Any], config_path: str) -> Path:
+    policy_section = config.get("policy", {}) if isinstance(config.get("policy"), dict) else {}
+    configured = policy_section.get("policy_file") or "policy.yaml"
+
+    base_dir = Path(config_path).expanduser().resolve().parent
+    p = Path(str(configured)).expanduser()
+    if not p.is_absolute():
+        p = (base_dir / p).resolve()
+    return p
+
+
+def _load_policy_engine_config(config: Dict[str, Any], config_path: str) -> Dict[str, Any]:
+    policy_path = _resolve_policy_config_path(config, config_path)
+    defaults = default_policy_engine_config()
+
+    if not policy_path.exists():
+        logger.info("Policy file not found at %s, policy engine disabled", policy_path)
+        config["policy_engine"] = defaults
+        config["policy_file_path"] = str(policy_path)
+        return config
+
+    try:
+        with open(policy_path) as f:
+            loaded = yaml.safe_load(f) or {}
+
+        if isinstance(loaded, dict) and isinstance(loaded.get("policy_engine"), dict):
+            policy_cfg = loaded.get("policy_engine")
+        elif isinstance(loaded, dict):
+            policy_cfg = loaded
+        else:
+            policy_cfg = {}
+
+        merged = dict(defaults)
+        if isinstance(policy_cfg, dict):
+            merged.update(policy_cfg)
+
+        if not isinstance(merged.get("rules"), list):
+            merged["rules"] = []
+        if not isinstance(merged.get("objects"), dict):
+            merged["objects"] = {}
+
+        config["policy_engine"] = merged
+        config["policy_file_path"] = str(policy_path)
+        logger.info("Loaded policy config from %s", policy_path)
+        return config
+    except Exception as e:
+        logger.warning(
+            "Failed to load policy config from %s: %s. Policy engine disabled.",
+            policy_path,
+            e,
+        )
+        config["policy_engine"] = defaults
+        config["policy_file_path"] = str(policy_path)
+        return config
 
 
 class NullRadio:
@@ -43,17 +101,50 @@ class NullRadio:
         return True
 
 
+class BaselineCrcCounterRadio:
+    """Radio proxy that exposes CRC errors relative to repeater startup.
+
+    pyMC modem transports report the modem firmware's cumulative CRC counter.
+    The SX1262 wrapper's counter starts at process startup, which lets the engine
+    persist deltas without knowing the radio backend. Mirror that wrapper flow
+    here by normalizing the modem's raw counter at the transport boundary.
+    """
+
+    def __init__(self, radio):
+        self._radio = radio
+        self._crc_baseline = self._read_raw_crc_count()
+
+    def __getattr__(self, name: str):
+        return getattr(self._radio, name)
+
+    @property
+    def crc_error_count(self) -> int:
+        current = self._read_raw_crc_count()
+        if self._crc_baseline <= 0 and current > 0:
+            self._crc_baseline = current
+            return 0
+        return max(0, current - self._crc_baseline)
+
+    @crc_error_count.setter
+    def crc_error_count(self, value: Any) -> None:
+        setattr(self._radio, "crc_error_count", value)
+
+    def _read_raw_crc_count(self) -> int:
+        try:
+            return int(getattr(self._radio, "crc_error_count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+
 def resolve_storage_dir(
     config: Dict[str, Any],
     *,
     config_path: Optional[str] = None,
-    default: str = "/var/lib/pymc_repeater",
+    default: str = "/var/lib/openhop_repeater",
 ) -> Path:
 
     storage_dir_cfg = (
-        config.get("storage", {}).get("storage_dir")
-        or config.get("storage_dir")
-        or default
+        config.get("storage", {}).get("storage_dir") or config.get("storage_dir") or default
     )
 
     storage_dir = Path(str(storage_dir_cfg)).expanduser()
@@ -70,10 +161,10 @@ def resolve_storage_dir(
 def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extract node name, radio configuration, and MQTT settings from config.
-    
+
     Args:
         config: Configuration dictionary
-        
+
     Returns:
         Dictionary with node_name, radio_config, and MQTT configuration
     """
@@ -87,10 +178,10 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
     radio_freq_mhz = radio_freq / 1_000_000
     radio_bw_khz = radio_bw / 1_000
     radio_config_str = f"{radio_freq_mhz},{radio_bw_khz},{radio_sf},{radio_cr}"
-    
+
     # Handle getting the config from mqtt brokers, falling back to letsmesh if it doesn't exist
     mqtt_config = config.get("mqtt_brokers", config.get("letsmesh", {}))
-    
+
     return {
         "node_name": node_name,
         "radio_config": radio_config_str,
@@ -104,7 +195,10 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if config_path is None:
-        config_path = os.getenv("PYMC_REPEATER_CONFIG", "/etc/pymc_repeater/config.yaml")
+        config_path = os.getenv(
+            "OPENHOP_REPEATER_CONFIG",
+            os.getenv("PYMC_REPEATER_CONFIG", "/etc/openhop_repeater/config.yaml"),
+        )
 
     # Check if config file exists
     if not Path(config_path).exists():
@@ -143,8 +237,8 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "inform_interval_seconds": 30,
             "request_timeout_seconds": 10,
             "verify_tls": True,
-            "api_token": "",
-            "cert_store_dir": "/etc/pymc_repeater/glass",
+            "api_token": None,
+            "cert_store_dir": "/etc/openhop_repeater/glass",
         }
 
     if "gps" not in config:
@@ -158,6 +252,12 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "baud_rate": 9600,
             "read_timeout_seconds": 1.0,
             "reconnect_interval_seconds": 5.0,
+            "host": "",
+            "port": 80,
+            "endpoint": "/api/stats",
+            "scheme": "http",
+            "username": "admin",
+            "password": None,
             "stale_after_seconds": 10.0,
             "retain_sentences": 25,
             "validate_checksum": True,
@@ -184,14 +284,14 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if "security" not in config["repeater"]:
         logger.warning(
             "No 'security' section found under 'repeater' in config. "
-            "Adding defaults — please review and update passwords."
+            "Adding secure placeholders — complete setup wizard before login."
         )
         config["repeater"]["security"] = {
             "max_clients": 1,
-            "admin_password": "admin123",
-            "guest_password": "guest123",
+            "admin_password": None,
+            "guest_password": None,
             "allow_read_only": False,
-            "jwt_secret": "",
+            "jwt_secret": None,
             "jwt_expiry_minutes": 60,
         }
 
@@ -204,10 +304,13 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         else:
             config["repeater"]["identity_key"] = _load_or_create_identity_key()
 
-    if os.getenv("PYMC_REPEATER_LOG_LEVEL"):
+    env_log_level = os.getenv("OPENHOP_REPEATER_LOG_LEVEL", os.getenv("PYMC_REPEATER_LOG_LEVEL"))
+    if env_log_level:
         if "logging" not in config:
             config["logging"] = {}
-        config["logging"]["level"] = os.getenv("PYMC_REPEATER_LOG_LEVEL")
+        config["logging"]["level"] = env_log_level
+
+    config = _load_policy_engine_config(config, config_path)
 
     return config
 
@@ -215,17 +318,20 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
 def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) -> bool:
     """
     Save configuration to YAML file.
-    
+
     Args:
         config_data: Configuration dictionary to save
         config_path: Path to config file (uses default if None)
-        
+
     Returns:
         True if successful, False otherwise
     """
     if config_path is None:
-        config_path = os.getenv("PYMC_REPEATER_CONFIG", "/etc/pymc_repeater/config.yaml")
-    
+        config_path = os.getenv(
+            "OPENHOP_REPEATER_CONFIG",
+            os.getenv("PYMC_REPEATER_CONFIG", "/etc/openhop_repeater/config.yaml"),
+        )
+
     try:
         # Create backup of existing config
         config_file = Path(config_path)
@@ -247,7 +353,7 @@ def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) 
 
         logger.info(f"Saved configuration to {config_path}")
         return True
-        
+
     except Exception as e:
         logger.error(f"Failed to save configuration: {e}")
         return False
@@ -256,29 +362,29 @@ def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) 
 def update_unscoped_flood_policy(allow: bool, config_path: Optional[str] = None) -> bool:
     """
     Update the unscoped flood policy in the configuration.
-    
+
     Args:
         allow: True to allow unscoped flooding, False to deny
         config_path: Path to config file (uses default if None)
-        
+
     Returns:
         True if successful, False otherwise
     """
     try:
         # Load current config
         config = load_config(config_path)
-        
+
         # Ensure mesh section exists
         if "mesh" not in config:
             config["mesh"] = {}
-        
+
         # Set global flood policy
         config["mesh"]["global_flood_allow"] = allow
         config["mesh"]["unscoped_flood_allow"] = allow
-        
+
         # Save updated config
         return save_config(config, config_path)
-        
+
     except Exception as e:
         logger.error(f"Failed to update unscoped flood policy: {e}")
         return False
@@ -288,16 +394,16 @@ def _load_or_create_identity_key(path: Optional[str] = None) -> bytes:
 
     if path is None:
         # Check system-wide location first (matches config.yaml location)
-        system_key_path = Path("/etc/pymc_repeater/identity.key")
+        system_key_path = Path("/etc/openhop_repeater/identity.key")
         if system_key_path.exists():
             key_path = system_key_path
         else:
             # Follow XDG spec
             xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
             if xdg_config_home:
-                config_dir = Path(xdg_config_home) / "pymc_repeater"
+                config_dir = Path(xdg_config_home) / "openhop_repeater"
             else:
-                config_dir = Path.home() / ".config" / "pymc_repeater"
+                config_dir = Path.home() / ".config" / "openhop_repeater"
             key_path = config_dir / "identity.key"
     else:
         key_path = Path(path)
@@ -345,7 +451,7 @@ def get_radio_for_board(board_config: dict):
         if isinstance(value, int):
             return value
         if isinstance(value, str):
-            return int(value.strip().rstrip(','), 0)
+            return int(value.strip().rstrip(","), 0)
         raise ValueError(f"Invalid int value type: {type(value)}")
 
     def _parse_int_list(value):
@@ -376,7 +482,7 @@ def get_radio_for_board(board_config: dict):
         radio_type = "kiss"
 
     if radio_type in ("sx1262", "sx1262_ch341"):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         # Get radio and SPI configuration - all settings must be in config file
         spi_config = board_config.get("sx1262")
@@ -393,8 +499,8 @@ def get_radio_for_board(board_config: dict):
             if not ch341_cfg:
                 raise ValueError("Missing 'ch341' section in configuration file")
 
-            from pymc_core.hardware.lora.LoRaRF.SX126x import set_spi_transport
-            from pymc_core.hardware.transports.ch341_spi_transport import CH341SPITransport
+            from openhop_core.hardware.lora.LoRaRF.SX126x import set_spi_transport
+            from openhop_core.hardware.transports.ch341_spi_transport import CH341SPITransport
 
             vid = _parse_int(ch341_cfg.get("vid"), default=0x1A86)
             pid = _parse_int(ch341_cfg.get("pid"), default=0x5512)
@@ -435,7 +541,7 @@ def get_radio_for_board(board_config: dict):
             combined_config["en_pins"] = en_pins
 
         # Add optional GPIO parameters if specified in config
-        # These wont be supported by older versions of pymc_core
+        # These wont be supported by older versions of openhop_core
         if "gpio_chip" in spi_config:
             combined_config["gpio_chip"] = _parse_int(spi_config["gpio_chip"], default=0)
         if "use_gpiod_backend" in spi_config:
@@ -455,16 +561,16 @@ def get_radio_for_board(board_config: dict):
 
     elif radio_type == "kiss":
         try:
-            from pymc_core.hardware.kiss_modem_wrapper import KissModemWrapper
+            from openhop_core.hardware.kiss_modem_wrapper import KissModemWrapper
         except ImportError:
             try:
-                from pymc_core.hardware.kiss_serial_wrapper import (
+                from openhop_core.hardware.kiss_serial_wrapper import (
                     KissSerialWrapper as KissModemWrapper,
                 )
             except ImportError:
                 raise RuntimeError(
-                    "KISS modem support requires pyMC_core with KISS support. "
-                    "Install your fork with: pip install -e /path/to/pyMC_core"
+                    "KISS modem support requires openhop-core with KISS support. "
+                    "Install your fork with: pip install -e /path/to/openhop-core"
                 ) from None
 
         kiss_config = board_config.get("kiss")
@@ -483,7 +589,20 @@ def get_radio_for_board(board_config: dict):
             "spreading_factor": int(radio_cfg.get("spreading_factor", 8)),
             "coding_rate": int(radio_cfg.get("coding_rate", 8)),
             "tx_power": int(radio_cfg.get("tx_power", 14)),
+            "preamble_length": int(radio_cfg.get("preamble_length", 32)),
         }
+
+        # Optional KISS key-up / CSMA tuning, forwarded to the modem firmware (via
+        # SetHardware) only when present so the wrapper keeps its own defaults otherwise.
+        # For a host-managed repeater the engine already staggers retransmits, so the
+        # firmware's p-persistent CSMA backoff is usually redundant; set
+        # kiss_persistence: 255 to transmit as soon as the channel is clear.
+        for _key in ("tx_delay_ms", "kiss_persistence", "kiss_slottime_ms", "kiss_txtail_ms"):
+            if kiss_config.get(_key) is not None:
+                radio_config[_key] = int(kiss_config[_key])
+        if kiss_config.get("kiss_full_duplex") is not None:
+            radio_config["kiss_full_duplex"] = bool(kiss_config["kiss_full_duplex"])
+
         radio = KissModemWrapper(
             port=port,
             baudrate=baudrate,
@@ -501,11 +620,11 @@ def get_radio_for_board(board_config: dict):
 
     elif radio_type == "pymc_tcp":
         try:
-            from pymc_core.hardware.tcp_radio import TCPLoRaRadio
+            from openhop_core.hardware.tcp_radio import TCPLoRaRadio
         except ImportError:
             raise RuntimeError(
-                "pymc_tcp radio requires pyMC_core >= the release that includes "
-                "PR pyMC-dev/pyMC_core#68 (merged 2026-05-13). "
+                "pymc_tcp radio requires openhop-core >= the release that includes "
+                "the openhop-core release with TCP modem support. "
                 "Reinstall the [hardware] extra to pick it up."
             ) from None
 
@@ -517,9 +636,7 @@ def get_radio_for_board(board_config: dict):
 
         host = tcp_cfg.get("host")
         if not host:
-            raise ValueError(
-                "Missing 'host' in 'pymc_tcp' section (modem hostname or LAN IP)"
-            )
+            raise ValueError("Missing 'host' in 'pymc_tcp' section (modem hostname or LAN IP)")
 
         radio_cfg = board_config.get("radio") or {}
         radio = TCPLoRaRadio(
@@ -543,15 +660,15 @@ def get_radio_for_board(board_config: dict):
         except Exception as e:
             raise RuntimeError(f"Failed to initialize pymc_tcp radio: {e}") from e
 
-        return radio
+        return BaselineCrcCounterRadio(radio)
 
     elif radio_type == "pymc_usb":
         try:
-            from pymc_core.hardware.usb_radio import USBLoRaRadio
+            from openhop_core.hardware.usb_radio import USBLoRaRadio
         except ImportError:
             raise RuntimeError(
-                "pymc_usb radio requires pyMC_core >= the release that includes "
-                "PR pyMC-dev/pyMC_core#68 (merged 2026-05-13). "
+                "pymc_usb radio requires openhop-core >= the release that includes "
+                "the openhop-core release with TCP modem support. "
                 "Reinstall the [hardware] extra to pick it up."
             ) from None
 
@@ -563,9 +680,7 @@ def get_radio_for_board(board_config: dict):
 
         port = usb_cfg.get("port")
         if not port:
-            raise ValueError(
-                "Missing 'port' in 'pymc_usb' section (e.g. /dev/ttyACM0)"
-            )
+            raise ValueError("Missing 'port' in 'pymc_usb' section (e.g. /dev/ttyACM0)")
 
         radio_cfg = board_config.get("radio") or {}
         radio = USBLoRaRadio(
@@ -587,7 +702,7 @@ def get_radio_for_board(board_config: dict):
         except Exception as e:
             raise RuntimeError(f"Failed to initialize pymc_usb radio: {e}") from e
 
-        return radio
+        return BaselineCrcCounterRadio(radio)
 
     raise RuntimeError(
         f"Unknown radio type: {radio_type}. "

@@ -1,5 +1,5 @@
 """
-OTA Update endpoints for pyMC Repeater.
+OTA Update endpoints for openHop Repeater.
 
 Provides server-side GitHub version checks, background pip-based upgrades with
 SSE progress streaming, and release-channel switching.
@@ -19,16 +19,21 @@ import json
 import logging
 import os
 import re
+import shutil
 import ssl
-import subprocess
+
+# Required for fixed internal maintenance commands.
+import subprocess  # nosec B404
 import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
+from urllib.parse import urlparse
 
 import cherrypy
+
 from repeater.service_utils import get_container_restart_message, is_buildroot, is_container
 
 logger = logging.getLogger("HTTPServer")
@@ -36,14 +41,20 @@ logger = logging.getLogger("HTTPServer")
 # ---------------------------------------------------------------------------
 # Repository constants
 # ---------------------------------------------------------------------------
-GITHUB_OWNER = "rightup"
-GITHUB_REPO = "pyMC_Repeater"
+GITHUB_OWNER = "openhop-dev"
+GITHUB_REPO = "openhop_repeater"
 GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
 GITHUB_API_BASE = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
-PACKAGE_NAME = "pymc_repeater"
+PACKAGE_NAME = "openhop_repeater"
 
 # How long (seconds) before a cached check result expires
 CHECK_CACHE_TTL = 600  # 10 minutes
+_RM_BIN = "/bin/rm"
+_SED_BIN = "/usr/bin/sed"
+_SYSTEMCTL_BIN = "/bin/systemctl"
+_SUDO_BIN = "/usr/bin/sudo"
+_INSTALL_DIR = "/opt/openhop_repeater"
+_LEGACY_PYMC_INSTALL_DIR = "/opt/pymc_repeater"
 
 _github_ssl_ctx: Optional[ssl.SSLContext] = None
 _disk_version_mismatch_logged: Optional[tuple] = None
@@ -61,8 +72,8 @@ def _get_github_ssl_context() -> ssl.SSLContext:
 
 def _find_buildroot_upgrade_helper() -> Optional[str]:
     candidates = [
-        "/root/pyMC_Repeater/buildroot-manage.sh",
-        "/opt/pymc_repeater/pyMC_Repeater/buildroot-manage.sh",
+        "/root/openhop-repeater/buildroot-manage.sh",
+        "/opt/openhop_repeater/openhop-repeater/buildroot-manage.sh",
         "/root/scripts/buildroot-manage.sh",
     ]
     for path in candidates:
@@ -73,6 +84,7 @@ def _find_buildroot_upgrade_helper() -> Optional[str]:
 
 class _RateLimitError(Exception):
     """Raised when GitHub returns HTTP 403 due to rate limiting."""
+
     def __init__(self, msg: str, reset_at: Optional[datetime] = None):
         super().__init__(msg)
         self.reset_at = reset_at
@@ -80,7 +92,7 @@ class _RateLimitError(Exception):
 
 def _get_installed_version(force_refresh: bool = False) -> str:
     """
-    Return the highest dist-info version found for pymc_repeater across all
+    Return the highest dist-info version found for openhop_repeater across all
     directories the running interpreter actually uses.
 
     Search strategy (union of all three to cover venvs, system, dist-packages):
@@ -126,7 +138,7 @@ def _get_installed_version(force_refresh: bool = False) -> str:
         if p and ("site-packages" in p or "dist-packages" in p) and p not in dirs:
             dirs.append(p)
     # Explicitly include the dedicated venv's site-packages
-    _venv_site = "/opt/pymc_repeater/venv/lib"
+    _venv_site = "/opt/openhop_repeater/venv/lib"
     if os.path.isdir(_venv_site):
         for child in os.listdir(_venv_site):
             sp = os.path.join(_venv_site, child, "site-packages")
@@ -157,6 +169,7 @@ def _get_installed_version(force_refresh: bool = False) -> str:
         else:
             try:
                 from packaging.version import Version
+
                 disk_version = str(max(candidates, key=lambda v: Version(v)))
             except Exception:
                 # packaging unavailable – sort lexicographically as best-effort
@@ -166,13 +179,15 @@ def _get_installed_version(force_refresh: bool = False) -> str:
     if disk_version is None:
         try:
             from importlib.metadata import version as _pkg_ver
+
             disk_version = _pkg_ver(PACKAGE_NAME)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[Update] importlib.metadata fallback unavailable: {exc}")
 
     if disk_version is None:
         try:
             from repeater import __version__
+
             return _cache_and_return(__version__)
         except Exception:
             return _cache_and_return("unknown")
@@ -181,8 +196,10 @@ def _get_installed_version(force_refresh: bool = False) -> str:
     # If the running process is already on a higher version than anything found
     # on disk, the dist-info dirs are stale leftovers and __version__ is truth.
     try:
-        from repeater import __version__ as _running
         from packaging.version import Version
+
+        from repeater import __version__ as _running
+
         if Version(_running) > Version(disk_version):
             # status() polls can call this frequently; throttle mismatch logs.
             global _disk_version_mismatch_logged
@@ -206,14 +223,15 @@ def _get_installed_version(force_refresh: bool = False) -> str:
 
             # Strip PEP 440 local identifier (+gXXXXXX) – it only encodes
             # the git hash and causes spurious mismatches with GitHub versions.
-            return _cache_and_return(re.sub(r'\+[a-zA-Z0-9.]+$', '', _running))
-    except Exception:
-        pass
+            return _cache_and_return(re.sub(r"\+[a-zA-Z0-9.]+$", "", _running))
+    except Exception as exc:
+        logger.debug(f"[Update] Running-version sanity check skipped: {exc}")
 
-    return _cache_and_return(re.sub(r'\+[a-zA-Z0-9.]+$', '', disk_version))
+    return _cache_and_return(re.sub(r"\+[a-zA-Z0-9.]+$", "", disk_version))
+
 
 # Channels file – persisted so the choice survives daemon restarts
-_CHANNELS_FILE = "/var/lib/pymc_repeater/.update_channel"
+_CHANNELS_FILE = "/var/lib/openhop_repeater/.update_channel"
 
 
 def _detect_channel_from_dist_info() -> Optional[str]:
@@ -259,9 +277,10 @@ def _detect_channel_from_dist_info() -> Optional[str]:
     # Use the highest-version dist-info so a stale old one doesn't win
     try:
         from packaging.version import Version
+
         candidates.sort(key=lambda t: Version(t[0]), reverse=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"[Update] Could not version-sort direct_url candidates: {exc}")
 
     _, best_url_path = candidates[0]
     try:
@@ -271,10 +290,10 @@ def _detect_channel_from_dist_info() -> Optional[str]:
         # ``requested_revision`` is only present when the user explicitly named
         # a branch/tag; absent means HEAD of the default branch.
         revision = vcs_info.get("requested_revision")
-        if revision and re.match(r'^[a-zA-Z0-9_./\-]+$', revision):
+        if revision and re.match(r"^[a-zA-Z0-9_./\-]+$", revision):
             return revision
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"[Update] Failed to inspect direct_url metadata {best_url_path}: {exc}")
 
     return None
 
@@ -294,7 +313,7 @@ class _UpdateState:
         self.channel: str = self._load_channel()
         self.last_checked: Optional[datetime] = None
         # progress / install state
-        self.state: str = "idle"           # idle | checking | installing | complete | error
+        self.state: str = "idle"  # idle | checking | installing | complete | error
         self.error_message: Optional[str] = None
         self.progress_lines: List[str] = []
         self._install_thread: Optional[threading.Thread] = None
@@ -357,7 +376,9 @@ class _UpdateState:
                 "last_checked": self.last_checked.isoformat() if self.last_checked else None,
                 "state": self.state,
                 "error": self.error_message,
-                "rate_limit_until": self.rate_limit_until.isoformat() if self.rate_limit_until else None,
+                "rate_limit_until": self.rate_limit_until.isoformat()
+                if self.rate_limit_until
+                else None,
             }
 
     def set_channel(self, channel: str) -> None:
@@ -384,7 +405,7 @@ class _UpdateState:
             if fresh != "unknown":
                 self.current_version = fresh
             self.has_update = _has_update(self.current_version, latest)
-            self.last_checked = datetime.utcnow()
+            self.last_checked = datetime.now(timezone.utc)
             self.state = "idle"
             self.error_message = None
 
@@ -392,7 +413,7 @@ class _UpdateState:
         with self._lock:
             self.state = "error"
             self.error_message = msg
-            self.last_checked = datetime.utcnow()
+            self.last_checked = datetime.now(timezone.utc)
 
     def _fail_check_ratelimit(self, msg: str, reset_at: Optional[datetime]) -> None:
         """Like _fail_check but keeps existing version data intact and records
@@ -401,7 +422,7 @@ class _UpdateState:
             # Keep state as idle so the UI still shows version info
             self.state = "idle"
             self.error_message = msg
-            self.last_checked = datetime.utcnow()
+            self.last_checked = datetime.now(timezone.utc)
             self.rate_limit_until = reset_at
 
     def start_install(self, thread: threading.Thread) -> bool:
@@ -439,6 +460,7 @@ _state = _UpdateState()
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _fetch_url(url: str, timeout: int = 10) -> str:
     """Perform a simple GET and return text body, or raise on failure.
 
@@ -447,14 +469,20 @@ def _fetch_url(url: str, timeout: int = 10) -> str:
     Raises _RateLimitError on HTTP 403 so callers can back off gracefully.
     """
     installed = _get_installed_version()
-    headers = {"User-Agent": f"pymc-repeater/{installed}"}
+    headers = {"User-Agent": f"openhop-repeater/{installed}"}
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc not in {
+        "api.github.com",
+        "raw.githubusercontent.com",
+    }:
+        raise RuntimeError(f"Refusing to fetch untrusted update URL: {url}")
     req = urllib.request.Request(url, headers=headers)
     try:
         ctx = _get_github_ssl_context() if url.startswith("https") else None
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # nosec B310
             return resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
@@ -463,9 +491,11 @@ def _fetch_url(url: str, timeout: int = 10) -> str:
             try:
                 reset_ts = exc.headers.get("X-RateLimit-Reset")
                 if reset_ts:
-                    reset_at = datetime.utcfromtimestamp(int(reset_ts))
-            except Exception:
-                pass
+                    reset_at = datetime.fromtimestamp(int(reset_ts), timezone.utc)
+            except Exception as inner_exc:
+                logger.debug(
+                    f"[Update] Failed to parse GitHub rate-limit reset header: {inner_exc}"
+                )
             reset_str = reset_at.strftime("%H:%M UTC") if reset_at else "a short while"
             raise _RateLimitError(
                 f"GitHub API rate limit exceeded — resets at {reset_str}. "
@@ -482,7 +512,7 @@ def _get_latest_tag() -> str:
     tags = json.loads(body)
     for tag in tags:
         name = tag.get("name", "").lstrip("v")
-        if re.match(r'^\d+\.\d+', name):
+        if re.match(r"^\d+\.\d+", name):
             return name
     raise RuntimeError("No semver tags found in repository")
 
@@ -496,10 +526,10 @@ def _branch_is_dynamic(channel: str) -> bool:
         if re.search(r'^version\s*=\s*["\'][0-9]', toml_text, re.MULTILINE):
             return False
         # Dynamic looks like:  dynamic = ["version"]
-        if re.search(r'^dynamic\s*=', toml_text, re.MULTILINE):
+        if re.search(r"^dynamic\s*=", toml_text, re.MULTILINE):
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"[Update] Could not determine channel versioning mode for {channel!r}: {exc}")
     return True  # assume dynamic if we can't tell
 
 
@@ -519,7 +549,7 @@ def _next_dev_version(base_tag: str, ahead_by: int) -> str:
 
 def _parse_dev_number(version_str: str) -> Optional[int]:
     """Extract the dev commit count from a setuptools_scm version like 1.0.6.dev118."""
-    m = re.search(r'\.dev(\d+)', version_str)
+    m = re.search(r"\.dev(\d+)", version_str)
     return int(m.group(1)) if m else None
 
 
@@ -538,7 +568,7 @@ def _cleanup_stale_dist_info(allow_sudo: bool = True) -> None:
     except AttributeError:
         pass
     # Also scan the dedicated venv's site-packages
-    _venv_site = "/opt/pymc_repeater/venv/lib"
+    _venv_site = "/opt/openhop_repeater/venv/lib"
     if os.path.isdir(_venv_site):
         for child in os.listdir(_venv_site):
             sp = os.path.join(_venv_site, child, "site-packages")
@@ -547,7 +577,7 @@ def _cleanup_stale_dist_info(allow_sudo: bool = True) -> None:
 
     pkg_glob = PACKAGE_NAME.replace("-", "_") + "-*.dist-info"
 
-    # Collect {path: version_str} for every pymc_repeater dist-info we find
+    # Collect {path: version_str} for every openhop_repeater dist-info we find
     found: dict = {}
     for site_dir in dirs:
         for meta_dir in glob.glob(os.path.join(site_dir, pkg_glob)):
@@ -567,6 +597,7 @@ def _cleanup_stale_dist_info(allow_sudo: bool = True) -> None:
 
     try:
         from packaging.version import Version
+
         keep = max(found, key=lambda p: Version(found[p]))
     except Exception:
         return  # can't determine winner safely — leave everything alone
@@ -589,11 +620,15 @@ def _cleanup_stale_dist_info(allow_sudo: bool = True) -> None:
             # dist-info is root-owned (pip ran via sudo); use sudo to remove
             try:
                 subprocess.run(
-                    ["sudo", "--non-interactive", "rm", "-rf", path],
-                    check=True, capture_output=True, timeout=10,
-                )
+                    [_SUDO_BIN, "--non-interactive", _RM_BIN, "-rf", path],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                )  # nosec B603
                 logger.info(f"[Update] Removed stale dist-info (sudo): {path} (version {ver})")
-                _state.append_line(f"[pyMC updater] Removed stale dist-info: {os.path.basename(path)}")
+                _state.append_line(
+                    f"[pyMC updater] Removed stale dist-info: {os.path.basename(path)}"
+                )
                 removed_any = True
             except Exception as exc2:
                 logger.warning(f"[Update] Could not remove stale dist-info {path}: {exc2}")
@@ -618,16 +653,15 @@ def _startup_dist_info_cleanup() -> None:
 
 
 def _has_update(installed: str, latest: str) -> bool:
-    """
-
-    """
+    """ """
     if installed == latest:
         return False
     try:
         from packaging.version import Version
+
         return Version(latest) > Version(installed)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"[Update] PEP 440 comparison failed for {installed!r} vs {latest!r}: {exc}")
     # Fallback: dev-number comparison only when base version is identical
     installed_dev = _parse_dev_number(installed)
     latest_dev = _parse_dev_number(latest)
@@ -647,7 +681,8 @@ def _fetch_latest_version(channel: str) -> str:
             data = json.loads(body)
             ahead_by = int(data.get("ahead_by", 0))
             return _next_dev_version(base_tag, ahead_by)
-        except Exception:
+        except Exception as exc:
+            logger.debug(f"[Update] Dynamic version compare failed for {channel!r}: {exc}")
             return base_tag  # fallback: show the tag
 
     # Static version channel — read the pinned version from pyproject.toml on
@@ -658,22 +693,21 @@ def _fetch_latest_version(channel: str) -> str:
         m = re.search(r'^version\s*=\s*["\']([0-9][^"\']*)["\']', toml_text, re.MULTILINE)
         if m:
             return m.group(1)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"[Update] Static version lookup failed for {channel!r}: {exc}")
     return base_tag  # last-resort fallback
 
 
 def _fetch_changelog(channel: str, installed: str, max_commits: int = 50) -> List[dict]:
-
-    base_tag = _get_latest_tag()
-    installed_dev = _parse_dev_number(installed)
-
     try:
+        base_tag = _get_latest_tag()
+        installed_dev = _parse_dev_number(installed)
+
         if _branch_is_dynamic(channel):
             compare_url = f"{GITHUB_API_BASE}/compare/{base_tag}...{channel}?per_page=100"
         else:
             # For static channels compare from the installed tag if we know it
-            from_ref = installed if re.match(r'^\d+\.\d+', installed) else base_tag
+            from_ref = installed if re.match(r"^\d+\.\d+", installed) else base_tag
             compare_url = f"{GITHUB_API_BASE}/compare/{from_ref}...{channel}?per_page=100"
 
         body = _fetch_url(compare_url, timeout=12)
@@ -701,15 +735,17 @@ def _fetch_changelog(channel: str, installed: str, max_commits: int = 50) -> Lis
             )
             date = commit_data.get("author", {}).get("date", "")
             sha = c.get("sha", "")
-            result.append({
-                "sha": sha,
-                "short_sha": sha[:7],
-                "title": title,
-                "body": body_text,
-                "author": author,
-                "date": date,
-                "url": c.get("html_url", ""),
-            })
+            result.append(
+                {
+                    "sha": sha,
+                    "short_sha": sha[:7],
+                    "title": title,
+                    "body": body_text,
+                    "author": author,
+                    "date": date,
+                    "url": c.get("html_url", ""),
+                }
+            )
         return result
     except Exception as exc:
         logger.warning(f"[Update] Changelog fetch failed: {exc}")
@@ -760,27 +796,110 @@ def _migrate_service_unit() -> None:
         logger.info("[Update] Buildroot image detected, skipping systemd unit migration.")
         return
 
-    import subprocess as _sp
-    _SVC_UNIT = "/etc/systemd/system/pymc-repeater.service"
-    _VENV_PYTHON = "/opt/pymc_repeater/venv/bin/python"
+    _SVC_UNIT = "/etc/systemd/system/openhop-repeater.service"
+    _VENV_PYTHON = "/opt/openhop_repeater/venv/bin/python"
     try:
-        _sp.run(["sed", "-i", "/^Environment=.*PYTHONPATH/d", _SVC_UNIT], check=False)
-        _sp.run(
-            ["sed", "-i",
-             "s|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/pymc_repeater|",
-             _SVC_UNIT],
+        subprocess.run([_SED_BIN, "-i", "/^Environment=.*PYTHONPATH/d", _SVC_UNIT], check=False)  # nosec B603
+        subprocess.run(
+            [
+                _SED_BIN,
+                "-i",
+                "s|WorkingDirectory=/opt/openhop_repeater|WorkingDirectory=/var/lib/openhop_repeater|",
+                _SVC_UNIT,
+            ],
             check=False,
-        )
-        _sp.run(
-            ["sed", "-i",
-             f"s|ExecStart=/usr/bin/python3|ExecStart={_VENV_PYTHON}|",
-             _SVC_UNIT],
+        )  # nosec B603
+        subprocess.run(
+            [
+                _SED_BIN,
+                "-i",
+                "s|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|",
+                _SVC_UNIT,
+            ],
             check=False,
-        )
-        _sp.run(["systemctl", "daemon-reload"], check=False)
+        )  # nosec B603
+        subprocess.run(
+            [
+                _SED_BIN,
+                "-i",
+                "s|WorkingDirectory=/var/lib/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|",
+                _SVC_UNIT,
+            ],
+            check=False,
+        )  # nosec B603
+        subprocess.run(
+            [_SED_BIN, "-i", f"s|ExecStart=/usr/bin/python3|ExecStart={_VENV_PYTHON}|", _SVC_UNIT],
+            check=False,
+        )  # nosec B603
+        subprocess.run(
+            [
+                _SED_BIN,
+                "-i",
+                f"s|ExecStart=/opt/pymc_repeater/venv/bin/python|ExecStart={_VENV_PYTHON}|",
+                _SVC_UNIT,
+            ],
+            check=False,
+        )  # nosec B603
+        subprocess.run([_SYSTEMCTL_BIN, "daemon-reload"], check=False)  # nosec B603
         logger.info("[Update] Service unit migration applied (root path).")
     except Exception as exc:
         logger.warning(f"[Update] Service unit migration failed: {exc}")
+
+
+def _migrate_pymc_install_dir() -> None:
+    """Move legacy /opt/pymc_repeater into /opt/openhop_repeater when needed."""
+    if not os.path.isdir(_LEGACY_PYMC_INSTALL_DIR):
+        return
+
+    if not os.path.exists(_INSTALL_DIR):
+        os.rename(_LEGACY_PYMC_INSTALL_DIR, _INSTALL_DIR)
+        _state.append_line(
+            f"[pyMC updater] Migrated legacy install path: {_LEGACY_PYMC_INSTALL_DIR} -> {_INSTALL_DIR}"
+        )
+        return
+
+    backup_path = f"{_LEGACY_PYMC_INSTALL_DIR}.migrated.{time.strftime('%Y%m%d_%H%M%S')}"
+    os.rename(_LEGACY_PYMC_INSTALL_DIR, backup_path)
+    _state.append_line(f"[pyMC updater] Archived legacy install path at {backup_path}")
+
+
+def _cleanup_stale_source_trees() -> None:
+    stale_paths = [
+        "/opt/openhop_repeater/repeater",
+        "/opt/openhop_repeater/openhop_core",
+        "/opt/openhop_repeater/openhop-repeater",
+        "/opt/openhop_repeater/openhop-core",
+        "/opt/pymc_repeater/repeater",
+        "/opt/pymc_repeater/pymc_core",
+        "/opt/pymc_repeater/pymc-repeater",
+        "/opt/pymc_repeater/pymc-core",
+    ]
+
+    removed_any = False
+    for stale_src in stale_paths:
+        if os.path.isdir(stale_src):
+            removed_any = True
+            _state.append_line(f"[pyMC updater] Removing stale source tree: {stale_src}")
+            shutil.rmtree(stale_src, ignore_errors=True)
+
+    if not removed_any:
+        _state.append_line("[pyMC updater] No stale source-tree paths found")
+
+
+def _disable_legacy_services() -> None:
+    legacy_units = ["pymc-repeater", "pymc-repeater.service"]
+
+    for unit in legacy_units:
+        subprocess.run([_SYSTEMCTL_BIN, "stop", unit], check=False)  # nosec B603
+        subprocess.run([_SYSTEMCTL_BIN, "disable", unit], check=False)  # nosec B603
+
+    if os.path.isfile("/etc/systemd/system/pymc-repeater.service"):
+        try:
+            os.remove("/etc/systemd/system/pymc-repeater.service")
+        except OSError:
+            pass
+
+    subprocess.run([_SYSTEMCTL_BIN, "daemon-reload"], check=False)  # nosec B603
 
 
 def _do_install() -> None:
@@ -797,12 +916,13 @@ def _do_install() -> None:
                 text=True,
                 bufsize=1,
                 env=env,
-            )
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    _state.append_line(line)
-                    logger.debug(f"[pip] {line}")
+            )  # nosec B603
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        _state.append_line(line)
+                        logger.debug(f"[pip] {line}")
             proc.wait()
             return proc.returncode == 0
         except Exception as exc:
@@ -811,10 +931,11 @@ def _do_install() -> None:
             return False
 
     import os as _os
+
     env = _os.environ.copy()
     env["SETUPTOOLS_SCM_PRETEND_VERSION"] = _state.latest_version or "1.0.0"
 
-    _VENV_DIR = "/opt/pymc_repeater/venv"
+    _VENV_DIR = "/opt/openhop_repeater/venv"
     _VENV_PIP = os.path.join(_VENV_DIR, "bin", "pip")
     _VENV_PYTHON = os.path.join(_VENV_DIR, "bin", "python")
 
@@ -822,43 +943,47 @@ def _do_install() -> None:
 
     _UPGRADE_WRAPPER = "/usr/local/bin/pymc-do-upgrade"
     _BUILDROOT_UPGRADE_HELPER = _find_buildroot_upgrade_helper()
-    is_root = (_os.geteuid() == 0)
+    is_root = _os.geteuid() == 0
 
     if is_root and is_buildroot():
         env["PYMC_REPEATER_REF"] = channel
         env["PYMC_CORE_REF"] = channel
         if not _BUILDROOT_UPGRADE_HELPER:
-            _state.finish_install(False, "Buildroot upgrade helper not found in repo checkout or image bootstrap paths")
+            _state.finish_install(
+                False,
+                "Buildroot upgrade helper not found in repo checkout or image bootstrap paths",
+            )
             return
-        _state.append_line(f"[pyMC updater] Buildroot image detected – using {_BUILDROOT_UPGRADE_HELPER}")
+        _state.append_line(
+            f"[pyMC updater] Buildroot image detected – using {_BUILDROOT_UPGRADE_HELPER}"
+        )
         cmd = ["/bin/sh", _BUILDROOT_UPGRADE_HELPER, "upgrade"]
     elif is_root:
+        _disable_legacy_services()
+        _migrate_pymc_install_dir()
         _migrate_service_unit()
 
         # Ensure venv exists (migration from system-pip era)
         if not os.path.isfile(_VENV_PYTHON):
             _state.append_line("[pyMC updater] Creating venv (first-time migration)…")
-            _run(["python3", "-m", "venv", "--system-site-packages", _VENV_DIR], env=env)
+            _run(["/usr/bin/python3", "-m", "venv", "--system-site-packages", _VENV_DIR], env=env)
             _run([_VENV_PIP, "install", "--upgrade", "pip", "setuptools", "wheel"], env=env)
 
         # Clean up system-level packages to avoid shadowing
-        _run(["python3", "-m", "pip", "uninstall", "-y", "pymc_repeater"], env=env)
-        _run(["python3", "-m", "pip", "uninstall", "-y", "pymc_core"], env=env)
+        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "openhop_repeater"], env=env)
+        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "openhop_core"], env=env)
+        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "pymc_repeater"], env=env)
+        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "pymc_core"], env=env)
 
-        # Remove stale source tree that could shadow the venv package
-        stale_src = "/opt/pymc_repeater/repeater"
-        if os.path.isdir(stale_src):
-            _state.append_line("[pyMC updater] Removing stale source tree…")
-            import shutil
-            shutil.rmtree(stale_src, ignore_errors=True)
+        # Remove stale source trees that could shadow the venv package
+        _cleanup_stale_source_trees()
 
-        install_spec = (
-            f"pymc_repeater[hardware] @ git+https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git@{channel}"
-        )
-        _state.append_line(f"[pyMC updater] Running as root – venv pip install")
+        install_spec = f"openhop_repeater[hardware] @ git+https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git@{channel}"
+        _state.append_line("[pyMC updater] Running as root – venv pip install")
         _state.append_line(f"[pyMC updater] Target: {install_spec}")
         cmd = [
-            _VENV_PIP, "install",
+            _VENV_PIP,
+            "install",
             "--upgrade",
             "--no-cache-dir",
             install_spec,
@@ -866,7 +991,7 @@ def _do_install() -> None:
     elif _os.path.isfile(_UPGRADE_WRAPPER):
         _state.append_line(f"[pyMC updater] Using sudo wrapper: {_UPGRADE_WRAPPER}")
         # The wrapper handles venv creation/migration internally
-        cmd = ["sudo", _UPGRADE_WRAPPER, channel, _state.latest_version or ""]
+        cmd = [_SUDO_BIN, _UPGRADE_WRAPPER, channel, _state.latest_version or ""]
     else:
         msg = (
             f"Upgrade wrapper not found at {_UPGRADE_WRAPPER}. "
@@ -885,6 +1010,7 @@ def _do_install() -> None:
         restart_msg = "Restart not attempted"
         try:
             from repeater.service_utils import restart_service
+
             restart_ok, restart_msg = restart_service()
             logger.info(f"[Update] Post-upgrade restart: {restart_msg}")
         except Exception as exc:
@@ -897,9 +1023,13 @@ def _do_install() -> None:
                     f"Upgraded to latest on channel '{channel}' – {get_container_restart_message()}",
                 )
             else:
-                _state.finish_install(True, f"Upgraded to latest on channel '{channel}' – service restarted")
+                _state.finish_install(
+                    True, f"Upgraded to latest on channel '{channel}' – service restarted"
+                )
         else:
-            _state.finish_install(False, f"Upgrade succeeded but service restart failed: {restart_msg}")
+            _state.finish_install(
+                False, f"Upgrade succeeded but service restart failed: {restart_msg}"
+            )
     else:
         _state.finish_install(False, "pip install failed – see progress log for details")
 
@@ -911,13 +1041,15 @@ _startup_dist_info_cleanup()
 # CherryPy Endpoint class
 # ---------------------------------------------------------------------------
 
-class UpdateAPIEndpoints:
 
+class UpdateAPIEndpoints:
     def _set_cors_headers(self, config: dict) -> None:
         if config.get("web", {}).get("cors_enabled", False):
             cherrypy.response.headers["Access-Control-Allow-Origin"] = "*"
             cherrypy.response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            cherrypy.response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            cherrypy.response.headers["Access-Control-Allow-Headers"] = (
+                "Content-Type, Authorization"
+            )
 
     def _require_post(self):
         if cherrypy.request.method != "POST":
@@ -963,8 +1095,8 @@ class UpdateAPIEndpoints:
         body = {}
         try:
             body = cherrypy.request.json or {}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[Update] Ignoring non-JSON update check payload: {exc}")
         force = bool(body.get("force", False))
 
         # Honour the cache to avoid hammering GitHub (unless forced)
@@ -982,17 +1114,19 @@ class UpdateAPIEndpoints:
 
         # Respect GitHub rate-limit backoff window
         if not force and _state.rate_limit_until is not None:
-            remaining = (_state.rate_limit_until - datetime.utcnow()).total_seconds()
+            remaining = (_state.rate_limit_until - datetime.now(timezone.utc)).total_seconds()
             if remaining > 0:
                 reset_str = _state.rate_limit_until.strftime("%H:%M UTC")
-                return self._ok({
-                    "message": f"GitHub rate limit active — resets at {reset_str}",
-                    "state": snap["state"],
-                    **snap,
-                })
+                return self._ok(
+                    {
+                        "message": f"GitHub rate limit active — resets at {reset_str}",
+                        "state": snap["state"],
+                        **snap,
+                    }
+                )
 
         if not force and snap["last_checked"] is not None:
-            age = (datetime.utcnow() - _state.last_checked).total_seconds()
+            age = (datetime.now(timezone.utc) - _state.last_checked).total_seconds()
             if age < CHECK_CACHE_TTL and snap["latest_version"] is not None:
                 return self._ok({"message": "Using cached result", "state": snap["state"], **snap})
 
@@ -1024,8 +1158,8 @@ class UpdateAPIEndpoints:
         body = {}
         try:
             body = cherrypy.request.json or {}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[Update] Ignoring non-JSON update install payload: {exc}")
 
         snap = _state.snapshot()
 
@@ -1038,7 +1172,7 @@ class UpdateAPIEndpoints:
             if snap["latest_version"] is not None:
                 return self._err(
                     f"Already up to date ({snap['current_version']}). "
-                    "Pass {\"force\": true} to reinstall anyway.",
+                    'Pass {"force": true} to reinstall anyway.',
                     409,
                 )
 
@@ -1048,14 +1182,14 @@ class UpdateAPIEndpoints:
             return self._err("Could not start install thread – check state", 409)
 
         t.start()
-        logger.warning(
-            f"[Update] Install triggered via API – channel={_state.channel}"
+        logger.warning(f"[Update] Install triggered via API – channel={_state.channel}")
+        return self._ok(
+            {
+                "message": f"Update started on channel '{_state.channel}'. "
+                "Watch /api/update/progress for live output.",
+                "state": "installing",
+            }
         )
-        return self._ok({
-            "message": f"Update started on channel '{_state.channel}'. "
-                       "Watch /api/update/progress for live output.",
-            "state": "installing",
-        })
 
     # ------------------------------------------------------------------ #
     # GET /api/update/progress  (SSE)                                     #
@@ -1095,11 +1229,13 @@ class UpdateAPIEndpoints:
 
                     # Terminate stream when install completes or errors
                     if current_state in ("complete", "error") and last_idx >= len(current_lines):
-                        done_payload = json.dumps({
-                            "type": "done",
-                            "state": current_state,
-                            "error": snap.get("error"),
-                        })
+                        done_payload = json.dumps(
+                            {
+                                "type": "done",
+                                "state": current_state,
+                                "error": snap.get("error"),
+                            }
+                        )
                         yield f"data: {done_payload}\n\n"
                         return
 
@@ -1133,10 +1269,12 @@ class UpdateAPIEndpoints:
             return ""
 
         branch_list = _fetch_branches()
-        return self._ok({
-            "channels": branch_list,
-            "current_channel": _state.channel,
-        })
+        return self._ok(
+            {
+                "channels": branch_list,
+                "current_channel": _state.channel,
+            }
+        )
 
     # ------------------------------------------------------------------ #
     # POST /api/update/set_channel                                         #
@@ -1157,8 +1295,8 @@ class UpdateAPIEndpoints:
         body = {}
         try:
             body = cherrypy.request.json or {}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[Update] Ignoring non-JSON update channel payload: {exc}")
 
         channel = str(body.get("channel", "")).strip()
         if not channel:
@@ -1169,10 +1307,12 @@ class UpdateAPIEndpoints:
 
         _state.set_channel(channel)
         logger.info(f"[Update] Channel changed to '{channel}' via API")
-        return self._ok({
-            "channel": channel,
-            "message": f"Channel switched to '{channel}'. Run /api/update/check to verify.",
-        })
+        return self._ok(
+            {
+                "channel": channel,
+                "message": f"Channel switched to '{channel}'. Run /api/update/check to verify.",
+            }
+        )
 
     # ------------------------------------------------------------------ #
     # GET /api/update/changelog                                            #
@@ -1194,10 +1334,17 @@ class UpdateAPIEndpoints:
         installed = snap["current_version"]
         latest = snap["latest_version"] or ""
 
-        commits = _fetch_changelog(channel, installed, max_commits)
-        return self._ok({
-            "channel": channel,
-            "installed": installed,
-            "latest": latest,
-            "commits": commits,
-        })
+        try:
+            commits = _fetch_changelog(channel, installed, max_commits)
+        except Exception as exc:
+            logger.warning(f"[Update] Changelog endpoint fallback due to GitHub error: {exc}")
+            commits = []
+
+        return self._ok(
+            {
+                "channel": channel,
+                "installed": installed,
+                "latest": latest,
+                "commits": commits,
+            }
+        )

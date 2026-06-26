@@ -16,7 +16,6 @@ import yaml
 
 from repeater.web.api_endpoints import APIEndpoints
 
-
 # Minimal initial config.yaml the wizard writes into.
 _BASE_CONFIG = {
     "repeater": {"node_name": "mesh-repeater-01", "security": {"admin_password": "admin123"}},
@@ -66,11 +65,11 @@ def wizard_env(tmp_path, monkeypatch):
     # config has no explicit storage_dir set — that's exactly what we want
     # so the wizard finds our radio-settings.json next to config.yaml.
     config = {
+        "storage_dir": str(tmp_path),
         "repeater": {
-            "storage_dir": str(tmp_path),
             "node_name": "mesh-repeater-01",
             "security": {"admin_password": "admin123"},
-        }
+        },
     }
     endpoints = APIEndpoints(config=config, config_path=str(config_path))
 
@@ -232,3 +231,15 @@ def test_wizard_rejected_after_setup_complete(wizard_env):
 
     assert result["success"] is False
     assert "already complete" in result["error"].lower()
+
+
+def test_wizard_rejects_short_admin_password(wizard_env):
+    _tmp_path, _config_path, endpoints, set_request = wizard_env
+
+    body = dict(_BASE_REQUEST, hardware_key="pymc_tcp", admin_password="short7")
+    set_request(body)
+
+    result = endpoints.setup_wizard()
+
+    assert result["success"] is False
+    assert "at least 8 characters" in result["error"]

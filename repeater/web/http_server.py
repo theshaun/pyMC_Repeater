@@ -1,8 +1,10 @@
 import json
 import logging
 import os
+import queue
 import re
 import secrets
+import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -10,15 +12,13 @@ from typing import Callable, Optional
 
 import cherrypy
 import cherrypy_cors
-from pymc_core.protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
 
-from repeater import __version__
 from repeater.config import resolve_storage_dir
 from repeater.data_acquisition import SQLiteHandler
 
 from .api_endpoints import APIEndpoints
-from .auth import cherrypy_tool  # Import to register the tool
 from .auth.api_tokens import APITokenManager
+from .auth.cherrypy_tool import register_require_auth_tool
 from .auth.jwt_handler import JWTHandler
 from .auth_endpoints import AuthEndpoints
 
@@ -26,10 +26,11 @@ from .auth_endpoints import AuthEndpoints
 try:
     from repeater.data_acquisition.websocket_handler import (
         PacketWebSocket,
-        broadcast_packet,
         init_websocket,
     )
-    from .companion_ws_proxy import CompanionFrameWebSocket, set_daemon as _set_companion_daemon
+
+    from .companion_ws_proxy import CompanionFrameWebSocket
+    from .companion_ws_proxy import set_daemon as _set_companion_daemon
 
     WEBSOCKET_AVAILABLE = True
 except ImportError:
@@ -42,29 +43,108 @@ logger = logging.getLogger("HTTPServer")
 
 # In-memory log buffer
 class LogBuffer(logging.Handler):
+    _SECRET_PATTERNS = (
+        re.compile(
+            r"(?i)\b(admin_password|guest_password|password|passwd|api[_-]?key|token|jwt_secret)\b(\s*[:=]\s*)(['\"]?)([^,'\"\s]+)(['\"]?)"
+        ),
+        re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._-]+"),
+    )
 
     def __init__(self, max_lines=100):
         super().__init__()
         self.logs = deque(maxlen=max_lines)
+        self._next_id = 1
+        self._lock = threading.Lock()
+        self._subscribers = []
         self.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+
+    @classmethod
+    def _sanitize_log_text(cls, text: str) -> str:
+        if not text:
+            return ""
+
+        sanitized = text
+
+        def _replace_secret(match: re.Match) -> str:
+            key = match.group(1)
+            sep = match.group(2)
+            quote_start = match.group(3) or ""
+            quote_end = match.group(5) or quote_start
+            return f"{key}{sep}{quote_start}[REDACTED]{quote_end}"
+
+        sanitized = cls._SECRET_PATTERNS[0].sub(_replace_secret, sanitized)
+        sanitized = cls._SECRET_PATTERNS[1].sub("Bearer [REDACTED]", sanitized)
+        return sanitized
 
     def emit(self, record):
 
         try:
-            msg = self.format(record)
-            self.logs.append(
-                {
-                    "message": msg,
-                    "timestamp": datetime.fromtimestamp(record.created).isoformat(),
-                    "level": record.levelname,
-                }
-            )
+            formatted_message = self._sanitize_log_text(self.format(record))
+            entry = {
+                "id": self._next_log_id(),
+                "message": formatted_message,
+                "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+                "level": record.levelname,
+                "logger": record.name,
+                "module": record.module,
+                "pathname": record.pathname,
+                "line": record.lineno,
+                "thread": record.threadName,
+                "process": record.processName,
+            }
+
+            if record.exc_info:
+                formatter = self.formatter or logging.Formatter()
+                entry["exception"] = self._sanitize_log_text(
+                    formatter.formatException(record.exc_info)
+                )
+
+            with self._lock:
+                self.logs.append(entry)
+                dead_subscribers = []
+                for subscriber in self._subscribers:
+                    try:
+                        subscriber.put_nowait(entry)
+                    except Exception:
+                        dead_subscribers.append(subscriber)
+
+                if dead_subscribers:
+                    self._subscribers = [
+                        subscriber
+                        for subscriber in self._subscribers
+                        if subscriber not in dead_subscribers
+                    ]
         except Exception:
             self.handleError(record)
 
+    def _next_log_id(self):
+        with self._lock:
+            next_id = self._next_id
+            self._next_id += 1
+            return next_id
+
+    def snapshot(self, since_id=None):
+        with self._lock:
+            records = list(self.logs)
+
+        if since_id is None:
+            return records
+
+        return [record for record in records if record.get("id", 0) > since_id]
+
+    def subscribe(self):
+        subscriber = queue.Queue()
+        with self._lock:
+            self._subscribers.append(subscriber)
+        return subscriber
+
+    def unsubscribe(self, subscriber):
+        with self._lock:
+            self._subscribers = [item for item in self._subscribers if item is not subscriber]
+
 
 # Global log buffer instance
-_log_buffer = LogBuffer(max_lines=100)
+_log_buffer = LogBuffer(max_lines=1000)
 
 
 class DocEndpoint:
@@ -107,7 +187,6 @@ class DocEndpoint:
 
 
 class StatsApp:
-
     def __init__(
         self,
         stats_getter: Optional[Callable] = None,
@@ -165,7 +244,12 @@ class StatsApp:
             raise cherrypy.NotFound()
 
         # Handle WebSocket routes
-        if args and len(args) >= 2 and args[0] == "ws" and args[1] in ("packets", "companion_frame"):
+        if (
+            args
+            and len(args) >= 2
+            and args[0] == "ws"
+            and args[1] in ("packets", "companion_frame")
+        ):
             # WebSocket tool will intercept this
             return ""
 
@@ -174,10 +258,9 @@ class StatsApp:
 
 
 class HTTPStatsServer:
-
     def __init__(
         self,
-        host: str = "0.0.0.0",
+        host: str = "0.0.0.0",  # nosec B104 - intentional default for service exposure
         port: int = 8000,
         stats_getter: Optional[Callable] = None,
         node_name: str = "Repeater",
@@ -288,6 +371,7 @@ class HTTPStatsServer:
     def start(self):
 
         try:
+            register_require_auth_tool()
 
             if self._cors_enabled:
                 self._setup_server_cors()

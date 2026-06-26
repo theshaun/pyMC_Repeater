@@ -1,7 +1,7 @@
 """
 Repeater-specific CompanionFrameServer with SQLite persistence.
 
-Thin subclass of :class:`pymc_core.companion.frame_server.CompanionFrameServer`
+Thin subclass of :class:`openhop_core.companion.frame_server.CompanionFrameServer`
 that adds SQLite-backed message, contact, and channel persistence via a
 ``sqlite_handler`` dependency.
 """
@@ -12,9 +12,9 @@ import asyncio
 import logging
 from typing import Optional
 
-from pymc_core.companion.constants import RESP_CODE_NO_MORE_MESSAGES
-from pymc_core.companion.frame_server import CompanionFrameServer as _BaseFrameServer
-from pymc_core.companion.models import QueuedMessage
+from openhop_core.companion.constants import RESP_CODE_NO_MORE_MESSAGES
+from openhop_core.companion.frame_server import CompanionFrameServer as _BaseFrameServer
+from openhop_core.companion.models import QueuedMessage
 
 logger = logging.getLogger("CompanionFrameServer")
 
@@ -32,8 +32,8 @@ class CompanionFrameServer(_BaseFrameServer):
         bridge,
         companion_hash: str,
         port: int = 5000,
-        bind_address: str = "0.0.0.0",
-        client_idle_timeout_sec: Optional[int] = 8 * 60 * 60, # 8 hours
+        bind_address: str = "0.0.0.0",  # nosec B104 - intentional default for LAN reachability
+        client_idle_timeout_sec: Optional[int] = 8 * 60 * 60,  # 8 hours
         sqlite_handler=None,
         local_hash: Optional[int] = None,
         stats_getter=None,
@@ -45,8 +45,8 @@ class CompanionFrameServer(_BaseFrameServer):
             port=port,
             bind_address=bind_address,
             client_idle_timeout_sec=client_idle_timeout_sec,
-            device_model="pyMC-Repeater-Companion",
-            device_version=None,  # use FIRMWARE_VER_CODE from pyMC_core
+            device_model="openHop-Repeater-Companion",
+            device_version=None,  # use FIRMWARE_VER_CODE from openhop-core
             build_date="13 Feb 2026",
             local_hash=local_hash,
             stats_getter=stats_getter,
@@ -59,13 +59,23 @@ class CompanionFrameServer(_BaseFrameServer):
     # -----------------------------------------------------------------
 
     async def _persist_companion_message(self, msg_dict: dict) -> None:
-        """Persist message to SQLite and pop from bridge queue."""
+        """Persist message to SQLite and pop from bridge queue.
+
+        The bridge's ``offline_queue_size`` (``message_queue._max_size``) doubles
+        as the SQLite retention limit: 0 disables offline storage entirely, so the
+        message is dropped instead of persisted.
+        """
         if not self.sqlite_handler:
+            return
+        retention = getattr(self.bridge.message_queue, "_max_size", None)
+        if retention == 0:
+            self.bridge.message_queue.pop_last()
             return
         await asyncio.to_thread(
             self.sqlite_handler.companion_push_message,
             self.companion_hash,
             msg_dict,
+            retention,
         )
         self.bridge.message_queue.pop_last()
 

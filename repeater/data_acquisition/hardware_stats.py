@@ -12,17 +12,17 @@ except ImportError:
     psutil = None
 
 import logging
+import platform
 import time
 
 logger = logging.getLogger("HardwareStats")
 
 
 class HardwareStatsCollector:
-    
     def __init__(self):
 
         self.start_time = time.time()
-    
+
     def get_stats(self):
 
         if not PSUTIL_AVAILABLE:
@@ -32,13 +32,12 @@ class HardwareStatsCollector:
         try:
             # Get current timestamp
             now = time.time()
-            uptime = now - self.start_time
-            
+
             # CPU stats
             cpu_percent = psutil.cpu_percent(interval=0.1)
             cpu_count = psutil.cpu_count()
             cpu_freq = psutil.cpu_freq()
-            
+
             # Memory stats
             memory = psutil.virtual_memory()
 
@@ -47,7 +46,7 @@ class HardwareStatsCollector:
 
             # Network stats (total across all interfaces)
             net_io = psutil.net_io_counters()
-            
+
             # Load average (Unix only)
             load_avg = None
             try:
@@ -55,11 +54,12 @@ class HardwareStatsCollector:
             except (AttributeError, OSError):
                 # Not available on all systems - use zeros
                 load_avg = (0.0, 0.0, 0.0)
-            
+
             # System boot time
             boot_time = psutil.boot_time()
             system_uptime = now - boot_time
-            
+            system_info = self._get_system_info()
+
             # Temperature (if available)
             temperatures = {}
             try:
@@ -71,7 +71,7 @@ class HardwareStatsCollector:
             except (AttributeError, OSError):
                 # Temperature sensors not available
                 pass
-            
+
             # Format data structure to match Vue component expectations
             stats = {
                 "cpu": {
@@ -98,18 +98,43 @@ class HardwareStatsCollector:
                     "packets_sent": net_io.packets_sent,
                     "packets_recv": net_io.packets_recv,
                 },
-                "system": {"uptime": system_uptime, "boot_time": boot_time},
+                "system": {
+                    "uptime": system_uptime,
+                    "boot_time": boot_time,
+                    "os": system_info["os"],
+                    "kernel": system_info["kernel"],
+                    "arch": system_info["arch"],
+                },
             }
 
             # Add temperatures if available
             if temperatures:
                 stats["temperatures"] = temperatures
-            
+
             return stats
 
         except Exception as e:
             logger.error(f"Error collecting hardware stats: {e}")
             return {"error": str(e)}
+
+    @staticmethod
+    def _get_system_info(os_release_path="/etc/os-release"):
+        os_name = None
+        try:
+            with open(os_release_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    key, sep, value = line.partition("=")
+                    if sep and key == "PRETTY_NAME":
+                        os_name = value.strip().strip('"')
+                        break
+        except OSError:
+            os_name = None
+
+        return {
+            "os": os_name or platform.system(),
+            "kernel": platform.release(),
+            "arch": platform.machine(),
+        }
 
     def get_processes_summary(self, limit=10):
         """

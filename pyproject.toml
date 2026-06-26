@@ -3,22 +3,21 @@ requires = ["setuptools>=61.0", "wheel", "setuptools_scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pymc_repeater"
+name = "openhop_repeater"
 dynamic = ["version"]
 authors = [
-    {name = "Rightup", email = "rightup@pymc.dev"},
+    {name = "Rightup", email = "rightup@openhop.dev"},
 ]
 description = "PyMC Repeater Daemon"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -30,7 +29,7 @@ keywords = ["mesh", "networking", "lora", "repeater", "daemon", "iot"]
 
 
 dependencies = [
-    "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev",
+    "openhop_core[hardware]",
     "pyyaml>=6.0.0",
     "cherrypy>=18.0.0",
     "paho-mqtt>=1.6.0",
@@ -46,7 +45,7 @@ dependencies = [
 [project.optional-dependencies]
 # SX1262/SPI support (Linux only; required for Raspberry Pi HATs)
 hardware = [
-    "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev",
+    "openhop_core[hardware]",
 ]
 # RRD metrics (Performance Metrics chart); system librrd required (e.g. apt install rrdtool)
 rrd = [
@@ -55,13 +54,12 @@ rrd = [
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
-    "black>=23.0.0",
-    "isort>=5.12.0",
+    "ruff>=0.15.14",
     "mypy>=1.7.0",
 ]
 
 [project.scripts]
-pymc-repeater = "repeater.main:main"
+openhop-repeater = "repeater.main:main"
 pymc-cli = "repeater.local_cli:main"
 
 [tool.setuptools.packages.find]
@@ -78,13 +76,12 @@ repeater = [
     "presets/*.yaml",
 ]
 
-[tool.black]
+[tool.ruff]
 line-length = 100
-target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+target-version = "py39"
 
-[tool.isort]
-profile = "black"
-line_length = 100
+[tool.ruff.lint]
+extend-ignore = ["E701"]
 
 [tool.setuptools_scm]
 version_scheme = "guess-next-dev"

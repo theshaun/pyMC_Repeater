@@ -1,5 +1,5 @@
 #!/bin/bash
-# Convert MeshCore firmware 64-byte private key to pyMC_Repeater format
+# Convert MeshCore firmware 64-byte private key to openhop-repeater format
 #
 # Usage: sudo ./convert_firmware_key.sh <64-byte-hex-key> [--output-format=<yaml|identity>] [config-path]
 # Example: sudo ./convert_firmware_key.sh 987BDA619630197351F2B3040FD19B2EE0DEE357DD69BBEEE295786FA78A4D5F298B0BF1B7DE73CBC23257CDB2C562F5033DF58C232916432948B0F6BA4448F2
@@ -12,18 +12,18 @@ if [ $# -eq 0 ]; then
     echo "Usage: sudo $0 <64-byte-hex-key> [--output-format=<yaml|identity>] [config-path]"
     echo ""
     echo "This script imports a 64-byte MeshCore firmware private key into"
-    echo "pyMC_Repeater for full identity compatibility."
+    echo "openhop-repeater for full identity compatibility."
     echo ""
     echo "The 64-byte key format: [32-byte scalar][32-byte nonce]"
     echo "  - Enables same node address as firmware device"
     echo "  - Supports signing using MeshCore/orlp ed25519 algorithm"
-    echo "  - Fully compatible with pyMC_core LocalIdentity"
+    echo "  - Fully compatible with openhop-core LocalIdentity"
     echo ""
     echo "Arguments:"
     echo "  --output-format: Optional output format (yaml|identity, default: yaml)"
     echo "    yaml     - Store in config.yaml (embedded binary)"
     echo "    identity - Save to identity.key file (base64 encoded)"
-    echo "  config-path: Optional path to config.yaml (default: /etc/pymc_repeater/config.yaml)"
+    echo "  config-path: Optional path to config.yaml (default: /etc/openhop_repeater/config.yaml)"
     echo ""
     echo "Examples:"
     echo "  # Save to config.yaml (default)"
@@ -67,7 +67,7 @@ fi
 
 # Set default config path if not provided
 if [ -z "$CONFIG_PATH" ]; then
-    CONFIG_PATH="/etc/pymc_repeater/config.yaml"
+    CONFIG_PATH="/etc/openhop_repeater/config.yaml"
 fi
 
 # Validate hex string
@@ -92,7 +92,7 @@ if [ "$OUTPUT_FORMAT" = "yaml" ]; then
     fi
 else
     # For identity format, use system-wide location matching config.yaml
-    IDENTITY_DIR="/etc/pymc_repeater"
+    IDENTITY_DIR="/etc/openhop_repeater"
     IDENTITY_PATH="$IDENTITY_DIR/identity.key"
 fi
 
@@ -261,39 +261,39 @@ fi
 
 # Offer to restart service (only relevant for yaml format)
 if [ "$OUTPUT_FORMAT" = "yaml" ]; then
-    if systemctl is-active --quiet pymc-repeater 2>/dev/null; then
-        read -p "Restart pymc-repeater service now? (yes/no): " RESTART
+    if systemctl is-active --quiet openhop-repeater 2>/dev/null; then
+        read -p "Restart openhop-repeater service now? (yes/no): " RESTART
         if [ "$RESTART" = "yes" ]; then
-            systemctl restart pymc-repeater
+            systemctl restart openhop-repeater
             echo "✓ Service restarted"
             echo ""
             echo "Check logs for new identity:"
-            echo "  sudo journalctl -u pymc-repeater -f | grep -i 'identity\|hash'"
+            echo "  sudo journalctl -u openhop-repeater -f | grep -i 'identity\|hash'"
         else
             echo "Remember to restart the service:"
-            echo "  sudo systemctl restart pymc-repeater"
+            echo "  sudo systemctl restart openhop-repeater"
         fi
     else
-        echo "Note: pymc-repeater service is not running"
-        echo "Start it with: sudo systemctl start pymc-repeater"
+        echo "Note: openhop-repeater service is not running"
+        echo "Start it with: sudo systemctl start openhop-repeater"
     fi
 else
     echo "Identity key saved to file."
     echo ""
-    if systemctl is-active --quiet pymc-repeater 2>/dev/null; then
-        read -p "Restart pymc-repeater service now? (yes/no): " RESTART
+    if systemctl is-active --quiet openhop-repeater 2>/dev/null; then
+        read -p "Restart openhop-repeater service now? (yes/no): " RESTART
         if [ "$RESTART" = "yes" ]; then
-            systemctl restart pymc-repeater
+            systemctl restart openhop-repeater
             echo "✓ Service restarted"
             echo ""
             echo "Check logs for new identity:"
-            echo "  sudo journalctl -u pymc-repeater -f | grep -i 'identity\|hash'"
+            echo "  sudo journalctl -u openhop-repeater -f | grep -i 'identity\|hash'"
         else
             echo "Remember to restart the service:"
-            echo "  sudo systemctl restart pymc-repeater"
+            echo "  sudo systemctl restart openhop-repeater"
         fi
     else
-        echo "Note: pymc-repeater service is not running"
-        echo "Start it with: sudo systemctl start pymc-repeater"
+        echo "Note: openhop-repeater service is not running"
+        echo "Start it with: sudo systemctl start openhop-repeater"
     fi
 fi

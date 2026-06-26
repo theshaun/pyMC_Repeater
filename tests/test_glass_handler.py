@@ -4,8 +4,11 @@ import json
 import time
 from pathlib import Path
 import pytest
+import yaml
 
-_MODULE_PATH = Path(__file__).resolve().parents[1] / "repeater" / "data_acquisition" / "glass_handler.py"
+_MODULE_PATH = (
+    Path(__file__).resolve().parents[1] / "repeater" / "data_acquisition" / "glass_handler.py"
+)
 _SPEC = importlib.util.spec_from_file_location("repeater_glass_handler", _MODULE_PATH)
 _MODULE = importlib.util.module_from_spec(_SPEC)
 assert _SPEC and _SPEC.loader
@@ -20,7 +23,8 @@ class _DummyIdentity:
 
 
 class _DummyConfigManager:
-    def __init__(self):
+    def __init__(self, config_path="/tmp/config.yaml"):
+        self.config_path = config_path
         self.calls = []
 
     def update_and_save(self, updates, live_update=True, live_update_sections=None):
@@ -45,7 +49,10 @@ class _DummyConfigManager:
 class _DummyDaemon:
     def __init__(self):
         self.local_identity = _DummyIdentity()
-        self.repeater_handler = type("RH", (), {"start_time": time.time() - 60})()
+        self.repeater_handler = type(
+            "RH", (), {"start_time": time.time() - 60, "policy_engine": None}
+        )()
+        self.sensor_manager = None
 
     @staticmethod
     def get_stats():
@@ -65,6 +72,32 @@ class _DummyDaemon:
     @staticmethod
     async def send_advert():
         return True
+
+
+class _DummySensorManager:
+    def __init__(self, summary=None, error=None):
+        self.summary = summary or {
+            "enabled": True,
+            "poll_interval_seconds": 30.0,
+            "configured": 1,
+            "loaded": 1,
+            "running": True,
+            "readings": [
+                {
+                    "name": "ups-main",
+                    "type": "waveshare_ups_d",
+                    "ok": True,
+                    "timestamp": "2026-06-20T12:00:00+00:00",
+                    "data": {"battery_percent": 87.5, "current_ma": 120.0},
+                }
+            ],
+        }
+        self.error = error
+
+    def get_summary(self):
+        if self.error:
+            raise self.error
+        return self.summary
 
 
 class _DummyMqttClient:
@@ -197,13 +230,39 @@ def test_build_inform_payload_contains_expected_fields():
     assert payload["node_name"] == "mesh-repeater-01"
     assert payload["pubkey"].startswith("0x")
     assert payload["config_hash"].startswith("sha256:")
-    assert payload["location"] == "51.907400,-0.157800"
+    assert payload["location"] == "51.507400,-0.127800"
     assert payload["radio"]["frequency"] == 869618000
     assert payload["counters"]["duplicates"] == 4
-    assert payload["settings"]["repeater"]["location"] == "51.9074,-0.1570"
+    assert payload["settings"]["repeater"]["location"] == "51.5074,-0.1278"
     assert payload["settings"]["repeater"]["identity_key"] == "<redacted>"
     assert payload["settings"]["glass"]["mqtt_password"] == "<redacted>"
     assert payload["command_results"][0]["command_id"] == "cmd-1"
+
+
+def test_build_inform_payload_includes_sensors_when_manager_exists():
+    config = _make_config()
+    daemon = _DummyDaemon()
+    daemon.sensor_manager = _DummySensorManager()
+    manager = _DummyConfigManager()
+    handler = GlassHandler(config=config, daemon_instance=daemon, config_manager=manager)
+
+    payload = asyncio.run(handler._build_inform_payload())
+
+    assert payload["sensors"]["enabled"] is True
+    assert payload["sensors"]["readings"][0]["data"]["battery_percent"] == 87.5
+
+
+def test_build_inform_payload_reports_sensor_summary_error():
+    config = _make_config()
+    daemon = _DummyDaemon()
+    daemon.sensor_manager = _DummySensorManager(error=RuntimeError("i2c unavailable"))
+    manager = _DummyConfigManager()
+    handler = GlassHandler(config=config, daemon_instance=daemon, config_manager=manager)
+
+    payload = asyncio.run(handler._build_inform_payload())
+
+    assert payload["sensors"]["running"] is False
+    assert "i2c unavailable" in payload["sensors"]["error"]
 
 
 def test_execute_set_mode_command_updates_config():
@@ -212,11 +271,169 @@ def test_execute_set_mode_command_updates_config():
     manager = _DummyConfigManager()
     handler = GlassHandler(config=config, daemon_instance=daemon, config_manager=manager)
 
-    ok, message = asyncio.run(handler._execute_command_action("set_mode", {"mode": "monitor"}))
+    ok, message, details = asyncio.run(
+        handler._execute_command_action("set_mode", {"mode": "monitor"})
+    )
     assert ok is True
     assert "Config patched" in message
+    assert details is None
     assert manager.calls
     assert manager.calls[-1]["updates"]["repeater"]["mode"] == "monitor"
+
+
+def test_execute_policy_sync_validate_only_does_not_write_or_apply_runtime(tmp_path):
+    config = _make_config()
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("repeater: {node_name: test}\n", encoding="utf-8")
+    daemon = _DummyDaemon()
+    manager = _DummyConfigManager(config_path=str(cfg_path))
+    handler = GlassHandler(config=config, daemon_instance=daemon, config_manager=manager)
+
+    ok, message, details = asyncio.run(
+        handler._execute_command_action(
+            "policy_sync",
+            {
+                "policy": {
+                    "enabled": True,
+                    "default_action": "allow",
+                    "rules": [{"id": 1, "if": {"all": []}, "then": {"action": "drop"}}],
+                },
+                "validate_only": True,
+            },
+        )
+    )
+
+    assert ok is True
+    assert message == "Policy validated"
+    assert details["validate_only"] is True
+    assert details["rule_count"] == 1
+    assert not (tmp_path / "policy.yaml").exists()
+    assert "policy_engine" not in config
+    assert daemon.repeater_handler.policy_engine is None
+
+
+def test_execute_policy_sync_replace_writes_wrapper_preserves_groups_and_applies_runtime(tmp_path):
+    config = _make_config()
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("repeater: {node_name: test}\n", encoding="utf-8")
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(
+        yaml.safe_dump(
+            {
+                "policy_engine": {"enabled": False, "default_action": "allow", "rules": []},
+                "groups": {
+                    "channel_hashes": [
+                        {
+                            "id": "ops_channels",
+                            "friendly_name": "Ops Channels",
+                            "entries": [{"id": "ops", "value": "0x12"}],
+                        }
+                    ],
+                    "pubkeys": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    daemon = _DummyDaemon()
+    manager = _DummyConfigManager(config_path=str(cfg_path))
+    handler = GlassHandler(config=config, daemon_instance=daemon, config_manager=manager)
+
+    ok, message, details = asyncio.run(
+        handler._execute_command_action(
+            "policy_sync",
+            {
+                "policy": {
+                    "enabled": True,
+                    "default_action": "allow",
+                    "rules": [
+                        {
+                            "id": 7,
+                            "if": {
+                                "all": [
+                                    {
+                                        "field": "channel_hash",
+                                        "op": "in",
+                                        "value": "@channel_hash_groups.ops_channels",
+                                    }
+                                ]
+                            },
+                            "then": {"action": "drop"},
+                        }
+                    ],
+                },
+                "mode": "replace",
+            },
+        )
+    )
+
+    assert ok is True
+    assert message == "Policy synchronized"
+    assert details["enabled"] is True
+    loaded = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+    assert loaded["policy_engine"]["enabled"] is True
+    assert loaded["groups"]["channel_hashes"][0]["id"] == "ops_channels"
+    assert loaded["policy_engine"]["objects"]["channel_hash_groups"]["ops_channels"] == ["0x12"]
+    assert config["policy_engine"]["enabled"] is True
+    assert daemon.repeater_handler.policy_engine is not None
+
+
+def test_execute_policy_sync_patch_preserves_unspecified_policy_fields(tmp_path):
+    config = _make_config()
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("repeater: {node_name: test}\n", encoding="utf-8")
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(
+        yaml.safe_dump(
+            {
+                "policy_engine": {
+                    "enabled": False,
+                    "default_action": "drop",
+                    "rules": [{"id": "keep", "if": {"all": []}, "then": {"action": "allow"}}],
+                    "objects": {"custom": {"values": ["a"]}},
+                },
+                "groups": {"channel_hashes": [], "pubkeys": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    daemon = _DummyDaemon()
+    manager = _DummyConfigManager(config_path=str(cfg_path))
+    handler = GlassHandler(config=config, daemon_instance=daemon, config_manager=manager)
+
+    ok, message, _details = asyncio.run(
+        handler._execute_command_action(
+            "policy_sync",
+            {"policy": {"enabled": True}, "mode": "patch"},
+        )
+    )
+
+    assert ok is True
+    assert message == "Policy synchronized"
+    loaded = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+    assert loaded["policy_engine"]["enabled"] is True
+    assert loaded["policy_engine"]["default_action"] == "drop"
+    assert loaded["policy_engine"]["rules"][0]["id"] == "keep"
+    assert loaded["policy_engine"]["objects"]["custom"] == {"values": ["a"]}
+
+
+def test_execute_policy_sync_rejects_unsupported_mode(tmp_path):
+    config = _make_config()
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("repeater: {node_name: test}\n", encoding="utf-8")
+    daemon = _DummyDaemon()
+    manager = _DummyConfigManager(config_path=str(cfg_path))
+    handler = GlassHandler(config=config, daemon_instance=daemon, config_manager=manager)
+
+    ok, message, details = asyncio.run(
+        handler._execute_command_action(
+            "policy_sync", {"policy": {"enabled": True}, "mode": "merge"}
+        )
+    )
+
+    assert ok is False
+    assert "Unsupported policy_sync mode" in message
+    assert details is None
 
 
 def test_handle_command_response_queues_result():

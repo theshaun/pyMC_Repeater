@@ -50,7 +50,7 @@ def derive_companion_public_key_hex(identity_key: Any) -> Optional[str]:
     if raw is None:
         return None
     try:
-        from pymc_core import LocalIdentity
+        from openhop_core import LocalIdentity
 
         identity = LocalIdentity(seed=raw)
         return identity.get_public_key().hex()

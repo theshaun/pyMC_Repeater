@@ -1,5 +1,5 @@
 """
-Trace packet handling helper for pyMC Repeater.
+Trace packet handling helper for openHop Repeater.
 
 This module handles the processing and forwarding of trace packets,
 which are used for network diagnostics to track the path and SNR
@@ -11,10 +11,10 @@ import logging
 import time
 from typing import Any, Dict, List
 
-from pymc_core.hardware.signal_utils import snr_register_to_db
-from pymc_core.node.handlers.trace import TraceHandler
-from pymc_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.hardware.signal_utils import snr_register_to_db
+from openhop_core.node.handlers.trace import TraceHandler
+from openhop_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
+from openhop_core.protocol.packet_utils import PathUtils
 
 logger = logging.getLogger("TraceHelper")
 
@@ -53,9 +53,7 @@ class TraceHelper:
         self.packet_injector = packet_injector  # Function to inject packets into router
 
         # Ping callback system - track pending ping requests by tag
-        self.pending_pings = (
-            {}
-        )  # {tag: {'event': asyncio.Event(), 'result': dict, 'target': int, 'sent_at': float}}
+        self.pending_pings = {}  # {tag: {'event': asyncio.Event(), 'result': dict, 'target': int, 'sent_at': float}}
 
         # Optional: when trace reaches final node, call this (packet, parsed_data) to push 0x89 to companions
         self.on_trace_complete = None  # async (packet, parsed_data) -> None
@@ -103,8 +101,7 @@ class TraceHelper:
                 rssi_val = getattr(packet, "rssi", 0)
                 if rssi_val == 0:
                     logger.warning(
-                        f"Ignoring trace response for tag {trace_tag} "
-                        "with RSSI=0 (no signal data)"
+                        f"Ignoring trace response for tag {trace_tag} with RSSI=0 (no signal data)"
                     )
                     return  # wait for a valid response or let timeout handle it
                 ping_info = self.pending_pings[trace_tag]

@@ -3,11 +3,19 @@ import functools
 import logging
 import os
 import signal
-import sys
 import socket
+import sys
 import time
 
-from repeater.companion.utils import validate_companion_node_name, normalize_companion_identity_key
+from repeater.companion.utils import (
+    CompanionContactCapacityError,
+    effective_max_contacts,
+    enforce_companion_contact_capacity,
+    format_companion_bridge_limits,
+    normalize_companion_identity_key,
+    parse_companion_bridge_kwargs,
+    validate_companion_node_name,
+)
 from repeater.config import NullRadio, get_radio_for_board, load_config, save_config
 from repeater.config_manager import ConfigManager
 from repeater.data_acquisition.glass_handler import GlassHandler
@@ -31,7 +39,6 @@ logger = logging.getLogger("RepeaterDaemon")
 
 
 class RepeaterDaemon:
-
     def __init__(self, config: dict, radio=None):
 
         self.config = config
@@ -76,14 +83,14 @@ class RepeaterDaemon:
 
         logger.info(f"Initializing repeater: {self.config['repeater']['node_name']}")
 
-        #-----------------------------------------------
-        # Get the actual Network IP Address 
+        # -----------------------------------------------
+        # Get the actual Network IP Address
         try:
             # This looks for the IP assigned to the default hostname
             host_name = socket.gethostname()
             # We try to get the IP associated with the hostname
             self.network_ip = socket.gethostbyname(host_name)
-            
+
             # If that still gives 127.0.x.x, let's try a different internal method
             if self.network_ip.startswith("127."):
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -96,7 +103,7 @@ class RepeaterDaemon:
             self.network_ip = "Unknown"
 
         logger.info(f"System Network IP: {self.network_ip}")
-        #-----------------------------------------------
+        # -----------------------------------------------
 
         if self.radio is None:
             radio_type_raw = self.config.get("radio_type")
@@ -168,8 +175,8 @@ class RepeaterDaemon:
                 self.radio = NullRadio()
 
         try:
-            from pymc_core import LocalIdentity
-            from pymc_core.node.dispatcher import Dispatcher
+            from openhop_core import LocalIdentity
+            from openhop_core.node.dispatcher import Dispatcher
 
             self.dispatcher = Dispatcher(self.radio)
             logger.info("Dispatcher initialized")
@@ -202,7 +209,9 @@ class RepeaterDaemon:
             self.dispatcher._is_own_packet = lambda pkt: False
 
             self.repeater_handler = RepeaterHandler(
-                self.config, self.dispatcher, self.local_hash,
+                self.config,
+                self.dispatcher,
+                self.local_hash,
                 local_hash_bytes=self.local_hash_bytes,
                 send_advert_func=self.send_advert,
             )
@@ -267,6 +276,12 @@ class RepeaterDaemon:
                 identity_manager=self.identity_manager,
                 packet_injector=self.router.inject_packet,
                 log_fn=logger.info,
+                sqlite_handler=(
+                    self.repeater_handler.storage.sqlite_handler
+                    if self.repeater_handler and self.repeater_handler.storage
+                    else None
+                ),  # For anon regions-discovery replies
+                config=self.config,  # For owner-info / feature-flags replies
             )
 
             # Register default repeater identity
@@ -292,7 +307,7 @@ class RepeaterDaemon:
 
             # Initialize ConfigManager for centralized config management
             self.config_manager = ConfigManager(
-                config_path=getattr(self, "config_path", "/etc/pymc_repeater/config.yaml"),
+                config_path=getattr(self, "config_path", "/etc/openhop_repeater/config.yaml"),
                 config=self.config,
                 daemon_instance=self,
             )
@@ -380,7 +395,7 @@ class RepeaterDaemon:
             # Load companion identities (CompanionBridge + frame server per companion)
             await self._load_companion_identities()
 
-            # Subscribe to raw RX in pyMC_core so we can push PUSH_CODE_LOG_RX_DATA to companion clients
+            # Subscribe to raw RX in openhop-core so we can push PUSH_CODE_LOG_RX_DATA to companion clients
             self.dispatcher.add_raw_rx_subscriber(self._on_raw_rx_for_companions)
             n = len(getattr(self, "companion_frame_servers", []))
             logger.info(
@@ -407,14 +422,16 @@ class RepeaterDaemon:
                 and self.repeater_handler.storage
                 and hasattr(self.repeater_handler.storage, "set_glass_publisher")
             ):
-                self.repeater_handler.storage.set_glass_publisher(self.glass_handler.publish_telemetry)
+                self.repeater_handler.storage.set_glass_publisher(
+                    self.glass_handler.publish_telemetry
+                )
 
         except Exception as e:
             logger.error(f"Failed to initialize dispatcher: {e}")
             raise
 
     async def _load_additional_identities(self):
-        from pymc_core import LocalIdentity
+        from openhop_core import LocalIdentity
 
         identities_config = self.config.get("identities", {})
 
@@ -426,7 +443,7 @@ class RepeaterDaemon:
                 identity_key = room_config.get("identity_key")
 
                 if not name or not identity_key:
-                    logger.warning(f"Skipping room server config: missing name or identity_key")
+                    logger.warning("Skipping room server config: missing name or identity_key")
                     continue
 
                 # Convert identity_key to bytes if it's a hex string
@@ -435,9 +452,9 @@ class RepeaterDaemon:
                 elif isinstance(identity_key, str):
                     try:
                         identity_key_bytes = bytes.fromhex(identity_key)
-                        if len(identity_key_bytes) != 32:
+                        if len(identity_key_bytes) not in (32, 64):
                             logger.error(
-                                f"Identity key for '{name}' is invalid length: {len(identity_key_bytes)} bytes (expected 32)"
+                                f"Identity key for '{name}' is invalid length: {len(identity_key_bytes)} bytes (expected 32 or 64)"
                             )
                             continue
                     except ValueError as e:
@@ -476,8 +493,8 @@ class RepeaterDaemon:
 
     async def _load_companion_identities(self) -> None:
         """Load companion identities from config and create CompanionBridge + frame server for each."""
-        from pymc_core import LocalIdentity
-        from pymc_core.companion.models import Channel, Contact
+        from openhop_core import LocalIdentity
+        from openhop_core.companion.models import Channel
 
         from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
 
@@ -511,7 +528,9 @@ class RepeaterDaemon:
 
                 if isinstance(identity_key, str):
                     try:
-                        identity_key_bytes = bytes.fromhex(normalize_companion_identity_key(identity_key))
+                        identity_key_bytes = bytes.fromhex(
+                            normalize_companion_identity_key(identity_key)
+                        )
                     except ValueError as e:
                         logger.error(f"Companion '{name}' identity_key invalid hex: {e}")
                         continue
@@ -534,12 +553,13 @@ class RepeaterDaemon:
 
                 node_name = settings.get("node_name", name)
                 tcp_port = settings.get("tcp_port", 5000)
-                bind_address = settings.get("bind_address", "0.0.0.0")
-                tcp_timeout_raw = settings.get("tcp_timeout", 8 * 60 * 60) # 8 hours
+                bind_address = settings.get("bind_address", "0.0.0.0")  # nosec B104
+                tcp_timeout_raw = settings.get("tcp_timeout", 8 * 60 * 60)  # 8 hours
                 client_idle_timeout_sec = None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
 
                 def _make_sync_node_name_to_config(companion_name: str):
                     """Return a callback that syncs node_name to config for this companion (binds name at creation)."""
+
                     def _sync(new_node_name: str) -> None:
                         try:
                             validated = validate_companion_node_name(new_node_name)
@@ -555,16 +575,42 @@ class RepeaterDaemon:
                                 if config_path:
                                     save_config(self.config, config_path)
                                 break
+
                     return _sync
+
+                bridge_kwargs = parse_companion_bridge_kwargs(settings)
+                max_contacts = effective_max_contacts(bridge_kwargs)
+                if sqlite_handler:
+                    trimmed = enforce_companion_contact_capacity(
+                        companion_hash_str,
+                        max_contacts,
+                        sqlite_handler,
+                        trim=bool(settings.get("trim_contacts_on_overflow")),
+                        companion_name=name,
+                    )
+                    if trimmed:
+                        logger.warning(
+                            "Companion '%s': trimmed %d contact(s) to fit "
+                            "max_contacts=%d (trim_contacts_on_overflow)",
+                            name,
+                            trimmed,
+                            max_contacts,
+                        )
 
                 bridge = RepeaterCompanionBridge(
                     identity=identity,
-                    packet_injector=self.router.inject_packet,
+                    # Tag the injector with this companion's hash so inject_packet can
+                    # skip its own frame server when echoing TX as raw RX (a node never
+                    # hears its own transmission).
+                    packet_injector=functools.partial(
+                        self.router.inject_packet, origin_hash=companion_hash_str
+                    ),
                     node_name=node_name,
                     radio_config=radio_config,
                     sqlite_handler=sqlite_handler,
                     companion_hash=companion_hash_str,
                     on_prefs_saved=_make_sync_node_name_to_config(name),
+                    **bridge_kwargs,
                 )
 
                 # Load contacts from SQLite
@@ -598,24 +644,29 @@ class RepeaterDaemon:
                         ch = Channel(name=row.get("name", ""), secret=raw)
                         bridge.channels.set(row.get("channel_idx", 0), ch)
 
-                    # Preload queued messages from SQLite into bridge
-                    for msg_dict in sqlite_handler.companion_load_messages(companion_hash_str):
-                        from pymc_core.companion.models import QueuedMessage
+                    # Preload queued messages from SQLite into bridge, bounded by
+                    # offline_queue_size (0 disables offline storage entirely).
+                    retention = getattr(bridge.message_queue, "_max_size", None)
+                    if retention != 0:
+                        for msg_dict in sqlite_handler.companion_load_messages(
+                            companion_hash_str, limit=retention or 100
+                        ):
+                            from openhop_core.companion.models import QueuedMessage
 
-                        sk = msg_dict.get("sender_key", b"")
-                        if isinstance(sk, str):
-                            sk = bytes.fromhex(sk)
-                        bridge.message_queue.push(
-                            QueuedMessage(
-                                sender_key=sk,
-                                txt_type=msg_dict.get("txt_type", 0),
-                                timestamp=msg_dict.get("timestamp", 0),
-                                text=msg_dict.get("text", ""),
-                                is_channel=bool(msg_dict.get("is_channel", False)),
-                                channel_idx=msg_dict.get("channel_idx", 0),
-                                path_len=msg_dict.get("path_len", 0),
+                            sk = msg_dict.get("sender_key", b"")
+                            if isinstance(sk, str):
+                                sk = bytes.fromhex(sk)
+                            bridge.message_queue.push(
+                                QueuedMessage(
+                                    sender_key=sk,
+                                    txt_type=msg_dict.get("txt_type", 0),
+                                    timestamp=msg_dict.get("timestamp", 0),
+                                    text=msg_dict.get("text", ""),
+                                    is_channel=bool(msg_dict.get("is_channel", False)),
+                                    channel_idx=msg_dict.get("channel_idx", 0),
+                                    path_len=msg_dict.get("path_len", 0),
+                                )
                             )
-                        )
 
                 # Ensure public channel (0) exists with default key for new companions
                 from repeater.companion.constants import DEFAULT_PUBLIC_CHANNEL_SECRET
@@ -648,11 +699,15 @@ class RepeaterDaemon:
                     identity_type="companion",
                 )
 
+                limits = format_companion_bridge_limits(bridge_kwargs)
                 logger.info(
                     f"Loaded companion '{name}': hash=0x{companion_hash:02x}, "
-                    f"port={tcp_port}, bind={bind_address}, client_idle_timeout_sec={client_idle_timeout_sec}"
+                    f"port={tcp_port}, bind={bind_address}, "
+                    f"client_idle_timeout_sec={client_idle_timeout_sec}{limits}"
                 )
 
+            except CompanionContactCapacityError as e:
+                logger.error("%s", e)
             except Exception as e:
                 logger.error(f"Failed to load companion '{name}': {e}", exc_info=True)
 
@@ -662,8 +717,8 @@ class RepeaterDaemon:
         Creates RepeaterCompanionBridge, CompanionFrameServer, starts the server,
         and registers with identity_manager. Raises on error.
         """
-        from pymc_core import LocalIdentity
-        from pymc_core.companion.models import Channel
+        from openhop_core import LocalIdentity
+        from openhop_core.companion.models import Channel
 
         from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
         from repeater.companion.constants import DEFAULT_PUBLIC_CHANNEL_SECRET
@@ -714,17 +769,39 @@ class RepeaterDaemon:
 
         node_name = settings.get("node_name", name)
         tcp_port = settings.get("tcp_port", 5000)
-        bind_address = settings.get("bind_address", "0.0.0.0")
+        bind_address = settings.get("bind_address", "0.0.0.0")  # nosec B104
         tcp_timeout_raw = settings.get("tcp_timeout", 120)
         client_idle_timeout_sec = None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
 
+        bridge_kwargs = parse_companion_bridge_kwargs(settings)
+        max_contacts = effective_max_contacts(bridge_kwargs)
+        if sqlite_handler:
+            trimmed = enforce_companion_contact_capacity(
+                companion_hash_str,
+                max_contacts,
+                sqlite_handler,
+                trim=bool(settings.get("trim_contacts_on_overflow")),
+                companion_name=name,
+            )
+            if trimmed:
+                logger.warning(
+                    "Hot-reload companion '%s': trimmed %d contact(s) to fit "
+                    "max_contacts=%d (trim_contacts_on_overflow)",
+                    name,
+                    trimmed,
+                    max_contacts,
+                )
+
         bridge = RepeaterCompanionBridge(
             identity=identity,
-            packet_injector=self.router.inject_packet,
+            packet_injector=functools.partial(
+                self.router.inject_packet, origin_hash=companion_hash_str
+            ),
             node_name=node_name,
             radio_config=radio_config,
             sqlite_handler=sqlite_handler,
             companion_hash=companion_hash_str,
+            **bridge_kwargs,
         )
 
         if sqlite_handler:
@@ -755,23 +832,27 @@ class RepeaterDaemon:
                 ch = Channel(name=row.get("name", ""), secret=raw)
                 bridge.channels.set(row.get("channel_idx", 0), ch)
 
-            for msg_dict in sqlite_handler.companion_load_messages(companion_hash_str):
-                from pymc_core.companion.models import QueuedMessage
+            retention = getattr(bridge.message_queue, "_max_size", None)
+            if retention != 0:
+                for msg_dict in sqlite_handler.companion_load_messages(
+                    companion_hash_str, limit=retention or 100
+                ):
+                    from openhop_core.companion.models import QueuedMessage
 
-                sk = msg_dict.get("sender_key", b"")
-                if isinstance(sk, str):
-                    sk = bytes.fromhex(sk)
-                bridge.message_queue.push(
-                    QueuedMessage(
-                        sender_key=sk,
-                        txt_type=msg_dict.get("txt_type", 0),
-                        timestamp=msg_dict.get("timestamp", 0),
-                        text=msg_dict.get("text", ""),
-                        is_channel=bool(msg_dict.get("is_channel", False)),
-                        channel_idx=msg_dict.get("channel_idx", 0),
-                        path_len=msg_dict.get("path_len", 0),
+                    sk = msg_dict.get("sender_key", b"")
+                    if isinstance(sk, str):
+                        sk = bytes.fromhex(sk)
+                    bridge.message_queue.push(
+                        QueuedMessage(
+                            sender_key=sk,
+                            txt_type=msg_dict.get("txt_type", 0),
+                            timestamp=msg_dict.get("timestamp", 0),
+                            text=msg_dict.get("text", ""),
+                            is_channel=bool(msg_dict.get("is_channel", False)),
+                            channel_idx=msg_dict.get("channel_idx", 0),
+                            path_len=msg_dict.get("path_len", 0),
+                        )
                     )
-                )
 
         if bridge.get_channel(0) is None:
             bridge.set_channel(0, "Public", DEFAULT_PUBLIC_CHANNEL_SECRET)
@@ -801,17 +882,28 @@ class RepeaterDaemon:
             identity_type="companion",
         )
 
+        limits = format_companion_bridge_limits(bridge_kwargs)
         logger.info(
             f"Hot-reload: Loaded companion '{name}': hash=0x{companion_hash:02x}, "
-            f"port={tcp_port}, bind={bind_address}, client_idle_timeout_sec={client_idle_timeout_sec}"
+            f"port={tcp_port}, bind={bind_address}, "
+            f"client_idle_timeout_sec={client_idle_timeout_sec}{limits}"
         )
 
-    async def _on_raw_rx_for_companions(self, data: bytes, rssi: int, snr: float) -> None:
-        """Raw RX subscriber: push PUSH_CODE_LOG_RX_DATA (0x88) to connected companion clients."""
+    async def _on_raw_rx_for_companions(
+        self, data: bytes, rssi: int, snr: float, exclude_hash: str | None = None
+    ) -> None:
+        """Raw RX subscriber: push PUSH_CODE_LOG_RX_DATA (0x88) to connected companion clients.
+
+        ``exclude_hash`` skips the frame server for that companion hash; used when
+        echoing a companion's own injected TX so it never hears its own transmission.
+        OTA RX subscribers leave it unset, so received packets reach every companion.
+        """
         servers = getattr(self, "companion_frame_servers", [])
         if not servers:
             return
         for fs in servers:
+            if exclude_hash is not None and getattr(fs, "companion_hash", None) == exclude_hash:
+                continue
             try:
                 fs.push_rx_raw(snr, rssi, data)
             except Exception as e:
@@ -1047,8 +1139,11 @@ class RepeaterDaemon:
             return False
 
         try:
-            from pymc_core.protocol import PacketBuilder
-            from pymc_core.protocol.constants import ADVERT_FLAG_HAS_NAME, ADVERT_FLAG_IS_REPEATER
+            from openhop_core.protocol import PacketBuilder
+            from openhop_core.protocol.constants import (
+                ADVERT_FLAG_HAS_NAME,
+                ADVERT_FLAG_IS_REPEATER,
+            )
 
             # Get node name and location from config
             repeater_config = self.config.get("repeater", {})
@@ -1079,13 +1174,14 @@ class RepeaterDaemon:
             # Send via dispatcher
             await self.dispatcher.send_packet(packet, wait_for_ack=False)
 
-            # Mark our own advert as seen to prevent re-forwarding it
             if self.repeater_handler:
                 self.repeater_handler.mark_seen(packet)
+                pkt_hash = packet.calculate_packet_hash().hex()[:16]
+                self.dispatcher.packet_filter.track_packet(pkt_hash)
                 logger.debug("Marked own advert as seen in duplicate cache")
 
             logger.info(
-                "Sent flood advert '%s' at (% .6f, % .6f) source=%s",
+                "Sent flood advert '%s' at (%.6f, %.6f) source=%s",
                 node_name,
                 latitude,
                 longitude,
@@ -1239,7 +1335,7 @@ class RepeaterDaemon:
             radio_type_raw = self.config.get("radio_type")
             radio_type = "" if radio_type_raw is None else str(radio_type_raw).lower()
             if radio_type == "sx1262_ch341":
-                from pymc_core.hardware.ch341.ch341_async import CH341Async
+                from openhop_core.hardware.ch341.ch341_async import CH341Async
 
                 CH341Async.reset_instance()
         except Exception as e:
@@ -1283,7 +1379,7 @@ class RepeaterDaemon:
 
             # Start HTTP stats server
             http_port = self.config.get("http", {}).get("port", 8000)
-            http_host = self.config.get("http", {}).get("host", "0.0.0.0")
+            http_host = self.config.get("http", {}).get("host", "0.0.0.0")  # nosec B104
 
             node_name = self.config.get("repeater", {}).get("node_name", "Repeater")
 
@@ -1309,7 +1405,7 @@ class RepeaterDaemon:
                 config=self.config,
                 event_loop=current_loop,
                 daemon_instance=self,
-                config_path=getattr(self, "config_path", "/etc/pymc_repeater/config.yaml"),
+                config_path=getattr(self, "config_path", "/etc/openhop_repeater/config.yaml"),
             )
 
             try:
@@ -1317,7 +1413,7 @@ class RepeaterDaemon:
             except Exception as e:
                 logger.error(f"Failed to start HTTP server: {e}")
 
-            # Run dispatcher (handles RX/TX via pymc_core)
+            # Run dispatcher (handles RX/TX via openhop_core)
             try:
                 await self.dispatcher.run_forever()
             except asyncio.CancelledError:
@@ -1348,10 +1444,10 @@ def main():
 
     import argparse
 
-    parser = argparse.ArgumentParser(description="pyMC Repeater Daemon")
+    parser = argparse.ArgumentParser(description="openHop Repeater Daemon")
     parser.add_argument(
         "--config",
-        help="Path to config file (default: /etc/pymc_repeater/config.yaml)",
+        help="Path to config file (default: /etc/openhop_repeater/config.yaml)",
     )
     parser.add_argument(
         "--log-level",
@@ -1363,7 +1459,7 @@ def main():
 
     # Load configuration
     config = load_config(args.config)
-    config_path = args.config if args.config else "/etc/pymc_repeater/config.yaml"
+    config_path = args.config if args.config else "/etc/openhop_repeater/config.yaml"
 
     if args.log_level:
         if "logging" not in config:

@@ -1,0 +1,187 @@
+import io
+import logging
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import cherrypy
+import pytest
+
+from repeater.web import http_server as hs
+
+
+def test_log_buffer_emit_collects_messages():
+    buf = hs.LogBuffer(max_lines=2)
+    rec1 = logging.LogRecord("x", logging.INFO, __file__, 1, "hello", (), None)
+    rec2 = logging.LogRecord("x", logging.ERROR, __file__, 2, "boom", (), None)
+    rec3 = logging.LogRecord("x", logging.WARNING, __file__, 3, "warn", (), None)
+
+    buf.emit(rec1)
+    buf.emit(rec2)
+    buf.emit(rec3)
+
+    assert len(buf.logs) == 2
+    assert buf.logs[-1]["level"] == "WARNING"
+    assert "warn" in buf.logs[-1]["message"]
+
+
+def test_log_buffer_emit_redacts_sensitive_values():
+    buf = hs.LogBuffer(max_lines=5)
+    rec = logging.LogRecord(
+        "auth",
+        logging.DEBUG,
+        __file__,
+        10,
+        "auth password=secret123 token=abc123 Authorization: Bearer deadbeef",
+        (),
+        None,
+    )
+
+    buf.emit(rec)
+
+    assert len(buf.logs) == 1
+    entry = buf.logs[0]
+    assert "secret123" not in entry["message"]
+    assert "abc123" not in entry["message"]
+    assert "deadbeef" not in entry["message"]
+    assert "[REDACTED]" in entry["message"]
+    assert "raw_message" not in entry
+
+
+def test_log_buffer_emit_includes_exception_text_without_crashing():
+    buf = hs.LogBuffer(max_lines=5)
+    try:
+        raise RuntimeError("boom password=secret123")
+    except RuntimeError:
+        rec = logging.LogRecord(
+            "x",
+            logging.ERROR,
+            __file__,
+            20,
+            "failure while sending advert",
+            (),
+            sys.exc_info(),
+        )
+
+    buf.emit(rec)
+
+    assert len(buf.logs) == 1
+    assert "exception" in buf.logs[0]
+    assert "RuntimeError" in buf.logs[0]["exception"]
+    assert "secret123" not in buf.logs[0]["exception"]
+
+
+def test_doc_endpoint_routes_and_openapi_json_paths(monkeypatch):
+    api = SimpleNamespace(docs=lambda: "docs-html")
+    doc = hs.DocEndpoint(api)
+
+    assert doc.index() == "docs-html"
+    assert doc.docs() == "docs-html"
+
+    monkeypatch.setattr(
+        cherrypy, "response", SimpleNamespace(headers={}, status=200), raising=False
+    )
+
+    # success path
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: io.StringIO("openapi: 3.0.0\n"))
+    out = doc.openapi_json()
+    assert cherrypy.response.headers["Content-Type"] == "application/json"
+    assert b"openapi" in out
+
+    # not found
+    def _missing(*_args, **_kwargs):
+        raise FileNotFoundError
+
+    monkeypatch.setattr("builtins.open", _missing)
+    out = doc.openapi_json()
+    assert cherrypy.response.status == 404
+    assert b"not found" in out
+
+    # generic error
+    def _err(*_args, **_kwargs):
+        raise RuntimeError("bad")
+
+    monkeypatch.setattr("builtins.open", _err)
+    out = doc.openapi_json()
+    assert cherrypy.response.status == 500
+    assert b"Error loading OpenAPI spec" in out
+
+
+def test_stats_app_index_and_default_routing(monkeypatch, tmp_path):
+    index_html = tmp_path / "index.html"
+    index_html.write_text("<html>ok</html>", encoding="utf-8")
+
+    fake_api = SimpleNamespace(config_manager=object(), docs=lambda: "d")
+    monkeypatch.setattr(hs, "APIEndpoints", lambda *args, **kwargs: fake_api)
+
+    app = hs.StatsApp(config={"web": {"web_path": str(tmp_path)}})
+
+    monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="GET"), raising=False)
+    assert app.index() == "<html>ok</html>"
+
+    monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="OPTIONS"), raising=False)
+    assert app.default("anything") == ""
+
+    monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="GET"), raising=False)
+    with pytest.raises(cherrypy.NotFound):
+        app.default("api")
+
+    assert app.default("ws", "packets") == ""
+    assert app.default("route") == "<html>ok</html>"
+
+
+def test_stats_app_index_error_paths(monkeypatch, tmp_path):
+    fake_api = SimpleNamespace(config_manager=object(), docs=lambda: "d")
+    monkeypatch.setattr(hs, "APIEndpoints", lambda *args, **kwargs: fake_api)
+
+    app = hs.StatsApp(config={"web": {"web_path": str(tmp_path)}})
+
+    with pytest.raises(cherrypy.HTTPError):
+        app.index()
+
+    # Force generic open() exception branch
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("builtins.open", _explode)
+    (tmp_path / "index.html").write_text("ignored", encoding="utf-8")
+    with pytest.raises(cherrypy.HTTPError):
+        app.index()
+
+
+def test_http_server_utility_methods(monkeypatch, tmp_path):
+    def _fake_init_auth(self):
+        self.jwt_handler = object()
+        self.token_manager = object()
+
+    monkeypatch.setattr(hs.HTTPStatsServer, "_init_auth_handlers", _fake_init_auth)
+    monkeypatch.setattr(
+        hs,
+        "StatsApp",
+        lambda *args, **kwargs: SimpleNamespace(api=SimpleNamespace(config_manager=object())),
+    )
+    monkeypatch.setattr(hs, "AuthEndpoints", lambda *args, **kwargs: object())
+    monkeypatch.setattr(hs, "DocEndpoint", lambda *_args, **_kwargs: object())
+
+    server = hs.HTTPStatsServer(
+        config={"web": {"cors_enabled": False}}, config_path=str(Path(tmp_path) / "cfg.yml")
+    )
+
+    monkeypatch.setattr(cherrypy, "response", SimpleNamespace(headers={}), raising=False)
+    out = server._json_error_handler(401, "no", "", "")
+    assert '"success": false' in out
+
+    install_called = {"v": False}
+    monkeypatch.setattr(hs.cherrypy_cors, "install", lambda: install_called.__setitem__("v", True))
+    server._setup_server_cors()
+    assert install_called["v"] is True
+
+    exited = {"v": False}
+    monkeypatch.setattr(
+        cherrypy,
+        "engine",
+        SimpleNamespace(exit=lambda: exited.__setitem__("v", True)),
+        raising=False,
+    )
+    server.stop()
+    assert exited["v"] is True

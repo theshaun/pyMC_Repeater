@@ -1,10 +1,11 @@
 import asyncio
 import logging
+import secrets
 import time
-from typing import Dict, Optional
+from typing import Dict
 
-from pymc_core.protocol import CryptoUtils, PacketBuilder
-from pymc_core.protocol.constants import PAYLOAD_TYPE_TXT_MSG
+from openhop_core.protocol import CryptoUtils, PacketBuilder
+from openhop_core.protocol.constants import PAYLOAD_TYPE_TXT_MSG
 
 logger = logging.getLogger("RoomServer")
 
@@ -46,7 +47,6 @@ GLOBAL_MIN_GAP_BETWEEN_MESSAGES = 1.1  # 1.1s  minimum gap between transmissions
 
 
 class GlobalRateLimiter:
-
     def __init__(self, min_gap_seconds: float = 0.1):
         self.min_gap = min_gap_seconds  # Minimum gap between consecutive messages
         self.lock = asyncio.Lock()  # Only one transmission at a time
@@ -60,7 +60,7 @@ class GlobalRateLimiter:
             time_since_last = now - self.last_release_time
             if time_since_last < self.min_gap:
                 wait_time = self.min_gap - time_since_last
-                logger.debug(f"Global rate limiter: waiting {wait_time*1000:.0f}ms")
+                logger.debug(f"Global rate limiter: waiting {wait_time * 1000:.0f}ms")
                 await asyncio.sleep(wait_time)
             # Lock is now held - caller can transmit
             # Will be released when context exits
@@ -70,7 +70,6 @@ class GlobalRateLimiter:
 
 
 class RoomServer:
-
     def __init__(
         self,
         room_hash: int,
@@ -103,8 +102,8 @@ class RoomServer:
                 return False
 
             try:
-                from pymc_core.protocol import PacketBuilder
-                from pymc_core.protocol.constants import (
+                from openhop_core.protocol import PacketBuilder
+                from openhop_core.protocol.constants import (
                     ADVERT_FLAG_HAS_NAME,
                     ADVERT_FLAG_IS_ROOM_SERVER,
                 )
@@ -307,7 +306,7 @@ class RoomServer:
 
                 return True
             else:
-                logger.error(f"Failed to store message to database")
+                logger.error("Failed to store message to database")
                 return False
 
         except Exception as e:
@@ -358,7 +357,7 @@ class RoomServer:
                 timestamp.to_bytes(4, "little") + bytes([flags]) + author_prefix + message_bytes
             )
 
-            # Calculate expected ACK (same algorithm as pymc_core)
+            # Calculate expected ACK (same algorithm as openhop_core)
             attempt = 0
             pack_data = PacketBuilder._pack_timestamp_data(timestamp, attempt, message_bytes)
             ack_hash = CryptoUtils.sha256(pack_data + client_info.id.get_public_key())[:4]
@@ -537,9 +536,7 @@ class RoomServer:
     async def _sync_loop(self):
 
         # SAFETY: Stagger room startup to prevent thundering herd
-        import random
-
-        startup_delay = random.uniform(0, 5)  # 0-5 second random delay
+        startup_delay = secrets.randbelow(5001) / 1000.0  # 0-5 second random delay
         await asyncio.sleep(startup_delay)
 
         logger.info(f"Room '{self.room_name}' sync loop starting (delayed {startup_delay:.1f}s)")

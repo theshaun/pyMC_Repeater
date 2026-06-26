@@ -1,22 +1,32 @@
 """
-CLI client for pyMC Repeater.
+CLI client for openHop Repeater.
 Connects to an already-running repeater daemon via its HTTP API.
 Reads admin password and HTTP port from the local config.yaml automatically.
 """
 
 import sys
-
+from typing import Optional
+from urllib.parse import urlparse
 
 CONFIG_PATHS = [
-    "/etc/pymc_repeater/config.yaml",
+    "/etc/openhop_repeater/config.yaml",
     "config.yaml",
 ]
 
 
+def _validate_http_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme or '<missing>'}")
+    if not parsed.hostname:
+        raise ValueError("URL must include a host")
+
+
 def _load_config(config_path=None):
     """Load repeater config.yaml, trying common paths."""
-    import yaml
     from pathlib import Path
+
+    import yaml
 
     paths = [config_path] if config_path else CONFIG_PATHS
     for p in paths:
@@ -27,13 +37,13 @@ def _load_config(config_path=None):
     return {}
 
 
-def run_client_cli(host: str = "127.0.0.1", port: int = 8000, password: str = ""):
+def run_client_cli(host: str = "127.0.0.1", port: int = 8000, password: Optional[str] = None):
     """
     Standalone CLI client that connects to a running repeater's HTTP API.
     """
-    import urllib.request
-    import urllib.error
     import json
+    import urllib.error
+    import urllib.request
 
     base_url = f"http://{host}:{port}"
 
@@ -41,18 +51,21 @@ def run_client_cli(host: str = "127.0.0.1", port: int = 8000, password: str = ""
     token = None
     if password:
         try:
-            auth_data = json.dumps({
-                "username": "admin",
-                "password": password,
-                "client_id": "pymc-cli",
-            }).encode()
+            auth_data = json.dumps(
+                {
+                    "username": "admin",
+                    "password": password,
+                    "client_id": "pymc-cli",
+                }
+            ).encode()
             req = urllib.request.Request(
                 f"{base_url}/auth/login",
                 data=auth_data,
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            _validate_http_url(req.full_url)
+            with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310
                 result = json.loads(resp.read())
                 token = result.get("token") or result.get("data", {}).get("token")
         except urllib.error.URLError as e:
@@ -66,7 +79,7 @@ def run_client_cli(host: str = "127.0.0.1", port: int = 8000, password: str = ""
         print("Error: Authentication failed. Check password or repeater status.")
         sys.exit(1)
 
-    print(f"\npyMC Repeater CLI (connected to {base_url})")
+    print(f"\nopenHop Repeater CLI (connected to {base_url})")
     print("Type 'help' for available commands, 'exit' to quit.\n")
 
     while True:
@@ -92,7 +105,8 @@ def run_client_cli(host: str = "127.0.0.1", port: int = 8000, password: str = ""
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            _validate_http_url(req.full_url)
+            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310
                 result = json.loads(resp.read())
                 if result.get("success"):
                     print(result["data"]["reply"])
@@ -109,18 +123,22 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Connect to a running pyMC Repeater and issue CLI commands"
+        description="Connect to a running openHop Repeater and issue CLI commands"
     )
     parser.add_argument(
-        "--config", default=None,
+        "--config",
+        default=None,
         help="Path to config.yaml (auto-detected if not set)",
     )
     parser.add_argument(
-        "--host", default=None,
+        "--host",
+        default=None,
         help="Repeater HTTP host (default: 127.0.0.1)",
     )
     parser.add_argument(
-        "--port", type=int, default=None,
+        "--port",
+        type=int,
+        default=None,
         help="Repeater HTTP port (default: from config or 8000)",
     )
     args = parser.parse_args()

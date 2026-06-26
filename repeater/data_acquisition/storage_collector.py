@@ -1,10 +1,9 @@
 import asyncio
-import json
+import concurrent.futures
 import logging
+import threading
 import time
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from repeater.config import resolve_storage_dir
 
@@ -23,6 +22,17 @@ class StorageCollector:
         self.glass_publish_callback = None
         self._pending_tasks = set()
 
+        # Dedicated single writer thread for all blocking storage work (the SQLite
+        # write, the cumulative-counts aggregate, RRD updates, and network
+        # publishing). This keeps that work off the asyncio event loop, which it
+        # was previously stalling for seconds per packet on a busy mesh — starving
+        # every other coroutine (e.g. send_advert would time out). One worker
+        # preserves packet write ordering and reuses a single thread-local SQLite
+        # connection (no WAL writer contention, no connection fan-out).
+        self._db_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="storage-writer"
+        )
+
         self.storage_dir = resolve_storage_dir(config)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
@@ -31,7 +41,9 @@ class StorageCollector:
 
         # Initialize MQTT handler if configured
         self.mqtt_handler = None
-        if (config.get("mqtt_brokers", {}) or config.get("letsmesh", {}) or config.get("mqtt", {})) and local_identity:
+        if (
+            config.get("mqtt_brokers", {}) or config.get("letsmesh", {}) or config.get("mqtt", {})
+        ) and local_identity:
             try:
                 # Pass local_identity directly (supports both standard and firmware keys)
                 self.mqtt_handler = MeshCoreToMqttPusher(
@@ -42,9 +54,7 @@ class StorageCollector:
                 self.mqtt_handler.connect()
 
                 public_key_hex = local_identity.get_public_key().hex()
-                logger.info(
-                    f"MQTT handler initialized with public key: {public_key_hex[:16]}..."
-                )
+                logger.info(f"MQTT handler initialized with public key: {public_key_hex[:16]}...")
             except Exception as e:
                 logger.error(f"Failed to initialize MQTT handler: {e}")
                 self.mqtt_handler = None
@@ -58,8 +68,9 @@ class StorageCollector:
         # Initialize WebSocket handler for real-time updates
         self.websocket_available = False
         self.websocket_has_connected_clients = lambda: False
-        self._last_ws_stats_broadcast: float = 0.0
         self._ws_stats_broadcast_interval_sec: float = 5.0
+        self._stats_stop_event = threading.Event()
+        self._stats_thread: Optional[threading.Thread] = None
         try:
             from .websocket_handler import (
                 broadcast_packet,
@@ -72,6 +83,19 @@ class StorageCollector:
             self.websocket_has_connected_clients = has_connected_clients
             self.websocket_available = True
             logger.info("WebSocket handler initialized for real-time updates")
+
+            # Broadcast aggregate stats on a fixed cadence rather than inline on the
+            # per-packet write path. get_packet_stats(24h) is a multi-second aggregate;
+            # running it inside _record_packet_blocking made the storage writer thread
+            # spend ~1-2s of every 5s on it, competing with packet inserts. A dedicated
+            # tick keeps the writer doing only fast writes and only runs the aggregate
+            # when a dashboard client is actually connected.
+            self._stats_thread = threading.Thread(
+                target=self._stats_broadcast_loop,
+                name="stats-broadcast",
+                daemon=True,
+            )
+            self._stats_thread.start()
         except ImportError:
             logger.debug("WebSocket handler not available")
 
@@ -148,7 +172,12 @@ class StorageCollector:
         return stats
 
     def record_packet(self, packet_record: dict, skip_mqtt_if_invalid: bool = True):
-        """Record packet to storage and publish to MQTT
+        """Record a packet to storage and publish it.
+
+        All blocking work — the SQLite write, the cumulative-counts aggregate, the
+        RRD update, and network publishing — runs on the dedicated writer thread so
+        it never blocks the asyncio event loop. Callers treat this as
+        fire-and-forget (the previous synchronous version blocked the loop).
 
         Args:
             packet_record: Dictionary containing packet information
@@ -158,57 +187,76 @@ class StorageCollector:
             f"Recording packet: type={packet_record.get('type')}, "
             f"transmitted={packet_record.get('transmitted')}"
         )
+        self._submit_db(self._record_packet_blocking, packet_record, skip_mqtt_if_invalid)
 
-        # HOT PATH: Store to local databases only (fast, non-blocking)
+    def _submit_db(self, fn, *args):
+        """Run a blocking storage operation on the dedicated writer thread.
+
+        Falls back to running inline only if the executor has already been shut
+        down (process teardown), so late records are not silently dropped.
+        """
+        try:
+            self._db_executor.submit(self._run_db_task, fn, *args)
+        except RuntimeError:
+            self._run_db_task(fn, *args)
+
+    def _run_db_task(self, fn, *args):
+        """Execute a writer-thread task, logging (not raising) on failure."""
+        try:
+            fn(*args)
+        except Exception as e:
+            logger.error(f"Storage writer task failed: {e}", exc_info=True)
+
+    def _record_packet_blocking(self, packet_record: dict, skip_mqtt: bool):
+        """Store, aggregate, update metrics, and publish one packet (writer thread)."""
         self.sqlite_handler.store_packet(packet_record)
         cumulative_counts = self.sqlite_handler.get_cumulative_counts()
         self.rrd_handler.update_packet_metrics(packet_record, cumulative_counts)
-
-        # DEFERRED: Publish to network sinks and WebSocket in background tasks
-        # This prevents network latency from blocking packet processing
-        self._schedule_background(
-            self._deferred_publish,
-            packet_record,
-            skip_mqtt_if_invalid,
-            sync_fallback=self._publish_packet_sync,
-        )
-
-    async def _deferred_publish(self, packet_record: dict, skip_mqtt: bool):
-        """Deferred background task for all network publishing operations."""
-        try:
-            self._publish_packet_sync(packet_record, skip_mqtt)
-        except Exception as e:
-            logger.error(f"Deferred publish failed: {e}", exc_info=True)
+        self._publish_packet_sync(packet_record, skip_mqtt)
 
     def _publish_packet_sync(self, packet_record: dict, skip_mqtt: bool):
-        """Publish packet updates synchronously (used when no asyncio loop is active)."""
+        """Publish a single packet (glass, per-packet WebSocket event, MQTT).
+
+        Only fast, per-packet work runs here. The aggregate stats broadcast is
+        driven separately by _stats_broadcast_loop so the writer thread is not
+        held by the multi-second get_packet_stats(24h) query.
+        """
         self._publish_to_glass(packet_record, "packet")
 
         if self.websocket_available:
             try:
                 self.websocket_broadcast_packet(packet_record)
-                if self.websocket_has_connected_clients():
-                    now_mono = time.monotonic()
-                    if (
-                        now_mono - self._last_ws_stats_broadcast
-                        >= self._ws_stats_broadcast_interval_sec
-                    ):
-                        self._last_ws_stats_broadcast = now_mono
-                        packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
-                        uptime_seconds = (
-                            time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
-                        )
-                        self.websocket_broadcast_stats(
-                            {
-                                "packet_stats": packet_stats_24h,
-                                "system_stats": {"uptime_seconds": uptime_seconds},
-                            }
-                        )
             except Exception as e:
                 logger.debug(f"WebSocket broadcast failed: {e}")
 
-
         self._publish_packet_to_mqtt(packet_record)
+
+    def _broadcast_stats_once(self) -> None:
+        """Compute the 24h aggregate and broadcast it to WebSocket clients."""
+        packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
+        uptime_seconds = (
+            time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
+        )
+        self.websocket_broadcast_stats(
+            {
+                "packet_stats": packet_stats_24h,
+                "system_stats": {"uptime_seconds": uptime_seconds},
+            }
+        )
+
+    def _stats_broadcast_loop(self) -> None:
+        """Broadcast aggregate stats every interval while clients are connected.
+
+        Runs on its own thread (off the event loop and off the storage writer) so
+        the heavy get_packet_stats(24h) aggregate never sits in the packet write
+        path. Skips the query entirely when no dashboard client is connected.
+        """
+        while not self._stats_stop_event.wait(self._ws_stats_broadcast_interval_sec):
+            try:
+                if self.websocket_has_connected_clients():
+                    self._broadcast_stats_once()
+            except Exception as e:
+                logger.debug(f"Stats broadcast failed: {e}")
 
     def _publish_packet_to_mqtt(self, packet_record: dict):
         """Publish packet to mqtt broker if enabled and allowed.
@@ -312,6 +360,18 @@ class StorageCollector:
     def get_crc_error_history(self, hours: int = 24, limit: int = None) -> list:
         return self.sqlite_handler.get_crc_error_history(hours, limit)
 
+    def get_policy_event_counts(
+        self,
+        start_timestamp: float,
+        end_timestamp: float,
+        bucket_seconds: int = 60,
+    ) -> list:
+        return self.sqlite_handler.get_policy_event_counts(
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            bucket_seconds=bucket_seconds,
+        )
+
     def get_packet_stats(self, hours: int = 24) -> dict:
         return self.sqlite_handler.get_packet_stats(hours)
 
@@ -411,6 +471,15 @@ class StorageCollector:
         return self.sqlite_handler.get_noise_floor_stats(hours)
 
     def close(self):
+        # Stop the stats broadcast thread.
+        self._stats_stop_event.set()
+        if self._stats_thread is not None:
+            self._stats_thread.join(timeout=2)
+
+        # Drain and stop the storage writer thread first so pending writes and
+        # publishes complete before MQTT and the DB connections are torn down.
+        self._db_executor.shutdown(wait=True)
+
         # Cancel all pending background tasks
         for task in self._pending_tasks:
             if not task.done():

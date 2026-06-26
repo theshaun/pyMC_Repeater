@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# pyMC Repeater - Proxmox LXC Installer
-# Creates an LXC container with USB passthrough and installs pyMC Repeater
+# openHop Repeater - Proxmox LXC Installer
+# Creates an LXC container with USB passthrough and installs openHop Repeater
 #
 # Usage (run on the Proxmox host):
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/rightup/pyMC_Repeater/main/scripts/proxmox-install.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/openhop-dev/openhop_repeater/main/scripts/proxmox-install.sh)"
 #
 # License: MIT
-# Source: https://github.com/rightup/pyMC_Repeater
+# Source: https://github.com/openhop-dev/openhop_repeater
 
 set -euo pipefail
 
 # ── Defaults ───────────────────────────────────────────────────────────────
-REPO="https://github.com/rightup/pyMC_Repeater.git"
-BRANCH="feat/newRadios"
+REPO="https://github.com/openhop-dev/openhop_repeater.git"
+BRANCH="dev"
 CT_TEMPLATE="debian-12-standard"
 CT_RAM=1024
 CT_SWAP=512
 CT_DISK=4
 CT_CORES=2
-CT_HOSTNAME="pymc-repeater"
+CT_HOSTNAME="openhop-repeater"
 CT_BRIDGE="vmbr0"
 CT_STORAGE="local-lvm"
 CT_TEMPLATE_STORAGE="local"
@@ -37,7 +37,7 @@ header() {
     clear
     echo -e "${BLD}"
     echo "═══════════════════════════════════════════════════════════════"
-    echo "         pyMC Repeater - Proxmox LXC Installer"
+    echo "         openHop Repeater - Proxmox LXC Installer"
     echo "═══════════════════════════════════════════════════════════════"
     echo -e "${CL}"
 }
@@ -79,11 +79,27 @@ else
     msg_warn "CH341 USB device not found — plug it in before starting the repeater"
 fi
 
+# Default to the next available container ID, but allow the user to choose.
+DEFAULT_CTID=$(pvesh get /cluster/nextid)
+
 # ── Interactive settings ──────────────────────────────────────────────────
 echo ""
 echo -e "${BLD}Container Settings${CL} (press Enter for defaults):"
 echo ""
 
+while true; do
+    read -p "  Container ID [${DEFAULT_CTID}]: " -r input
+    CTID="${input:-$DEFAULT_CTID}"
+    if [[ ! "$CTID" =~ ^[0-9]+$ ]]; then
+        msg_warn "Container ID must be a number"
+        continue
+    fi
+    if pct status "$CTID" &>/dev/null; then
+        msg_warn "Container ID ${CTID} already exists"
+        continue
+    fi
+    break
+done
 read -p "  Hostname [${CT_HOSTNAME}]: " -r input; CT_HOSTNAME="${input:-$CT_HOSTNAME}"
 read -p "  RAM in MB [${CT_RAM}]: " -r input; CT_RAM="${input:-$CT_RAM}"
 read -p "  Disk in GB [${CT_DISK}]: " -r input; CT_DISK="${input:-$CT_DISK}"
@@ -96,9 +112,6 @@ read -p "  Storage [${CT_STORAGE}]: " -r input; CT_STORAGE="${input:-$CT_STORAGE
 read -p "  Git branch [${BRANCH}]: " -r input; BRANCH="${input:-$BRANCH}"
 read -sp "  Root password [pymc]: " CT_PASSWORD; echo
 CT_PASSWORD="${CT_PASSWORD:-pymc}"
-
-# ── Get next CTID ─────────────────────────────────────────────────────────
-CTID=$(pvesh get /cluster/nextid)
 
 # ── Confirmation ──────────────────────────────────────────────────────────
 echo ""
@@ -141,7 +154,7 @@ msg_ok "Container created"
 msg_info "Configuring USB passthrough..."
 cat >> "/etc/pve/lxc/${CTID}.conf" <<'EOF'
 
-# CH341 USB passthrough for pyMC Repeater
+# CH341 USB passthrough for openHop Repeater
 lxc.cgroup2.devices.allow: c 189:* rwm
 lxc.mount.entry: /dev/bus/usb dev/bus/usb none bind,optional,create=dir 0 0
 EOF
@@ -177,7 +190,7 @@ pct exec "$CTID" -- bash -c "
     locale-gen >/dev/null 2>&1
     echo 'LANG=en_US.UTF-8' > /etc/default/locale
 
-    apt-get install -y git whiptail >/dev/null 2>&1
+    apt-get install -y curl git whiptail >/dev/null 2>&1
 
     # Enable auto-login on console (no password prompt in Proxmox web console)
     mkdir -p /etc/systemd/system/container-getty@1.service.d
@@ -196,41 +209,41 @@ IP=\$(hostname -I | awk '{print \$1}')
 OS=\$(. /etc/os-release && echo \"\$NAME\")
 VER=\$(. /etc/os-release && echo \"\$VERSION_ID\")
 echo \"\"
-echo \"    pyMC Repeater LXC Container\"
-echo \"    🌐  GitHub: https://github.com/rightup/pyMC_Repeater\"
+echo \"    openHop Repeater LXC Container\"
+echo \"    🌐  GitHub: https://github.com/openhop-dev/openhop_repeater\"
 echo \"\"
 echo \"    🖥️   OS: \$OS - Version: \$VER\"
 echo \"    🏠  Hostname: \$HOSTNAME\"
 echo \"    💡  IP Address: \$IP\"
 echo \"    📡  Dashboard: http://\$IP:8000\"
 echo \"\"
-echo \"    Management: cd /opt/pymc_repeater && bash manage.sh\"
+echo \"    Management: cd /opt/openhop_repeater && bash manage.sh\"
 echo \"\"
 MOTD
     chmod +x /etc/profile.d/pymc-motd.sh
 "
-msg_ok "Git installed, locale fixed, console auto-login enabled"
+msg_ok "curl/git installed, locale fixed, console auto-login enabled"
 
-msg_info "Cloning pyMC_Repeater (branch: ${BRANCH})..."
-pct exec "$CTID" -- bash -c "git clone --branch ${BRANCH} ${REPO} /root/pyMC_Repeater"
+msg_info "Cloning openhop-repeater (branch: ${BRANCH})..."
+pct exec "$CTID" -- bash -c "git clone --branch ${BRANCH} ${REPO} /root/openhop-repeater"
 msg_ok "Repository cloned"
 
 # Pre-seed config with CH341 radio type and correct GPIO pins
 pct exec "$CTID" -- bash -c "
-    mkdir -p /etc/pymc_repeater
-    if [ -f /root/pyMC_Repeater/config.yaml.example ]; then
-        cp /root/pyMC_Repeater/config.yaml.example /etc/pymc_repeater/config.yaml
+    mkdir -p /etc/openhop_repeater
+    if [ -f /root/openhop-repeater/config.yaml.example ]; then
+        cp /root/openhop-repeater/config.yaml.example /etc/openhop_repeater/config.yaml
         # Set radio type to CH341
-        sed -i 's/^radio_type: sx1262$/radio_type: sx1262_ch341/' /etc/pymc_repeater/config.yaml
+        sed -i 's/^radio_type: sx1262$/radio_type: sx1262_ch341/' /etc/openhop_repeater/config.yaml
         # Replace Pi BCM GPIO pins with CH341 GPIO pin numbers (0-7)
-        sed -i 's/cs_pin: 21/cs_pin: 0/'       /etc/pymc_repeater/config.yaml
-        sed -i 's/reset_pin: 18/reset_pin: 2/'  /etc/pymc_repeater/config.yaml
-        sed -i 's/busy_pin: 20/busy_pin: 4/'    /etc/pymc_repeater/config.yaml
-        sed -i 's/irq_pin: 16/irq_pin: 6/'      /etc/pymc_repeater/config.yaml
-        sed -i 's/rxen_pin: -1/rxen_pin: 1/'     /etc/pymc_repeater/config.yaml
+        sed -i 's/cs_pin: 21/cs_pin: 0/'       /etc/openhop_repeater/config.yaml
+        sed -i 's/reset_pin: 18/reset_pin: 2/'  /etc/openhop_repeater/config.yaml
+        sed -i 's/busy_pin: 20/busy_pin: 4/'    /etc/openhop_repeater/config.yaml
+        sed -i 's/irq_pin: 16/irq_pin: 6/'      /etc/openhop_repeater/config.yaml
+        sed -i 's/rxen_pin: -1/rxen_pin: 1/'     /etc/openhop_repeater/config.yaml
         # Enable TCXO and DIO2 RF switch for E22 module
-        sed -i 's/use_dio3_tcxo: false/use_dio3_tcxo: true/' /etc/pymc_repeater/config.yaml
-        sed -i 's/use_dio2_rf: false/use_dio2_rf: true/'     /etc/pymc_repeater/config.yaml
+        sed -i 's/use_dio3_tcxo: false/use_dio3_tcxo: true/' /etc/openhop_repeater/config.yaml
+        sed -i 's/use_dio2_rf: false/use_dio2_rf: true/'     /etc/openhop_repeater/config.yaml
     fi
 "
 
@@ -238,7 +251,7 @@ pct exec "$CTID" -- bash -c "
 msg_info "Running manage.sh install (this will take several minutes)..."
 echo ""
 # Use lxc-attach with a pty so manage.sh gets an interactive terminal
-lxc-attach -n "$CTID" -- bash -c "cd /root/pyMC_Repeater && TERM=xterm bash manage.sh install"
+lxc-attach -n "$CTID" -- bash -c "cd /root/openhop-repeater && TERM=xterm bash manage.sh install"
 echo ""
 msg_ok "manage.sh install completed"
 
@@ -250,7 +263,7 @@ CT_IP=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')
 echo ""
 echo -e "${BLD}"
 echo "═══════════════════════════════════════════════════════════════"
-echo "        ✓ pyMC Repeater Installation Complete!"
+echo "        ✓ openHop Repeater Installation Complete!"
 echo "═══════════════════════════════════════════════════════════════"
 echo -e "${CL}"
 echo -e "  Container:   ${GN}${CTID}${CL} (${CT_HOSTNAME})"
@@ -258,6 +271,6 @@ echo -e "  IP Address:  ${GN}${CT_IP:-unknown}${CL}"
 echo -e "  Dashboard:   ${GN}http://${CT_IP:-<ip>}:8000${CL}"
 echo ""
 echo "  Next: open the dashboard and complete the setup wizard"
-echo "  Management: pct enter ${CTID}, then: cd /opt/pymc_repeater && bash manage.sh"
+echo "  Management: pct enter ${CTID}, then: cd /opt/openhop_repeater && bash manage.sh"
 echo ""
 echo "═══════════════════════════════════════════════════════════════"

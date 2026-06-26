@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build production .deb package for pyMC_Repeater
+# Build production .deb package for openhop-repeater
 # Requires a clean git tag - fails if not on a tagged commit
 
 set -euo pipefail
@@ -31,7 +31,7 @@ log_step() {
 cd "$(dirname "$0")/.."
 PROJECT_ROOT=$(pwd)
 
-log_info "Building production .deb package for pyMC_Repeater..."
+log_info "Building production .deb package for openhop-repeater..."
 log_info "Project root: $PROJECT_ROOT"
 
 # Check if we're in a git repository
@@ -106,7 +106,7 @@ log_info "Debian version: $DEBIAN_VERSION"
 log_step "Updating debian/changelog..."
 CHANGELOG_DATE=$(date -R)
 cat > debian/changelog << EOF
-pymc-repeater ($DEBIAN_VERSION) stable; urgency=medium
+openhop-repeater ($DEBIAN_VERSION) stable; urgency=medium
 
   * Production release $VERSION
   * Git tag: $TAG
@@ -119,11 +119,11 @@ log_info "Changelog updated with version $DEBIAN_VERSION"
 
 # Clean previous builds
 log_step "Cleaning previous builds..."
-rm -rf debian/pymc-repeater/
+rm -rf debian/openhop-repeater/
 rm -rf debian/.debhelper/
 rm -rf debian/files
-rm -f debian/pymc-repeater.*.debhelper
-rm -f debian/pymc-repeater.substvars
+rm -f debian/openhop-repeater.*.debhelper
+rm -f debian/openhop-repeater.substvars
 rm -f debian/*.log
 rm -rf .pybuild/
 rm -rf build/
@@ -146,7 +146,7 @@ else
 fi
 
 # Find and display the built package
-DEB_FILE=$(find .. -maxdepth 1 -name "pymc-repeater_${DEBIAN_VERSION}_*.deb" -type f | head -n 1)
+DEB_FILE=$(find .. -maxdepth 1 -name "openhop-repeater_${DEBIAN_VERSION}_*.deb" -type f | head -n 1)
 
 if [ -n "$DEB_FILE" ]; then
     # Run lintian to check package quality

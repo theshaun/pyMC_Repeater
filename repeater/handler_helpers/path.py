@@ -12,7 +12,7 @@ class PathHelper:
 
     async def process_path_packet(self, packet):
 
-        from pymc_core.protocol.crypto import CryptoUtils
+        from openhop_core.protocol.crypto import CryptoUtils
 
         try:
             if len(packet.payload) < 2:
@@ -62,7 +62,7 @@ class PathHelper:
             # Parse decrypted PATH data
             # Format: path_len(1) + path[path_len] + extra_type(1) + extra[...]
             if len(decrypted) < 1:
-                logger.debug(f"Decrypted PATH data too short")
+                logger.debug("Decrypted PATH data too short")
                 return False
 
             path_len = decrypted[0]

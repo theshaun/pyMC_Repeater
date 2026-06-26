@@ -1,5 +1,5 @@
 """
-Discovery request/response handling helper for pyMC Repeater.
+Discovery request/response handling helper for openHop Repeater.
 
 This module handles the processing and response to discovery requests,
 allowing other nodes to discover repeaters on the mesh network.
@@ -7,10 +7,20 @@ allowing other nodes to discover repeaters on the mesh network.
 
 import asyncio
 import logging
+import secrets
 
-from pymc_core.node.handlers.control import ControlHandler
+from openhop_core.node.handlers.control import ControlHandler
 
 logger = logging.getLogger("DiscoveryHelper")
+
+# Default upper bound (ms) for the randomized pre-send jitter applied to node
+# discovery responses. A node-discover request is a broadcast that every
+# in-range repeater answers at once, so without jitter they all transmit at the
+# same engine-scheduled instant and collide. Mirrors the firmware, which spreads
+# these replies deliberately (MyMesh.cpp:797, sendZeroHop with
+# getRetransmitDelay*4). Safe to be generous: the requester's discovery window is
+# 60s (firmware pending_discover_until = futureMillis(60000)).
+DEFAULT_DISCOVERY_RESPONSE_JITTER_MS = 2000
 
 
 class DiscoveryHelper:
@@ -23,6 +33,7 @@ class DiscoveryHelper:
         node_type: int = 2,
         log_fn=None,
         debug_log_fn=None,
+        response_jitter_ms: int = DEFAULT_DISCOVERY_RESPONSE_JITTER_MS,
     ):
         """
         Initialize the discovery helper.
@@ -34,10 +45,14 @@ class DiscoveryHelper:
             log_fn: Optional logging function for ControlHandler
             debug_log_fn: Optional logging for verbose ControlHandler messages (e.g. callback
                 presence). Pass logger.debug to avoid INFO noise when forwarding to companions.
+            response_jitter_ms: Upper bound (ms) for the randomized delay added before
+                transmitting a discovery response, to avoid multiple repeaters colliding
+                when answering the same broadcast. Set to 0 to disable (e.g. in tests).
         """
         self.local_identity = local_identity
         self.packet_injector = packet_injector  # Function to inject packets into router
         self.node_type = node_type
+        self.response_jitter_ms = max(0, int(response_jitter_ms))
 
         # Create ControlHandler internally as a parsing utility
         self.control_handler = ControlHandler(
@@ -118,7 +133,7 @@ class DiscoveryHelper:
         try:
             our_pub_key = self.local_identity.get_public_key()
 
-            from pymc_core.protocol.packet_builder import PacketBuilder
+            from openhop_core.protocol.packet_builder import PacketBuilder
 
             response_packet = PacketBuilder.create_discovery_response(
                 tag=tag,
@@ -147,6 +162,18 @@ class DiscoveryHelper:
             tag: The tag for logging purposes
         """
         try:
+            # Randomized pre-send jitter so multiple repeaters answering the same
+            # zero-hop discovery broadcast don't transmit at the same engine-scheduled
+            # instant and collide (the engine's DIRECT delay is fixed, not random).
+            # Mirrors firmware MyMesh.cpp:797. Uses secrets like the engine's TX jitter.
+            if self.response_jitter_ms > 0:
+                jitter_s = secrets.randbelow(self.response_jitter_ms + 1) / 1000.0
+                if jitter_s > 0:
+                    logger.debug(
+                        f"Discovery response jitter {jitter_s * 1000:.0f}ms for tag 0x{tag:08X}"
+                    )
+                    await asyncio.sleep(jitter_s)
+
             success = await self.packet_injector(packet, wait_for_ack=False)
             if success:
                 logger.info(f"Response sent for tag 0x{tag:08X}")

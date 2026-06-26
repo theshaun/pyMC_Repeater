@@ -5,23 +5,30 @@ ARG USER=repeater
 ARG GROUP=repeater
 ARG PUID=15888
 ARG PGID=15888
+ARG DIALOUT_GID=20
+ARG GPIO_GID=986
+ARG SPI_GID=989
 ARG TARGETARCH
 ARG YQ_VERSION=v4.40.5
 
-ENV INSTALL_DIR=/opt/pymc_repeater \
-    CONFIG_DIR=/etc/pymc_repeater \
-    DATA_DIR=/var/lib/pymc_repeater \
+ENV INSTALL_DIR=/opt/openhop_repeater \
+    CONFIG_DIR=/etc/openhop_repeater \
+    DATA_DIR=/var/lib/openhop_repeater \
     HOME_DIR=/home/${USER} \
     PATH=/home/${USER}/.local/bin:${PATH} \
     PYTHONUNBUFFERED=1 \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYMC_REPEATER=${PACKAGE_VERSION} \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER=${PACKAGE_VERSION} \
     PUID=${PUID} \
-    PGID=${PGID}
+    PGID=${PGID} \
+    DIALOUT_GID=${DIALOUT_GID} \
+    GPIO_GID=${GPIO_GID} \
+    SPI_GID=${SPI_GID}
 
 # Install runtime dependencies only
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
     libffi-dev \
-    python3-rrdtool \
+    librrd-dev \
+    pkg-config \
     jq \
     wget \
     libusb-1.0-0 \
@@ -44,7 +51,11 @@ RUN arch="${TARGETARCH:-}" \
 
 # Create the group and user in order to run without root privileges
 RUN groupadd --gid "$PGID" "$GROUP" \
-    && useradd --uid "$PUID" --gid "$PGID" --home-dir "$HOME_DIR" --create-home --shell /usr/bin/bash "$USER"
+    && (getent group dialout >/dev/null || groupadd --gid "$DIALOUT_GID" dialout) \
+    && groupadd --gid "$GPIO_GID" gpio \
+    && groupadd --gid "$SPI_GID" spi \
+    && useradd --uid "$PUID" --gid "$PGID" --home-dir "$HOME_DIR" --create-home --shell /usr/bin/bash "$USER" \
+    && usermod -a -G dialout,gpio,spi "$USER"
 
 # Create runtime directories
 RUN mkdir -p ${INSTALL_DIR} ${CONFIG_DIR} ${DATA_DIR} \
@@ -64,7 +75,7 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 USER ${USER}
 
 # Install package
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[rrd]"
 
 USER root
 

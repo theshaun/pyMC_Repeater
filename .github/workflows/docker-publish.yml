@@ -10,14 +10,14 @@ on:
       image_repository:
         description: "Docker image repository to publish to"
         required: false
-        default: "pymcdev/pymc-repeater"
+        default: "openhop/openhop-repeater"
 
 jobs:
   docker:
     if: |
       github.event_name == 'workflow_dispatch' ||
-      github.repository == 'pyMC-dev/pyMC_Repeater' ||
-      github.repository == 'yellowcooln/pyMC_Repeater'
+      github.repository == 'openhop-dev/openhop_repeater' ||
+      github.repository == 'yellowcooln/openhop_repeater'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -58,10 +58,10 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_repository }}" ]; then
             image_repository="${{ inputs.image_repository }}"
-          elif [ "${{ github.repository }}" = "yellowcooln/pyMC_Repeater" ]; then
-            image_repository="yellowcooln/pymc-repeater"
+          elif [ "${{ github.repository }}" = "yellowcooln/openhop_repeater" ]; then
+            image_repository="yellowcooln/openhop-repeater"
           else
-            image_repository="pymcdev/pymc-repeater"
+            image_repository="openhop/openhop-repeater"
           fi
 
           echo "Using image repository: ${image_repository}"
@@ -92,7 +92,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Notify Home Assistant add-on repository
-        if: github.repository == 'pyMC-dev/pyMC_Repeater'
+        if: github.repository == 'openhop-dev/openhop_repeater'
         env:
           DISPATCH_TOKEN: ${{ secrets.HA_ADDON_REPO_DISPATCH_TOKEN }}
           CHANNEL: ${{ github.ref_name }}
@@ -107,5 +107,5 @@ jobs:
             -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
-            https://api.github.com/repos/pyMC-dev/pyMC-HA-Add-on/dispatches \
+            https://api.github.com/repos/openhop-dev/openHop-HA-Add-on/dispatches \
             -d "{\"event_type\":\"sync-upstream-channel\",\"client_payload\":{\"channel\":\"${CHANNEL}\",\"revision\":\"${REVISION}\"}}"

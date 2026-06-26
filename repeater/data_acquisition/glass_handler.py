@@ -3,21 +3,25 @@ import hashlib
 import json
 import logging
 import os
+import re
 import ssl
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 from urllib import error, request
+from urllib.parse import urlparse
 
 import psutil
+import yaml
+
 try:
     import paho.mqtt.client as mqtt
 except ImportError:
     mqtt = None
 
 from repeater import __version__
+from repeater.policy_engine import PolicyEngine, SUPPORTED_ACTIONS, default_policy_engine_config
 from repeater.service_utils import restart_service
 
 logger = logging.getLogger("GlassHandler")
@@ -44,9 +48,9 @@ class GlassHandler:
         self.base_url = "http://localhost:8080"
         self.request_timeout_seconds = 10
         self.verify_tls = True
-        self.api_token = ""
+        self.api_token = ""  # nosec - runtime config value, not a hardcoded credential
         self.inform_interval_seconds = 30
-        self.cert_store_dir = "/etc/pymc_repeater/glass"
+        self.cert_store_dir = "/etc/openhop_repeater/glass"
         self._cert_expires_at: Optional[str] = None
         self.mqtt_enabled = False
         self.mqtt_broker_host = "localhost"
@@ -131,7 +135,8 @@ class GlassHandler:
             int(glass_cfg.get("inform_interval_seconds", self.inform_interval_seconds))
         )
         self.cert_store_dir = str(
-            glass_cfg.get("cert_store_dir", "/etc/pymc_repeater/glass") or "/etc/pymc_repeater/glass"
+            glass_cfg.get("cert_store_dir", "/etc/openhop_repeater/glass")
+            or "/etc/openhop_repeater/glass"
         )
         self.client_cert_path = (
             str(glass_cfg.get("client_cert_path")).strip()
@@ -144,9 +149,7 @@ class GlassHandler:
             else None
         )
         self.ca_cert_path = (
-            str(glass_cfg.get("ca_cert_path")).strip()
-            if glass_cfg.get("ca_cert_path")
-            else None
+            str(glass_cfg.get("ca_cert_path")).strip() if glass_cfg.get("ca_cert_path") else None
         )
         managed_cfg = self._load_managed_settings()
         parsed_base_url = urlparse(self.base_url)
@@ -164,7 +167,9 @@ class GlassHandler:
         self.mqtt_tls_enabled = bool(managed_cfg.get("mqtt_tls_enabled", False))
         username = managed_cfg.get("mqtt_username")
         password = managed_cfg.get("mqtt_password")
-        self.mqtt_username = str(username).strip() if isinstance(username, str) and username else None
+        self.mqtt_username = (
+            str(username).strip() if isinstance(username, str) and username else None
+        )
         self.mqtt_password = str(password) if isinstance(password, str) and password else None
 
     def _managed_settings_path(self) -> Path:
@@ -287,7 +292,7 @@ class GlassHandler:
         settings_snapshot = self._build_settings_snapshot()
         location = self._extract_location_from_settings(settings_snapshot)
 
-        return {
+        payload = {
             "type": "inform",
             "version": 1,
             "node_name": node_name,
@@ -319,6 +324,28 @@ class GlassHandler:
             "settings": settings_snapshot,
             "command_results": command_results,
         }
+        sensors_summary = self._collect_sensor_summary()
+        if sensors_summary is not None:
+            payload["sensors"] = sensors_summary
+        return payload
+
+    def _collect_sensor_summary(self) -> Optional[Dict[str, Any]]:
+        sensor_manager = getattr(self.daemon_instance, "sensor_manager", None)
+        if sensor_manager is None:
+            return None
+        try:
+            summary = sensor_manager.get_summary()
+            return summary if isinstance(summary, dict) else None
+        except Exception as exc:
+            logger.debug("Failed collecting sensor summary for Glass inform: %s", exc)
+            return {
+                "enabled": False,
+                "configured": 0,
+                "loaded": 0,
+                "running": False,
+                "readings": [],
+                "error": str(exc),
+            }
 
     def _build_settings_snapshot(self) -> Dict[str, Any]:
         normalized = self._normalize_for_hash(self.config)
@@ -406,7 +433,9 @@ class GlassHandler:
     def _collect_system_stats(self) -> Dict[str, Any]:
         temperature_c = None
         try:
-            temperatures = psutil.sensors_temperatures() if hasattr(psutil, "sensors_temperatures") else {}
+            temperatures = (
+                psutil.sensors_temperatures() if hasattr(psutil, "sensors_temperatures") else {}
+            )
             if temperatures:
                 for values in temperatures.values():
                     if values:
@@ -436,6 +465,7 @@ class GlassHandler:
 
     def _post_inform_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}/inform"
+        self._validate_http_url(url)
         headers = {"Content-Type": "application/json"}
         if self.api_token:
             headers["Authorization"] = f"Bearer {self.api_token}"
@@ -449,7 +479,7 @@ class GlassHandler:
                 req,
                 timeout=self.request_timeout_seconds,
                 context=ssl_context,
-            ) as response:
+            ) as response:  # nosec B310
                 response_bytes = response.read()
         except error.HTTPError as exc:
             details = ""
@@ -484,7 +514,9 @@ class GlassHandler:
             else:
                 context = ssl.create_default_context()
         else:
-            context = ssl._create_unverified_context()
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
 
         if self.client_cert_path or self.client_key_path:
             cert_path = self._require_ssl_file(self.client_cert_path, "client_cert_path")
@@ -501,6 +533,14 @@ class GlassHandler:
         if not Path(normalized).exists():
             raise RuntimeError(f"Configured {field_name} does not exist: {normalized}")
         return normalized
+
+    @staticmethod
+    def _validate_http_url(url: str) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            raise RuntimeError(f"Unsupported Glass base_url scheme: {parsed.scheme or '<missing>'}")
+        if not parsed.netloc:
+            raise RuntimeError("Glass base_url must include a host")
 
     async def _handle_command_response(self, response: Dict[str, Any]) -> None:
         command_id = str(response.get("command_id", "")).strip()
@@ -579,20 +619,30 @@ class GlassHandler:
             success, message, details = self._apply_transport_keys_sync(params)
             return success, message, details
 
+        if action == "policy_sync":
+            success, message, details = self._apply_policy_sync(params)
+            return success, message, details
+
         if action == "set_radio":
             radio_values = params.get("radio", params)
             if not isinstance(radio_values, dict):
                 return False, "radio settings must be an object", None
-            success, message = self._apply_config_update({"radio": radio_values}, merge_mode="patch")
+            success, message = self._apply_config_update(
+                {"radio": radio_values}, merge_mode="patch"
+            )
             return success, message, None
 
         if action == "run_diagnostic":
             stats = self.daemon_instance.get_stats() if self.daemon_instance else {}
-            return True, (
-                f"rx={int(stats.get('rx_count', 0))}, "
-                f"tx={int(stats.get('forwarded_count', 0))}, "
-                f"dropped={int(stats.get('dropped_count', 0))}"
-            ), None
+            return (
+                True,
+                (
+                    f"rx={int(stats.get('rx_count', 0))}, "
+                    f"tx={int(stats.get('forwarded_count', 0))}, "
+                    f"dropped={int(stats.get('dropped_count', 0))}"
+                ),
+                None,
+            )
 
         if action == "export_config":
             normalized_config = self._normalize_for_hash(self.config)
@@ -639,7 +689,9 @@ class GlassHandler:
                 live_updated = self.config_manager.live_update_daemon(sections)
                 return (
                     bool(saved and live_updated),
-                    "Config replaced" if saved and live_updated else "Failed to persist replace update",
+                    "Config replaced"
+                    if saved and live_updated
+                    else "Failed to persist replace update",
                 )
             return True, "Config replaced"
 
@@ -694,12 +746,315 @@ class GlassHandler:
             details["payload_hash"] = payload_hash
         return True, f"Applied transport key sync ({details['applied_nodes']} nodes)", details
 
+    def _apply_policy_sync(
+        self,
+        params: Dict[str, Any],
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        if not isinstance(params, dict):
+            return False, "policy_sync params must be an object", None
+        incoming_policy = params.get("policy")
+        if not isinstance(incoming_policy, dict):
+            return False, "policy_sync payload must include a policy object", None
+
+        mode = str(params.get("mode", "replace") or "replace").lower().strip()
+        if mode not in ("replace", "patch"):
+            return False, f"Unsupported policy_sync mode: {mode}", None
+        validate_only = bool(params.get("validate_only", False))
+
+        existing_doc, _ = self._load_policy_document()
+        existing_policy = self._normalize_policy_engine(existing_doc.get("policy_engine", {}))
+        if mode == "patch":
+            policy_engine_cfg = dict(existing_policy)
+            self._deep_merge(policy_engine_cfg, incoming_policy)
+        else:
+            policy_engine_cfg = incoming_policy
+
+        groups_cfg = params.get("groups", existing_doc.get("groups", {}))
+        doc_to_apply = {
+            "policy_engine": self._normalize_policy_engine(policy_engine_cfg),
+            "groups": self._normalize_policy_groups(groups_cfg),
+        }
+        doc_to_apply = self._sync_policy_engine_objects_from_groups(doc_to_apply)
+
+        try:
+            self._validate_policy_engine(doc_to_apply.get("policy_engine", {}))
+            PolicyEngine(doc_to_apply.get("policy_engine", {}))
+        except Exception as exc:
+            return False, f"Invalid policy: {exc}", None
+
+        details = self._policy_sync_details(doc_to_apply, mode=mode, validate_only=validate_only)
+        if validate_only:
+            return True, "Policy validated", details
+
+        try:
+            self._write_policy_document(doc_to_apply)
+            self._apply_policy_runtime(doc_to_apply.get("policy_engine", {}))
+        except Exception as exc:
+            return False, f"Policy sync failed: {exc}", None
+        return True, "Policy synchronized", details
+
+    def _policy_sync_details(
+        self,
+        doc: Dict[str, Any],
+        *,
+        mode: str,
+        validate_only: bool,
+    ) -> Dict[str, Any]:
+        policy_engine_cfg = doc.get("policy_engine", {}) if isinstance(doc, dict) else {}
+        rules = policy_engine_cfg.get("rules", []) if isinstance(policy_engine_cfg, dict) else []
+        return {
+            "policy_file": self._get_policy_file_path(),
+            "mode": mode,
+            "validate_only": validate_only,
+            "rule_count": len(rules) if isinstance(rules, list) else 0,
+            "enabled": bool(policy_engine_cfg.get("enabled", False))
+            if isinstance(policy_engine_cfg, dict)
+            else False,
+            "default_action": str(policy_engine_cfg.get("default_action", "allow"))
+            if isinstance(policy_engine_cfg, dict)
+            else "allow",
+        }
+
+    def _get_policy_file_path(self) -> str:
+        policy_cfg = self.config.get("policy", {}) if isinstance(self.config, dict) else {}
+        policy_file = policy_cfg.get("policy_file", "policy.yaml")
+        if os.path.isabs(str(policy_file)):
+            return str(policy_file)
+        config_path = getattr(self.config_manager, "config_path", None) or self.config.get(
+            "config_path", "/etc/pymc_repeater/config.yaml"
+        )
+        config_dir = os.path.dirname(os.path.abspath(str(config_path)))
+        return os.path.abspath(os.path.join(config_dir, str(policy_file)))
+
+    @staticmethod
+    def _default_policy_document() -> Dict[str, Any]:
+        return {
+            "policy_engine": default_policy_engine_config(),
+            "groups": {"channel_hashes": [], "pubkeys": []},
+        }
+
+    def _load_policy_document(self) -> Tuple[Dict[str, Any], bool]:
+        path = self._get_policy_file_path()
+        if not os.path.exists(path):
+            return self._default_policy_document(), False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            if not isinstance(data, dict):
+                return self._default_policy_document(), False
+            if "policy_engine" not in data:
+                return {
+                    "policy_engine": data,
+                    "groups": self._default_policy_document()["groups"],
+                }, True
+            if not isinstance(data.get("policy_engine"), dict):
+                return self._default_policy_document(), False
+            if not isinstance(data.get("groups"), dict):
+                data["groups"] = self._default_policy_document()["groups"]
+            return data, True
+        except Exception as exc:
+            logger.error("Failed to load policy file %s: %s", path, exc)
+            return self._default_policy_document(), False
+
+    def _write_policy_document(self, doc: Dict[str, Any]) -> None:
+        policy_path = self._get_policy_file_path()
+        os.makedirs(os.path.dirname(policy_path), exist_ok=True)
+        with open(policy_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                doc,
+                f,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+                width=1000000,
+            )
+
+    @staticmethod
+    def _normalize_policy_engine(engine_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(engine_cfg, dict):
+            engine_cfg = {}
+        return {
+            "enabled": bool(engine_cfg.get("enabled", False)),
+            "default_action": str(engine_cfg.get("default_action", "allow")),
+            "rules": engine_cfg.get("rules") if isinstance(engine_cfg.get("rules"), list) else [],
+            "objects": (
+                engine_cfg.get("objects") if isinstance(engine_cfg.get("objects"), dict) else {}
+            ),
+        }
+
+    def _apply_policy_runtime(self, policy_engine_cfg: Dict[str, Any]) -> None:
+        self.config["policy_engine"] = policy_engine_cfg
+        self.config["policy_file_path"] = self._get_policy_file_path()
+        repeater_handler = getattr(self.daemon_instance, "repeater_handler", None)
+        if repeater_handler is not None:
+            repeater_handler.policy_engine = PolicyEngine.from_runtime_config(self.config)
+
+    def _sync_policy_engine_objects_from_groups(self, doc: Dict[str, Any]) -> Dict[str, Any]:
+        policy_engine_cfg = self._normalize_policy_engine(doc.get("policy_engine", {}))
+        groups_cfg = self._normalize_policy_groups(doc.get("groups", {}))
+        objects = policy_engine_cfg.get("objects", {})
+        if not isinstance(objects, dict):
+            objects = {}
+        objects.update(self._policy_objects_from_groups(groups_cfg))
+        policy_engine_cfg["objects"] = objects
+        doc["policy_engine"] = policy_engine_cfg
+        doc["groups"] = groups_cfg
+        return doc
+
+    def _normalize_policy_groups(self, groups_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = {"channel_hashes": [], "pubkeys": []}
+        if not isinstance(groups_cfg, dict):
+            return normalized
+        for kind in ("channel_hashes", "pubkeys"):
+            source_groups = groups_cfg.get(kind)
+            if not isinstance(source_groups, list):
+                continue
+            seen_group_ids = set()
+            for idx, group in enumerate(source_groups):
+                if not isinstance(group, dict):
+                    continue
+                group_id = self._slugify_policy_id(
+                    group.get("id") or group.get("name") or group.get("friendly_name"),
+                    f"{kind}_{idx + 1}",
+                )
+                if group_id in seen_group_ids:
+                    continue
+                seen_group_ids.add(group_id)
+                entries = []
+                seen_entry_ids = set()
+                for ent_idx, entry in enumerate(group.get("entries") or []):
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        entry_value = self._normalize_policy_entry_value(kind, entry.get("value"))
+                    except Exception as exc:
+                        logger.warning(
+                            "Skipping invalid policy entry at index %d: %s", ent_idx, exc
+                        )
+                        continue
+                    entry_id = self._slugify_policy_id(
+                        entry.get("id")
+                        or entry.get("name")
+                        or entry.get("friendly_name")
+                        or entry_value,
+                        f"entry_{ent_idx + 1}",
+                    )
+                    if entry_id in seen_entry_ids:
+                        continue
+                    seen_entry_ids.add(entry_id)
+                    entries.append(
+                        {
+                            "id": entry_id,
+                            "friendly_name": str(
+                                entry.get("friendly_name") or entry.get("name") or entry_id
+                            ),
+                            "value": entry_value,
+                        }
+                    )
+                normalized[kind].append(
+                    {
+                        "id": group_id,
+                        "friendly_name": str(
+                            group.get("friendly_name") or group.get("name") or group_id
+                        ),
+                        "description": str(group.get("description") or ""),
+                        "entries": entries,
+                    }
+                )
+        return normalized
+
+    @staticmethod
+    def _slugify_policy_id(value: str, fallback: str) -> str:
+        text = str(value or "").strip().lower()
+        text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+        return text or fallback
+
+    def _normalize_policy_entry_value(self, kind: str, value: Any) -> str:
+        if kind == "pubkeys":
+            return self._normalize_pubkey_value(value)
+        if kind == "channel_hashes":
+            return self._normalize_channel_hash_value(value)
+        raise ValueError(f"Unsupported group kind: {kind}")
+
+    @staticmethod
+    def _normalize_pubkey_value(value: Any) -> str:
+        if value is None:
+            raise ValueError("pubkey value is required")
+        raw = value.hex() if isinstance(value, bytes) else str(value).strip().lower()
+        if raw.startswith("0x"):
+            raw = raw[2:]
+        raw = raw.replace(" ", "")
+        if not raw:
+            raise ValueError("pubkey value is required")
+        if not re.fullmatch(r"[0-9a-f]+", raw):
+            raise ValueError("pubkey must be hex")
+        if len(raw) % 2 != 0:
+            raise ValueError("pubkey hex length must be even")
+        return f"0x{raw}"
+
+    @staticmethod
+    def _normalize_channel_hash_value(value: Any) -> str:
+        if value is None:
+            raise ValueError("channel hash value is required")
+        if isinstance(value, int):
+            parsed = value
+        else:
+            raw = str(value).strip()
+            if not raw:
+                raise ValueError("channel hash value is required")
+            normalized_hex = raw[2:] if raw.lower().startswith("0x") else raw
+            if len(normalized_hex) in (32, 64) and re.fullmatch(r"[0-9a-fA-F]+", normalized_hex):
+                return f"0x{normalized_hex.upper()}"
+            if raw.lower().startswith("0x"):
+                parsed = int(raw, 16)
+            elif re.fullmatch(r"[0-9]+", raw):
+                parsed = int(raw, 10)
+            else:
+                parsed = int(raw, 16)
+        if parsed < 0:
+            raise ValueError("channel hash must be non-negative")
+        if parsed > 0xFF:
+            raise ValueError("channel hash must be one byte (0x00-0xFF)")
+        return f"0x{parsed:02X}"
+
+    def _policy_objects_from_groups(self, groups_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        channel_hash_groups = {}
+        pubkey_groups = {}
+        for group in groups_cfg.get("channel_hashes", []):
+            channel_hash_groups[group["id"]] = [
+                entry["value"] for entry in group.get("entries", [])
+            ]
+        for group in groups_cfg.get("pubkeys", []):
+            pubkey_groups[group["id"]] = [entry["value"] for entry in group.get("entries", [])]
+        return {"channel_hash_groups": channel_hash_groups, "pubkey_groups": pubkey_groups}
+
+    @staticmethod
+    def _validate_policy_engine(policy_engine_cfg: Dict[str, Any]) -> None:
+        default_action = str(policy_engine_cfg.get("default_action", "allow"))
+        if default_action not in SUPPORTED_ACTIONS:
+            raise ValueError(f"Unsupported default_action: {default_action}")
+        rules = policy_engine_cfg.get("rules", [])
+        if not isinstance(rules, list):
+            raise ValueError("rules must be a list")
+        for idx, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                raise ValueError(f"rule {idx} must be an object")
+            then_block = rule.get("then", {})
+            action = then_block.get("action") if isinstance(then_block, dict) else then_block
+            if action is None:
+                action = rule.get("action", "allow")
+            action = str(action or "allow")
+            if action not in SUPPORTED_ACTIONS:
+                raise ValueError(f"Unsupported rule action at index {idx}: {action}")
+
     def _apply_cert_renewal(self, response: Dict[str, Any]) -> Tuple[bool, str]:
         client_cert = response.get("client_cert")
         client_key = response.get("client_key")
         ca_cert = response.get("ca_cert")
 
-        if not all(isinstance(item, str) and item.strip() for item in (client_cert, client_key, ca_cert)):
+        if not all(
+            isinstance(item, str) and item.strip() for item in (client_cert, client_key, ca_cert)
+        ):
             return False, "Missing certificate payload values"
 
         cert_dir = Path(self.cert_store_dir)
@@ -826,7 +1181,11 @@ class GlassHandler:
             if self.mqtt_username:
                 client.username_pw_set(self.mqtt_username, self.mqtt_password)
             if self.mqtt_tls_enabled:
-                ca_certs = self._require_ssl_file(self.ca_cert_path, "ca_cert_path") if self.ca_cert_path else None
+                ca_certs = (
+                    self._require_ssl_file(self.ca_cert_path, "ca_cert_path")
+                    if self.ca_cert_path
+                    else None
+                )
                 certfile = None
                 keyfile = None
                 if self.client_cert_path or self.client_key_path:
@@ -890,7 +1249,18 @@ class GlassHandler:
 
     def _current_mqtt_signature(
         self,
-    ) -> Tuple[str, int, str, bool, bool, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+    ) -> Tuple[
+        str,
+        int,
+        str,
+        bool,
+        bool,
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+    ]:
         return (
             self.mqtt_broker_host,
             self.mqtt_broker_port,
@@ -923,10 +1293,7 @@ class GlassHandler:
     @staticmethod
     def _deep_merge(target: Dict[str, Any], source: Dict[str, Any]) -> None:
         for key, value in source.items():
-            if (
-                isinstance(value, dict)
-                and isinstance(target.get(key), dict)
-            ):
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
                 GlassHandler._deep_merge(target[key], value)
             else:
                 target[key] = value

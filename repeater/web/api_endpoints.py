@@ -1,13 +1,16 @@
 import json
 import logging
 import os
+import re
+import secrets
 import time
-from datetime import datetime
-from pathlib import Path
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 import cherrypy
-from pymc_core.protocol import CryptoUtils
+import yaml
+from openhop_core.protocol import CryptoUtils
 
 from repeater import __version__
 from repeater.companion.identity_resolve import (
@@ -15,7 +18,15 @@ from repeater.companion.identity_resolve import (
     find_companion_index,
     heal_companion_empty_names,
 )
-from repeater.config import resolve_storage_dir, update_unscoped_flood_policy
+from repeater.companion.utils import (
+    CompanionContactCapacityError,
+    merge_companion_settings_update,
+    parse_companion_bridge_kwargs,
+    trim_companion_contacts_to_fit,
+    validate_companion_config_capacity,
+)
+from repeater.config import resolve_storage_dir
+from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
 
 from .auth.middleware import require_auth
@@ -25,6 +36,14 @@ from .companion_endpoints import CompanionAPIEndpoints
 from .update_endpoints import UpdateAPIEndpoints
 
 logger = logging.getLogger("HTTPServer")
+
+POLICY_GROUP_KINDS = {
+    "channel_hash": "channel_hashes",
+    "channel_hashes": "channel_hashes",
+    "channels": "channel_hashes",
+    "pubkey": "pubkeys",
+    "pubkeys": "pubkeys",
+}
 
 
 # ============================================================================
@@ -45,6 +64,7 @@ logger = logging.getLogger("HTTPServer")
 # GET    /api/gps - Get local GPS diagnostics and parsed NMEA attributes
 # GET    /api/gps_stream - GPS diagnostics SSE stream
 # GET    /api/logs - Get system logs
+# GET    /api/logs_stream - Stream live system logs over SSE
 # GET    /api/hardware_stats - Get hardware statistics
 # GET    /api/hardware_processes - Get process information
 # GET    /api/validate_config - Validate config.yaml syntax and required settings
@@ -95,6 +115,7 @@ logger = logging.getLogger("HTTPServer")
 # GET    /api/transport_keys - List all transport keys
 # POST   /api/transport_keys - Create new transport key
 # GET    /api/transport_key?key_id=X - Get specific transport key
+# PUT    /api/transport_key?key_id=X - Update transport key
 # DELETE /api/transport_key?key_id=X - Delete transport key
 
 # Network Policy
@@ -164,7 +185,6 @@ logger = logging.getLogger("HTTPServer")
 
 
 class APIEndpoints:
-
     def __init__(
         self,
         stats_getter: Optional[Callable] = None,
@@ -179,7 +199,7 @@ class APIEndpoints:
         self.config = config or {}
         self.event_loop = event_loop
         self.daemon_instance = daemon_instance
-        self._config_path = config_path or "/etc/pymc_repeater/config.yaml"
+        self._config_path = config_path or "/etc/openhop_repeater/config.yaml"
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
         # Initialize ConfigManager for centralized config management
@@ -319,6 +339,627 @@ class APIEndpoints:
         }
         return has_default_name or has_default_password or radio_not_configured, reasons
 
+    def _default_policy_document(self) -> dict:
+        return {
+            "policy_engine": {
+                "enabled": False,
+                "default_action": "allow",
+                "rules": [],
+                "objects": {},
+            },
+            "groups": {
+                "channel_hashes": [],
+                "pubkeys": [],
+            },
+        }
+
+    @staticmethod
+    def _slugify_policy_id(value: str, fallback: str) -> str:
+        text = str(value or "").strip().lower()
+        text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+        return text or fallback
+
+    def _normalize_policy_group_kind(self, raw_kind) -> Optional[str]:
+        if raw_kind is None:
+            return None
+        key = str(raw_kind).strip().lower()
+        return POLICY_GROUP_KINDS.get(key)
+
+    def _normalize_pubkey_value(self, value) -> str:
+        if value is None:
+            raise ValueError("pubkey value is required")
+        if isinstance(value, bytes):
+            raw = value.hex()
+        else:
+            raw = str(value).strip().lower()
+        if raw.startswith("0x"):
+            raw = raw[2:]
+        raw = raw.replace(" ", "")
+        if not raw:
+            raise ValueError("pubkey value is required")
+        if not re.fullmatch(r"[0-9a-f]+", raw):
+            raise ValueError("pubkey must be hex")
+        if len(raw) % 2 != 0:
+            raise ValueError("pubkey hex length must be even")
+        return f"0x{raw}"
+
+    def _normalize_channel_hash_value(self, value) -> str:
+        if value is None:
+            raise ValueError("channel hash value is required")
+
+        if isinstance(value, int):
+            parsed = value
+        else:
+            raw = str(value).strip()
+            if not raw:
+                raise ValueError("channel hash value is required")
+            normalized_hex = raw[2:] if raw.lower().startswith("0x") else raw
+            if len(normalized_hex) in (32, 64) and re.fullmatch(r"[0-9a-fA-F]+", normalized_hex):
+                return f"0x{normalized_hex.upper()}"
+            if raw.lower().startswith("0x"):
+                parsed = int(raw, 16)
+            elif re.fullmatch(r"[0-9]+", raw):
+                parsed = int(raw, 10)
+            else:
+                parsed = int(raw, 16)
+
+        if parsed < 0:
+            raise ValueError("channel hash must be non-negative")
+        if parsed > 0xFF:
+            raise ValueError("channel hash must be one byte (0x00-0xFF)")
+        return f"0x{parsed:02X}"
+
+    def _normalize_policy_entry_value(self, kind: str, value) -> str:
+        if kind == "pubkeys":
+            return self._normalize_pubkey_value(value)
+        if kind == "channel_hashes":
+            return self._normalize_channel_hash_value(value)
+        raise ValueError(f"Unsupported group kind: {kind}")
+
+    def _normalize_policy_groups(self, groups_cfg: dict) -> dict:
+        normalized = {"channel_hashes": [], "pubkeys": []}
+
+        if not isinstance(groups_cfg, dict):
+            return normalized
+
+        for kind in ("channel_hashes", "pubkeys"):
+            source_groups = groups_cfg.get(kind)
+            if not isinstance(source_groups, list):
+                continue
+
+            seen_group_ids = set()
+            for idx, group in enumerate(source_groups):
+                if not isinstance(group, dict):
+                    continue
+                group_id = self._slugify_policy_id(
+                    group.get("id") or group.get("name") or group.get("friendly_name"),
+                    f"{kind}_{idx + 1}",
+                )
+                if group_id in seen_group_ids:
+                    continue
+                seen_group_ids.add(group_id)
+
+                friendly_name = str(group.get("friendly_name") or group.get("name") or group_id)
+                description = str(group.get("description") or "")
+                entries = []
+                seen_entry_ids = set()
+
+                for ent_idx, entry in enumerate(group.get("entries") or []):
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        entry_value = self._normalize_policy_entry_value(kind, entry.get("value"))
+                    except Exception as exc:
+                        logger.warning(
+                            "Skipping invalid policy entry at index %d: %s", ent_idx, exc
+                        )
+
+                        continue
+
+                    entry_id = self._slugify_policy_id(
+                        entry.get("id")
+                        or entry.get("name")
+                        or entry.get("friendly_name")
+                        or entry_value,
+                        f"entry_{ent_idx + 1}",
+                    )
+                    if entry_id in seen_entry_ids:
+                        continue
+                    seen_entry_ids.add(entry_id)
+
+                    entry_friendly_name = str(
+                        entry.get("friendly_name") or entry.get("name") or entry_id
+                    )
+                    entries.append(
+                        {
+                            "id": entry_id,
+                            "friendly_name": entry_friendly_name,
+                            "value": entry_value,
+                        }
+                    )
+
+                normalized[kind].append(
+                    {
+                        "id": group_id,
+                        "friendly_name": friendly_name,
+                        "description": description,
+                        "entries": entries,
+                    }
+                )
+
+        return normalized
+
+    def _policy_objects_from_groups(self, groups_cfg: dict) -> dict:
+        channel_hash_groups = {}
+        pubkey_groups = {}
+
+        for group in groups_cfg.get("channel_hashes", []):
+            channel_hash_groups[group["id"]] = [
+                entry["value"] for entry in group.get("entries", [])
+            ]
+
+        for group in groups_cfg.get("pubkeys", []):
+            pubkey_groups[group["id"]] = [entry["value"] for entry in group.get("entries", [])]
+
+        return {
+            "channel_hash_groups": channel_hash_groups,
+            "pubkey_groups": pubkey_groups,
+        }
+
+    def _write_policy_document(self, doc: dict) -> None:
+        policy_path = self._get_policy_file_path()
+        os.makedirs(os.path.dirname(policy_path), exist_ok=True)
+        with open(policy_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                doc,
+                f,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+                width=1000000,
+            )
+
+    def _sync_policy_engine_objects_from_groups(self, doc: dict) -> dict:
+        policy_engine_cfg = self._normalize_policy_engine(doc.get("policy_engine", {}))
+        groups_cfg = self._normalize_policy_groups(doc.get("groups", {}))
+
+        objects = policy_engine_cfg.get("objects", {})
+        if not isinstance(objects, dict):
+            objects = {}
+        objects.update(self._policy_objects_from_groups(groups_cfg))
+
+        policy_engine_cfg["objects"] = objects
+        doc["policy_engine"] = policy_engine_cfg
+        doc["groups"] = groups_cfg
+        return doc
+
+    def _get_policy_file_path(self) -> str:
+        policy_cfg = self.config.get("policy", {}) if isinstance(self.config, dict) else {}
+        policy_file = policy_cfg.get("policy_file", "policy.yaml")
+
+        config_dir = os.path.dirname(os.path.abspath(self._config_path))
+        if os.path.isabs(str(policy_file)):
+            return str(policy_file)
+        return os.path.abspath(os.path.join(config_dir, str(policy_file)))
+
+    def _load_policy_document(self) -> tuple[dict, bool]:
+        path = self._get_policy_file_path()
+        if not os.path.exists(path):
+            return self._default_policy_document(), False
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            if not isinstance(data, dict):
+                return self._default_policy_document(), False
+            if "policy_engine" not in data:
+                return {"policy_engine": data}, True
+            if not isinstance(data.get("policy_engine"), dict):
+                return self._default_policy_document(), False
+            return data, True
+        except Exception as e:
+            logger.error(f"Failed to load policy file {path}: {e}")
+            return self._default_policy_document(), False
+
+    @staticmethod
+    def _normalize_policy_engine(engine_cfg: dict) -> dict:
+        normalized = {
+            "enabled": bool(engine_cfg.get("enabled", False)),
+            "default_action": str(engine_cfg.get("default_action", "allow")),
+            "rules": engine_cfg.get("rules") if isinstance(engine_cfg.get("rules"), list) else [],
+            "objects": (
+                engine_cfg.get("objects") if isinstance(engine_cfg.get("objects"), dict) else {}
+            ),
+        }
+        return normalized
+
+    def _apply_policy_runtime(self, policy_engine_cfg: dict) -> None:
+        self.config["policy_engine"] = policy_engine_cfg
+        self.config["policy_file_path"] = self._get_policy_file_path()
+
+        if not self.daemon_instance:
+            return
+        repeater_handler = getattr(self.daemon_instance, "repeater_handler", None)
+        if not repeater_handler:
+            return
+        try:
+            repeater_handler.policy_engine = PolicyEngine.from_runtime_config(self.config)
+        except Exception as e:
+            logger.warning(f"Failed to apply runtime policy engine update: {e}")
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def policy(self, **kwargs):
+        """GET/POST policy.yaml next to config.yaml.
+
+        GET: returns policy document and file metadata.
+        POST: writes policy document and applies runtime policy engine refresh.
+        """
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        policy_path = self._get_policy_file_path()
+
+        if cherrypy.request.method == "GET":
+            doc, exists = self._load_policy_document()
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            normalized = self._normalize_policy_engine(doc.get("policy_engine", {}))
+            return self._success(
+                {
+                    "policy_file": policy_path,
+                    "exists": exists,
+                    "policy_engine": normalized,
+                    "groups": doc.get("groups", self._default_policy_document().get("groups", {})),
+                }
+            )
+
+        if cherrypy.request.method != "POST":
+            return self._error("Method not supported")
+
+        try:
+            self._require_post()
+            body = cherrypy.request.json or {}
+
+            if not isinstance(body, dict):
+                return self._error("Invalid payload: expected JSON object")
+
+            if isinstance(body.get("policy_engine"), dict):
+                policy_engine_cfg = body.get("policy_engine")
+            else:
+                # Allow posting the policy_engine object directly.
+                policy_engine_cfg = body
+
+            existing_doc, _ = self._load_policy_document()
+            groups_from_body = body.get("groups")
+            if groups_from_body is None:
+                normalized_groups = self._normalize_policy_groups(existing_doc.get("groups", {}))
+            else:
+                normalized_groups = self._normalize_policy_groups(groups_from_body)
+
+            normalized = self._normalize_policy_engine(policy_engine_cfg)
+            if "objects" not in policy_engine_cfg and isinstance(
+                existing_doc.get("policy_engine", {}).get("objects"), dict
+            ):
+                normalized["objects"] = dict(
+                    existing_doc.get("policy_engine", {}).get("objects", {})
+                )
+
+            doc_to_write = {
+                "policy_engine": normalized,
+                "groups": normalized_groups,
+            }
+            doc_to_write = self._sync_policy_engine_objects_from_groups(doc_to_write)
+            self._write_policy_document(doc_to_write)
+
+            # Validate via PolicyEngine construction and apply live.
+            PolicyEngine(doc_to_write.get("policy_engine", {}))
+            self._apply_policy_runtime(doc_to_write.get("policy_engine", {}))
+
+            logger.info("Policy updated and saved to %s", policy_path)
+            return self._success(
+                {
+                    "policy_file": policy_path,
+                    "policy_engine": doc_to_write.get("policy_engine", {}),
+                    "groups": doc_to_write.get("groups", {}),
+                },
+                message="Policy updated and applied",
+                restart_required=False,
+            )
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating policy: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def policy_validate(self):
+        """Validate policy payload without saving it."""
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            body = cherrypy.request.json or {}
+            if not isinstance(body, dict):
+                return self._error("Invalid payload: expected JSON object")
+
+            if isinstance(body.get("policy_engine"), dict):
+                policy_engine_cfg = body.get("policy_engine")
+            else:
+                policy_engine_cfg = body
+
+            normalized = self._normalize_policy_engine(policy_engine_cfg)
+            engine = PolicyEngine(normalized)
+
+            return self._success(
+                {
+                    "valid": True,
+                    "normalized": normalized,
+                    "effective": {
+                        "enabled": engine.enabled,
+                        "default_action": engine.default_action,
+                        "rule_count": len(engine.rules),
+                    },
+                }
+            )
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Policy validation failed: {e}")
+            return self._success({"valid": False, "error": str(e)})
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in(force=False)
+    def policy_groups(self, **kwargs):
+        """Manage policy groups for channel hashes and pubkeys."""
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        if cherrypy.request.method == "GET":
+            kind = self._normalize_policy_group_kind(cherrypy.request.params.get("kind"))
+            if cherrypy.request.params.get("kind") and not kind:
+                return self._error("Invalid kind. Use 'channel_hashes' or 'pubkeys'")
+
+            doc, exists = self._load_policy_document()
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            groups = doc.get("groups", self._default_policy_document().get("groups", {}))
+
+            data = {
+                "policy_file": self._get_policy_file_path(),
+                "exists": exists,
+                "kind": kind,
+                "groups": groups[kind] if kind else groups,
+            }
+            return self._success(data)
+
+        if cherrypy.request.method not in ("POST", "DELETE"):
+            return self._error("Method not supported")
+
+        try:
+            body = cherrypy.request.json or {}
+            if not isinstance(body, dict):
+                body = {}
+
+            request_params = getattr(cherrypy.request, "params", {}) or {}
+            kind = self._normalize_policy_group_kind(body.get("kind") or request_params.get("kind"))
+            if not kind:
+                return self._error("Invalid kind. Use 'channel_hashes' or 'pubkeys'")
+
+            group_id = self._slugify_policy_id(
+                body.get("group_id")
+                or request_params.get("group_id")
+                or body.get("id")
+                or body.get("name")
+                or body.get("friendly_name"),
+                "group",
+            )
+
+            doc, _ = self._load_policy_document()
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            groups = doc.get("groups", self._default_policy_document().get("groups", {}))
+            group_list = groups.get(kind, [])
+
+            existing_group = next((g for g in group_list if g.get("id") == group_id), None)
+
+            if cherrypy.request.method == "POST":
+                if existing_group:
+                    return self._error(f"Group already exists: {group_id}")
+
+                friendly_name = str(body.get("friendly_name") or body.get("name") or group_id)
+                description = str(body.get("description") or "")
+                new_group = {
+                    "id": group_id,
+                    "friendly_name": friendly_name,
+                    "description": description,
+                    "entries": [],
+                }
+                group_list.append(new_group)
+
+                groups[kind] = group_list
+                doc["groups"] = self._normalize_policy_groups(groups)
+                doc = self._sync_policy_engine_objects_from_groups(doc)
+                self._write_policy_document(doc)
+                self._apply_policy_runtime(doc.get("policy_engine", {}))
+
+                return self._success(
+                    {
+                        "kind": kind,
+                        "group": new_group,
+                        "groups": doc.get("groups", {}),
+                    },
+                    message="Policy group created",
+                    restart_required=False,
+                )
+
+            if not existing_group:
+                return self._error(f"Group not found: {group_id}")
+
+            group_list = [g for g in group_list if g.get("id") != group_id]
+            groups[kind] = group_list
+            doc["groups"] = self._normalize_policy_groups(groups)
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            self._write_policy_document(doc)
+            self._apply_policy_runtime(doc.get("policy_engine", {}))
+
+            return self._success(
+                {
+                    "kind": kind,
+                    "group_id": group_id,
+                    "groups": doc.get("groups", {}),
+                },
+                message="Policy group deleted",
+                restart_required=False,
+            )
+        except Exception as e:
+            logger.error(f"Error managing policy groups: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in(force=False)
+    def policy_group_entries(self, **kwargs):
+        """Manage entries inside policy groups."""
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        if cherrypy.request.method == "GET":
+            kind = self._normalize_policy_group_kind(cherrypy.request.params.get("kind"))
+            if not kind:
+                return self._error("Invalid kind. Use 'channel_hashes' or 'pubkeys'")
+
+            group_id = self._slugify_policy_id(cherrypy.request.params.get("group_id"), "group")
+            doc, _ = self._load_policy_document()
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            groups = doc.get("groups", self._default_policy_document().get("groups", {}))
+            group = next((g for g in groups.get(kind, []) if g.get("id") == group_id), None)
+            if not group:
+                return self._error(f"Group not found: {group_id}")
+
+            return self._success(
+                {
+                    "kind": kind,
+                    "group": group,
+                    "entries": group.get("entries", []),
+                }
+            )
+
+        if cherrypy.request.method not in ("POST", "DELETE"):
+            return self._error("Method not supported")
+
+        try:
+            body = cherrypy.request.json or {}
+            if not isinstance(body, dict):
+                body = {}
+
+            request_params = getattr(cherrypy.request, "params", {}) or {}
+            kind = self._normalize_policy_group_kind(body.get("kind") or request_params.get("kind"))
+            if not kind:
+                return self._error("Invalid kind. Use 'channel_hashes' or 'pubkeys'")
+
+            group_id = self._slugify_policy_id(
+                body.get("group_id") or request_params.get("group_id") or body.get("group"),
+                "group",
+            )
+
+            doc, _ = self._load_policy_document()
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            groups = doc.get("groups", self._default_policy_document().get("groups", {}))
+            group = next((g for g in groups.get(kind, []) if g.get("id") == group_id), None)
+            if not group:
+                return self._error(f"Group not found: {group_id}")
+
+            entries = list(group.get("entries", []))
+
+            if cherrypy.request.method == "POST":
+                entry_value = self._normalize_policy_entry_value(kind, body.get("value"))
+                if any(entry.get("value") == entry_value for entry in entries):
+                    return self._error(f"Entry already exists in group: {entry_value}")
+
+                entry_id = self._slugify_policy_id(
+                    body.get("entry_id")
+                    or body.get("id")
+                    or body.get("name")
+                    or body.get("friendly_name")
+                    or entry_value,
+                    "entry",
+                )
+                if any(entry.get("id") == entry_id for entry in entries):
+                    return self._error(f"Entry id already exists in group: {entry_id}")
+
+                new_entry = {
+                    "id": entry_id,
+                    "friendly_name": str(body.get("friendly_name") or body.get("name") or entry_id),
+                    "value": entry_value,
+                }
+                entries.append(new_entry)
+                group["entries"] = entries
+
+                doc["groups"] = self._normalize_policy_groups(groups)
+                doc = self._sync_policy_engine_objects_from_groups(doc)
+                self._write_policy_document(doc)
+                self._apply_policy_runtime(doc.get("policy_engine", {}))
+
+                return self._success(
+                    {
+                        "kind": kind,
+                        "group_id": group_id,
+                        "entry": new_entry,
+                        "group": group,
+                    },
+                    message="Policy group entry added",
+                    restart_required=False,
+                )
+
+            entry_id = body.get("entry_id") or request_params.get("entry_id") or body.get("id")
+            value = body.get("value") or request_params.get("value")
+            if not entry_id and value is None:
+                return self._error("Provide entry_id or value")
+
+            if value is not None:
+                value = self._normalize_policy_entry_value(kind, value)
+
+            filtered_entries = []
+            removed = None
+            for entry in entries:
+                if entry_id and entry.get("id") == entry_id:
+                    removed = entry
+                    continue
+                if value is not None and entry.get("value") == value:
+                    removed = entry
+                    continue
+                filtered_entries.append(entry)
+
+            if removed is None:
+                return self._error("Entry not found")
+
+            group["entries"] = filtered_entries
+            doc["groups"] = self._normalize_policy_groups(groups)
+            doc = self._sync_policy_engine_objects_from_groups(doc)
+            self._write_policy_document(doc)
+            self._apply_policy_runtime(doc.get("policy_engine", {}))
+
+            return self._success(
+                {
+                    "kind": kind,
+                    "group_id": group_id,
+                    "removed": removed,
+                    "group": group,
+                },
+                message="Policy group entry removed",
+                restart_required=False,
+            )
+        except Exception as e:
+            logger.error(f"Error managing policy group entries: {e}", exc_info=True)
+            return self._error(str(e))
+
     # ============================================================================
     # SETUP WIZARD ENDPOINTS
     # ============================================================================
@@ -329,15 +970,15 @@ class APIEndpoints:
         """Check if the repeater needs initial setup configuration"""
         try:
             # Prefer the on-disk config so this reflects current persisted state.
-            import yaml
-
             config = self.config
+            config_path = getattr(self, "_config_path", None)
             try:
-                with open(self._config_path, "r") as f:
-                    config = yaml.safe_load(f) or {}
-            except Exception:
+                if config_path:
+                    with open(config_path, "r") as f:
+                        config = yaml.safe_load(f) or {}
+            except Exception as exc:
                 # Fall back to in-memory config if file cannot be read.
-                pass
+                logger.debug(f"needs_setup could not read persisted config {config_path}: {exc}")
 
             needs_setup, reasons = self._setup_status_from_config(config)
 
@@ -455,7 +1096,12 @@ class APIEndpoints:
                 # Fallback for environments where pyserial is unavailable.
                 import glob
 
-                for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyS*", "/dev/serial/by-id/*"):
+                for pattern in (
+                    "/dev/ttyACM*",
+                    "/dev/ttyUSB*",
+                    "/dev/ttyS*",
+                    "/dev/serial/by-id/*",
+                ):
                     for dev in glob.glob(pattern):
                         devices.append({"device": str(dev), "description": str(dev)})
 
@@ -480,8 +1126,6 @@ class APIEndpoints:
         try:
             self._require_post()
             data = cherrypy.request.json
-
-            import yaml
 
             # Setup wizard is first-run only. After setup, use /auth/change_password
             # and /api/update_radio_config for subsequent changes.
@@ -516,8 +1160,8 @@ class APIEndpoints:
                 return {"success": False, "error": "Radio preset selection is required"}
 
             admin_password = data.get("admin_password", "").strip()
-            if not admin_password or len(admin_password) < 6:
-                return {"success": False, "error": "Admin password must be at least 6 characters"}
+            if not admin_password or len(admin_password) < 8:
+                return {"success": False, "error": "Admin password must be at least 8 characters"}
 
             import json
 
@@ -535,7 +1179,10 @@ class APIEndpoints:
                 hardware_configs = hardware_data.get("hardware", {})
                 hw_config = hardware_configs.get(hardware_key, {})
                 if not hw_config:
-                    return {"success": False, "error": f"Hardware configuration not found: {hardware_key}"}
+                    return {
+                        "success": False,
+                        "error": f"Hardware configuration not found: {hardware_key}",
+                    }
             else:
                 hw_config = {}
 
@@ -581,9 +1228,11 @@ class APIEndpoints:
                 kiss_port = (data.get("kiss_port") or "").strip() or "/dev/ttyUSB0"
                 kiss_baud = int(data.get("kiss_baud_rate", data.get("kiss_baud", 115200)))
                 config_yaml["kiss"] = {"port": kiss_port, "baud_rate": kiss_baud}
-                config_yaml["radio"]["tx_power"] = tx_power_preset if tx_power_preset is not None else 14
+                config_yaml["radio"]["tx_power"] = (
+                    tx_power_preset if tx_power_preset is not None else 14
+                )
                 if "preamble_length" not in config_yaml["radio"]:
-                    config_yaml["radio"]["preamble_length"] = 17
+                    config_yaml["radio"]["preamble_length"] = 32
             elif hardware_key == "pymc_usb":
                 # pymc_usb modem: external SX1262 board over USB-CDC.
                 # Accept pymc_usb_port / pymc_usb_baudrate from the request body
@@ -603,7 +1252,7 @@ class APIEndpoints:
                 elif "tx_power" in hw_config:
                     config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
                 if "preamble_length" in hw_config:
-                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 16)
+                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
             elif hardware_key == "pymc_tcp":
                 # pymc_tcp modem: external SX1262 board exposed as TCP over Wi-Fi/Ethernet.
                 # 'host' has no sensible default — must be the modem's LAN address or
@@ -630,7 +1279,7 @@ class APIEndpoints:
                 elif "tx_power" in hw_config:
                     config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
                 if "preamble_length" in hw_config:
-                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 16)
+                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
             else:
                 # SX1262 / sx1262_ch341: radio_type and optional CH341 from hw_config
                 if "radio_type" in hw_config:
@@ -638,7 +1287,9 @@ class APIEndpoints:
                 else:
                     config_yaml["radio_type"] = "sx1262"
 
-                ch341_cfg = hw_config.get("ch341") if isinstance(hw_config.get("ch341"), dict) else None
+                ch341_cfg = (
+                    hw_config.get("ch341") if isinstance(hw_config.get("ch341"), dict) else None
+                )
                 vid = (ch341_cfg or {}).get("vid", hw_config.get("vid"))
                 pid = (ch341_cfg or {}).get("pid", hw_config.get("pid"))
                 if vid is not None or pid is not None:
@@ -654,7 +1305,7 @@ class APIEndpoints:
                 elif "tx_power" in hw_config:
                     config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
                 if "preamble_length" in hw_config:
-                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 17)
+                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
 
                 if "sx1262" not in config_yaml:
                     config_yaml["sx1262"] = {}
@@ -685,11 +1336,19 @@ class APIEndpoints:
                 if "use_dio3_tcxo" in hw_config:
                     config_yaml["sx1262"]["use_dio3_tcxo"] = hw_config.get("use_dio3_tcxo", False)
                 if "dio3_tcxo_voltage" in hw_config:
-                    config_yaml["sx1262"]["dio3_tcxo_voltage"] = hw_config.get("dio3_tcxo_voltage", 1.8)
+                    config_yaml["sx1262"]["dio3_tcxo_voltage"] = hw_config.get(
+                        "dio3_tcxo_voltage", 1.8
+                    )
                 if "use_dio2_rf" in hw_config:
                     config_yaml["sx1262"]["use_dio2_rf"] = hw_config.get("use_dio2_rf", False)
                 if "is_waveshare" in hw_config:
                     config_yaml["sx1262"]["is_waveshare"] = hw_config.get("is_waveshare", False)
+                if "gpio_chip" in hw_config:
+                    config_yaml["sx1262"]["gpio_chip"] = hw_config.get("gpio_chip", 0)
+                if "use_gpiod_backend" in hw_config:
+                    config_yaml["sx1262"]["use_gpiod_backend"] = hw_config.get(
+                        "use_gpiod_backend", False
+                    )
             # Write updated config
             with open(self._config_path, "w") as f:
                 yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)
@@ -699,7 +1358,6 @@ class APIEndpoints:
             )
 
             # Trigger service restart after setup
-            import subprocess
             import threading
 
             def delayed_restart():
@@ -708,6 +1366,7 @@ class APIEndpoints:
                 time.sleep(2)  # Give time for response to be sent
                 try:
                     from repeater.service_utils import restart_service
+
                     restart_service()
                 except Exception as e:
                     logger.error(f"Failed to restart service: {e}")
@@ -769,9 +1428,9 @@ class APIEndpoints:
             stats["site_name"] = self.config.get("web", {}).get("site_name", "")
             stats["version"] = __version__
             try:
-                import pymc_core
+                import openhop_core
 
-                stats["core_version"] = pymc_core.__version__
+                stats["core_version"] = openhop_core.__version__
             except ImportError:
                 stats["core_version"] = "unknown"
             image_info = get_buildroot_image_info()
@@ -889,8 +1548,7 @@ class APIEndpoints:
 
                         if snapshot_json != last_snapshot_json:
                             yield (
-                                f"data: {json.dumps({'type': 'snapshot', 'data': snapshot})}"
-                                "\n\n"
+                                f"data: {json.dumps({'type': 'snapshot', 'data': snapshot})}\n\n"
                             )
                             last_snapshot_json = snapshot_json
                             last_keepalive = time.time()
@@ -922,6 +1580,7 @@ class APIEndpoints:
         if cherrypy.request.method == "OPTIONS":
             return ""
 
+        future = None
         try:
             self._require_post()
             if not self.send_advert_func:
@@ -937,11 +1596,19 @@ class APIEndpoints:
                 if result
                 else self._error("Failed to send advert")
             )
+        except FutureTimeoutError:
+            logger.error(
+                "Error sending advert: timeout waiting for advert transmission to complete",
+                exc_info=True,
+            )
+            if future is not None:
+                future.cancel()
+            return self._error("Timed out waiting for advert transmission after 10 seconds")
         except cherrypy.HTTPError:
             # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
             raise
         except Exception as e:
-            logger.error(f"Error sending advert: {e}", exc_info=True)
+            logger.error("Error sending advert: %s", e, exc_info=True)
             return self._error(e)
 
     @cherrypy.expose
@@ -1067,7 +1734,7 @@ class APIEndpoints:
     @cherrypy.tools.json_in()
     def update_advert_rate_limit_config(self):
         """Update advert rate limiting configuration using ConfigManager.
-        
+
         POST /api/update_advert_rate_limit_config
         Body: {
             "rate_limit_enabled": true,
@@ -1090,16 +1757,16 @@ class APIEndpoints:
         }
         """
         self._set_cors_headers()
-        
+
         if cherrypy.request.method == "OPTIONS":
             return ""
-        
+
         try:
             self._require_post()
             data = cherrypy.request.json or {}
-            
+
             applied = []
-            
+
             # Ensure config sections exist
             if "repeater" not in self.config:
                 self.config["repeater"] = {}
@@ -1109,117 +1776,117 @@ class APIEndpoints:
                 self.config["repeater"]["advert_penalty_box"] = {}
             if "advert_adaptive" not in self.config["repeater"]:
                 self.config["repeater"]["advert_adaptive"] = {"thresholds": {}}
-            
+
             rate_cfg = self.config["repeater"]["advert_rate_limit"]
             penalty_cfg = self.config["repeater"]["advert_penalty_box"]
             adaptive_cfg = self.config["repeater"]["advert_adaptive"]
-            
+
             # Rate limit settings
             if "rate_limit_enabled" in data:
                 rate_cfg["enabled"] = bool(data["rate_limit_enabled"])
                 applied.append(f"rate_limit={'enabled' if rate_cfg['enabled'] else 'disabled'}")
-            
+
             if "bucket_capacity" in data:
                 cap = max(1, int(data["bucket_capacity"]))
                 rate_cfg["bucket_capacity"] = cap
                 applied.append(f"bucket_capacity={cap}")
-            
+
             if "refill_tokens" in data:
                 tokens = max(1, int(data["refill_tokens"]))
                 rate_cfg["refill_tokens"] = tokens
                 applied.append(f"refill_tokens={tokens}")
-            
+
             if "refill_interval_seconds" in data:
                 interval = max(60, int(data["refill_interval_seconds"]))
                 rate_cfg["refill_interval_seconds"] = interval
                 applied.append(f"refill_interval={interval}s")
-            
+
             if "min_interval_seconds" in data:
                 min_int = max(0, int(data["min_interval_seconds"]))
                 rate_cfg["min_interval_seconds"] = min_int
                 applied.append(f"min_interval={min_int}s")
-            
+
             # Penalty box settings
             if "penalty_enabled" in data:
                 penalty_cfg["enabled"] = bool(data["penalty_enabled"])
                 applied.append(f"penalty={'enabled' if penalty_cfg['enabled'] else 'disabled'}")
-            
+
             if "violation_threshold" in data:
                 thresh = max(1, int(data["violation_threshold"]))
                 penalty_cfg["violation_threshold"] = thresh
                 applied.append(f"violation_threshold={thresh}")
-            
+
             if "violation_decay_seconds" in data:
                 decay = max(60, int(data["violation_decay_seconds"]))
                 penalty_cfg["violation_decay_seconds"] = decay
                 applied.append(f"violation_decay={decay}s")
-            
+
             if "base_penalty_seconds" in data:
                 base = max(60, int(data["base_penalty_seconds"]))
                 penalty_cfg["base_penalty_seconds"] = base
                 applied.append(f"base_penalty={base}s")
-            
+
             if "penalty_multiplier" in data:
                 mult = max(1.0, float(data["penalty_multiplier"]))
                 penalty_cfg["penalty_multiplier"] = mult
                 applied.append(f"penalty_multiplier={mult}")
-            
+
             if "max_penalty_seconds" in data:
                 max_pen = max(60, int(data["max_penalty_seconds"]))
                 penalty_cfg["max_penalty_seconds"] = max_pen
                 applied.append(f"max_penalty={max_pen}s")
-            
+
             # Adaptive settings
             if "adaptive_enabled" in data:
                 adaptive_cfg["enabled"] = bool(data["adaptive_enabled"])
                 applied.append(f"adaptive={'enabled' if adaptive_cfg['enabled'] else 'disabled'}")
-            
+
             if "ewma_alpha" in data:
                 alpha = max(0.01, min(1.0, float(data["ewma_alpha"])))
                 adaptive_cfg["ewma_alpha"] = alpha
                 applied.append(f"ewma_alpha={alpha}")
-            
+
             if "hysteresis_seconds" in data:
                 hyst = max(0, int(data["hysteresis_seconds"]))
                 adaptive_cfg["hysteresis_seconds"] = hyst
                 applied.append(f"hysteresis={hyst}s")
-            
+
             # Adaptive thresholds
             if "thresholds" not in adaptive_cfg:
                 adaptive_cfg["thresholds"] = {}
-            
+
             if "quiet_max" in data:
                 adaptive_cfg["thresholds"]["quiet_max"] = float(data["quiet_max"])
                 applied.append(f"quiet_max={data['quiet_max']}")
-            
+
             if "normal_max" in data:
                 adaptive_cfg["thresholds"]["normal_max"] = float(data["normal_max"])
                 applied.append(f"normal_max={data['normal_max']}")
-            
+
             if "busy_max" in data:
                 adaptive_cfg["thresholds"]["busy_max"] = float(data["busy_max"])
                 applied.append(f"busy_max={data['busy_max']}")
-            
+
             if not applied:
                 return self._error("No valid settings provided")
-            
+
             # Save to config file and live update daemon
             result = self.config_manager.update_and_save(
-                updates={},
-                live_update=True,
-                live_update_sections=['repeater']
+                updates={}, live_update=True, live_update_sections=["repeater"]
             )
-            
+
             logger.info(f"Advert rate limit config updated: {', '.join(applied)}")
-            
-            return self._success({
-                "applied": applied,
-                "persisted": result.get("saved", False),
-                "live_update": result.get("live_updated", False),
-                "restart_required": False,
-                "message": "Advert rate limit settings applied immediately."
-            })
-            
+
+            return self._success(
+                {
+                    "applied": applied,
+                    "persisted": result.get("saved", False),
+                    "live_update": result.get("live_updated", False),
+                    "restart_required": False,
+                    "message": "Advert rate limit settings applied immediately.",
+                }
+            )
+
         except cherrypy.HTTPError:
             raise
         except Exception as e:
@@ -1295,27 +1962,31 @@ class APIEndpoints:
             try:
                 storage = self._get_storage()
                 handler = getattr(storage, "mqtt_handler", None)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"mqtt_status could not access mqtt_handler: {exc}")
 
             connected_brokers = []
             if handler:
                 for conn in getattr(handler, "connections", []):
-                    connected_brokers.append({
-                        "enabled": conn.enabled,
-                        "name": conn.broker.get("name", ""),
-                        "host": conn.broker.get("host", ""),
-                        "status": {
-                            "connected": conn.is_connected(),
-                            "reconnecting": conn.has_pending_reconnect(),
-                        },
-                        "format": conn.format
-                    })
+                    connected_brokers.append(
+                        {
+                            "enabled": conn.enabled,
+                            "name": conn.broker.get("name", ""),
+                            "host": conn.broker.get("host", ""),
+                            "status": {
+                                "connected": conn.is_connected(),
+                                "reconnecting": conn.has_pending_reconnect(),
+                            },
+                            "format": conn.format,
+                        }
+                    )
 
-            return self._success({
-                "handler_active": handler is not None,
-                "brokers": connected_brokers,
-            })
+            return self._success(
+                {
+                    "handler_active": handler is not None,
+                    "brokers": connected_brokers,
+                }
+            )
         except Exception as e:
             logger.error(f"Error getting MQTT status: {e}")
             return self._error(str(e))
@@ -1388,7 +2059,7 @@ class APIEndpoints:
             "email": "user@example.com",
             "brokers": [
             {
-            
+
             }]
         }
         """
@@ -1433,28 +2104,32 @@ class APIEndpoints:
 
                     for field in ("name", "host", "port", "format"):
                         if not b.get(field, ""):
-                            return self._error(f"Broker at index {i} missing required field: {field}")
-                    
+                            return self._error(
+                                f"Broker at index {i} missing required field: {field}"
+                            )
+
                     try:
                         port = int(b.get("port", 443))
                     except (ValueError, TypeError):
                         return self._error(f"Broker at index {i} has invalid port")
-                    
+
                     new_broker = {
-                        "name":      str(b["name"]).strip(),
-                        "enabled":   b.get("enabled", False),
+                        "name": str(b["name"]).strip(),
+                        "enabled": b.get("enabled", False),
                         "transport": str(b.get("transport", "websockets")).strip(),
-                        "host":      str(b["host"]).strip(),
-                        "port":      port,
-                        "format":    str(b["format"]).strip(),
+                        "host": str(b["host"]).strip(),
+                        "port": port,
+                        "format": str(b["format"]).strip(),
                         "disallowed_packet_types": list(b.get("disallowed_packet_types", [])),
                         "retain_status": bool(b.get("retain_status", False)),
                         "tls": {
-                            "enabled": bool(b.get("tls", {}).get("enabled", True if port == 443 else False)),
+                            "enabled": bool(
+                                b.get("tls", {}).get("enabled", True if port == 443 else False)
+                            ),
                             "insecure": bool(b.get("tls", {}).get("insecure", False)),
-                        }
+                        },
                     }
-                    
+
                     if b.get("use_jwt_auth", False):
                         new_broker["use_jwt_auth"] = True
                         new_broker["audience"] = str(b["audience"]).strip()
@@ -1477,11 +2152,13 @@ class APIEndpoints:
 
             if result.get("success"):
                 logger.info(f"MQTT config updated: {list(mqtt_updates.keys())}")
-                return self._success({
-                    "persisted": result.get("saved", False),
-                    "restart_required": True,
-                    "message": "Observer settings saved. Restart the service for changes to take effect.",
-                })
+                return self._success(
+                    {
+                        "persisted": result.get("saved", False),
+                        "restart_required": True,
+                        "message": "Observer settings saved. Restart the service for changes to take effect.",
+                    }
+                )
             else:
                 return self._error(result.get("error", "Failed to update LetsMesh configuration"))
 
@@ -1495,7 +2172,7 @@ class APIEndpoints:
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def restart_service(self):
-        """Restart the pymc-repeater service via systemctl."""
+        """Restart the openhop-repeater service via systemctl."""
         # Enable CORS for this endpoint only if configured
         self._set_cors_headers()
 
@@ -1535,8 +2212,6 @@ class APIEndpoints:
             raise cherrypy.HTTPError(405, "Method not allowed. This endpoint requires GET.")
 
         try:
-            import yaml
-
             errors = []
             warnings = []
 
@@ -1608,7 +2283,9 @@ class APIEndpoints:
                     add_error("repeater.security", "Missing required section 'repeater.security'")
                     security = {}
 
-                admin_password = (security.get("admin_password") if isinstance(security, dict) else "") or ""
+                admin_password = (
+                    security.get("admin_password") if isinstance(security, dict) else ""
+                ) or ""
                 if not str(admin_password).strip():
                     add_error("repeater.security.admin_password", "Admin password is required")
 
@@ -1651,13 +2328,29 @@ class APIEndpoints:
                         add_error("radio.frequency", "Frequency must be 100-1000 MHz")
 
                     bandwidth = as_int((radio or {}).get("bandwidth"), "radio.bandwidth")
-                    valid_bw = [7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000]
+                    valid_bw = [
+                        7800,
+                        10400,
+                        15600,
+                        20800,
+                        31250,
+                        41700,
+                        62500,
+                        125000,
+                        250000,
+                        500000,
+                    ]
                     if bandwidth is None:
                         add_error("radio.bandwidth", "Bandwidth is required")
                     elif bandwidth not in valid_bw:
-                        add_error("radio.bandwidth", f"Bandwidth must be one of {[b / 1000 for b in valid_bw]} kHz")
+                        add_error(
+                            "radio.bandwidth",
+                            f"Bandwidth must be one of {[b / 1000 for b in valid_bw]} kHz",
+                        )
 
-                    spreading_factor = as_int((radio or {}).get("spreading_factor"), "radio.spreading_factor")
+                    spreading_factor = as_int(
+                        (radio or {}).get("spreading_factor"), "radio.spreading_factor"
+                    )
                     if spreading_factor is None:
                         add_error("radio.spreading_factor", "Spreading factor is required")
                     elif spreading_factor < 5 or spreading_factor > 12:
@@ -1675,11 +2368,15 @@ class APIEndpoints:
                     elif tx_power < -9 or tx_power > 30:
                         add_error("radio.tx_power", "TX power must be between -9 and +30 dBm")
 
-                    preamble_length = as_int((radio or {}).get("preamble_length"), "radio.preamble_length")
+                    preamble_length = as_int(
+                        (radio or {}).get("preamble_length"), "radio.preamble_length"
+                    )
                     if preamble_length is None:
                         add_error("radio.preamble_length", "Preamble length is required")
                     elif preamble_length <= 0:
-                        add_error("radio.preamble_length", "Preamble length must be greater than zero")
+                        add_error(
+                            "radio.preamble_length", "Preamble length must be greater than zero"
+                        )
 
                 if radio_type in ("sx1262", "sx1262_ch341"):
                     sx1262_cfg = config_yaml.get("sx1262")
@@ -1701,7 +2398,9 @@ class APIEndpoints:
                         value = sx1262_cfg.get(key) if isinstance(sx1262_cfg, dict) else None
                         parsed = as_int(value, f"sx1262.{key}")
                         if parsed is None:
-                            add_error(f"sx1262.{key}", f"Missing or invalid required setting '{key}'")
+                            add_error(
+                                f"sx1262.{key}", f"Missing or invalid required setting '{key}'"
+                            )
 
                     en_pins = sx1262_cfg.get("en_pins") if isinstance(sx1262_cfg, dict) else None
                     if en_pins is not None:
@@ -1718,13 +2417,17 @@ class APIEndpoints:
                 if radio_type == "sx1262_ch341":
                     ch341_cfg = config_yaml.get("ch341")
                     if not isinstance(ch341_cfg, dict):
-                        add_error("ch341", "Missing required section 'ch341' for radio_type sx1262_ch341")
+                        add_error(
+                            "ch341", "Missing required section 'ch341' for radio_type sx1262_ch341"
+                        )
                         ch341_cfg = {}
                     for key in ("vid", "pid"):
                         value = ch341_cfg.get(key) if isinstance(ch341_cfg, dict) else None
                         parsed = as_int(value, f"ch341.{key}")
                         if parsed is None:
-                            add_error(f"ch341.{key}", f"Missing or invalid required setting '{key}'")
+                            add_error(
+                                f"ch341.{key}", f"Missing or invalid required setting '{key}'"
+                            )
 
                 if radio_type == "kiss":
                     kiss_cfg = config_yaml.get("kiss")
@@ -1743,26 +2446,37 @@ class APIEndpoints:
                 if radio_type == "pymc_usb":
                     usb_cfg = config_yaml.get("pymc_usb")
                     if not isinstance(usb_cfg, dict):
-                        add_error("pymc_usb", "Missing required section 'pymc_usb' for radio_type pymc_usb")
+                        add_error(
+                            "pymc_usb",
+                            "Missing required section 'pymc_usb' for radio_type pymc_usb",
+                        )
                         usb_cfg = {}
                     port = (usb_cfg.get("port") if isinstance(usb_cfg, dict) else "") or ""
                     if not str(port).strip():
                         add_error("pymc_usb.port", "pymc_usb.port is required")
                     baud = as_int((usb_cfg or {}).get("baudrate"), "pymc_usb.baudrate")
                     if baud is not None and baud <= 0:
-                        add_error("pymc_usb.baudrate", "pymc_usb.baudrate must be greater than zero")
+                        add_error(
+                            "pymc_usb.baudrate", "pymc_usb.baudrate must be greater than zero"
+                        )
 
                 if radio_type == "pymc_tcp":
                     tcp_cfg = config_yaml.get("pymc_tcp")
                     if not isinstance(tcp_cfg, dict):
-                        add_error("pymc_tcp", "Missing required section 'pymc_tcp' for radio_type pymc_tcp")
+                        add_error(
+                            "pymc_tcp",
+                            "Missing required section 'pymc_tcp' for radio_type pymc_tcp",
+                        )
                         tcp_cfg = {}
                     host = (tcp_cfg.get("host") if isinstance(tcp_cfg, dict) else "") or ""
                     host_str = str(host).strip()
                     if not host_str:
                         add_error("pymc_tcp.host", "pymc_tcp.host is required")
                     elif host_str == "REPLACE_WITH_MODEM_HOST":
-                        add_error("pymc_tcp.host", "Replace placeholder host with your modem hostname or IP")
+                        add_error(
+                            "pymc_tcp.host",
+                            "Replace placeholder host with your modem hostname or IP",
+                        )
                     port = as_int((tcp_cfg or {}).get("port"), "pymc_tcp.port")
                     if port is None:
                         add_error("pymc_tcp.port", "pymc_tcp.port is required")
@@ -1784,7 +2498,9 @@ class APIEndpoints:
                         "warning_count": len(warnings),
                     },
                     "config_path": self._config_path,
-                    "message": "Configuration is valid" if valid else "Configuration has validation errors",
+                    "message": "Configuration is valid"
+                    if valid
+                    else "Configuration has validation errors",
                 }
             )
 
@@ -1800,16 +2516,21 @@ class APIEndpoints:
         from .http_server import _log_buffer
 
         try:
-            logs = list(_log_buffer.logs)
+            if hasattr(_log_buffer, "snapshot"):
+                logs = _log_buffer.snapshot()
+            else:
+                logs = list(getattr(_log_buffer, "logs", []))
             return {
                 "logs": (
                     logs
                     if logs
                     else [
                         {
+                            "id": 0,
                             "message": "No logs available",
                             "timestamp": datetime.now().isoformat(),
                             "level": "INFO",
+                            "logger": "HTTPServer",
                         }
                     ]
                 )
@@ -1817,6 +2538,89 @@ class APIEndpoints:
         except Exception as e:
             logger.error(f"Error fetching logs: {e}")
             return {"error": str(e), "logs": []}
+
+    @cherrypy.expose
+    def logs_stream(self, since_id: Optional[str] = None):
+        from .http_server import _log_buffer
+
+        cherrypy.response.headers["Content-Type"] = "text/event-stream"
+        cherrypy.response.headers["Cache-Control"] = "no-cache"
+        cherrypy.response.headers["Connection"] = "keep-alive"
+        cherrypy.response.headers["X-Accel-Buffering"] = "no"
+
+        if since_id is None:
+            since_id = cherrypy.request.headers.get("Last-Event-ID")
+
+        try:
+            cursor = int(since_id) if since_id is not None else None
+        except (TypeError, ValueError):
+            cursor = None
+
+        def encode_event(payload, event_name: Optional[str] = None, event_id: Optional[int] = None):
+            lines = []
+            if event_name:
+                lines.append(f"event: {event_name}")
+            if event_id is not None:
+                lines.append(f"id: {event_id}")
+            lines.append(f"data: {json.dumps(payload, default=str)}")
+            return "\n".join(lines) + "\n\n"
+
+        def generate():
+            subscriber = _log_buffer.subscribe()
+            last_sent_id = cursor
+            current_snapshot = _log_buffer.snapshot()
+
+            try:
+                yield encode_event(
+                    {
+                        "type": "connected",
+                        "message": "Connected to logs stream",
+                        "latest_id": current_snapshot[-1]["id"] if current_snapshot else 0,
+                    },
+                    event_name="connected",
+                )
+
+                backlog = _log_buffer.snapshot(since_id=cursor)
+                for entry in backlog:
+                    last_sent_id = entry.get("id", last_sent_id)
+                    yield encode_event(
+                        {"type": "log", "entry": entry}, event_name="log", event_id=entry.get("id")
+                    )
+
+                while True:
+                    try:
+                        entry = subscriber.get(timeout=15.0)
+                    except Exception:
+                        yield encode_event(
+                            {"type": "keepalive"}, event_name="keepalive", event_id=last_sent_id
+                        )
+                        continue
+
+                    entry_id = entry.get("id")
+                    if (
+                        last_sent_id is not None
+                        and entry_id is not None
+                        and entry_id <= last_sent_id
+                    ):
+                        continue
+
+                    last_sent_id = entry_id
+                    yield encode_event(
+                        {"type": "log", "entry": entry}, event_name="log", event_id=entry_id
+                    )
+            except GeneratorExit:
+                logger.debug("Logs SSE stream closed by client")
+            except Exception as exc:
+                logger.error(f"Error serving logs stream: {exc}", exc_info=True)
+                yield encode_event(
+                    {"type": "error", "error": str(exc)}, event_name="error", event_id=last_sent_id
+                )
+            finally:
+                _log_buffer.unsubscribe(subscriber)
+
+        return generate()
+
+    logs_stream._cp_config = {"response.stream": True}
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -1862,15 +2666,19 @@ class APIEndpoints:
                 if not tracemalloc.is_tracing():
                     # Use 1 frame instead of 10 — much less overhead & faster snapshots
                     tracemalloc.start(1)
-                self._tracemalloc_baseline = tracemalloc.take_snapshot().filter_traces((
-                    tracemalloc.Filter(False, tracemalloc.__file__),
-                    tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
-                ))
+                self._tracemalloc_baseline = tracemalloc.take_snapshot().filter_traces(
+                    (
+                        tracemalloc.Filter(False, tracemalloc.__file__),
+                        tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+                    )
+                )
                 logger.info("Memory tracing started")
-                return self._success({
-                    "tracing": True,
-                    "message": "Tracing started — check again after some time to see growth",
-                })
+                return self._success(
+                    {
+                        "tracing": True,
+                        "message": "Tracing started — check again after some time to see growth",
+                    }
+                )
 
             if action == "stop":
                 if tracemalloc.is_tracing():
@@ -1888,30 +2696,35 @@ class APIEndpoints:
         # Always include RSS regardless of tracing state
         try:
             import resource
+
             rusage = resource.getrusage(resource.RUSAGE_SELF)
             result["rss_mb"] = round(rusage.ru_maxrss / 1024, 1)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"Could not read process RSS usage: {exc}")
 
         if not tracing:
             return self._success(result)
 
         # Filter out tracemalloc's own allocations to keep snapshot small & fast
-        current = tracemalloc.take_snapshot().filter_traces((
-            tracemalloc.Filter(False, tracemalloc.__file__),
-            tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
-        ))
+        current = tracemalloc.take_snapshot().filter_traces(
+            (
+                tracemalloc.Filter(False, tracemalloc.__file__),
+                tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+            )
+        )
         baseline = getattr(self, "_tracemalloc_baseline", None)
 
         # Top 20 allocations right now
         top_current = current.statistics("lineno")[:20]
         current_stats = []
         for stat in top_current:
-            current_stats.append({
-                "file": str(stat.traceback),
-                "size_kb": round(stat.size / 1024, 1),
-                "count": stat.count,
-            })
+            current_stats.append(
+                {
+                    "file": str(stat.traceback),
+                    "size_kb": round(stat.size / 1024, 1),
+                    "count": stat.count,
+                }
+            )
         result["current_top_20"] = current_stats
 
         # Growth since baseline
@@ -1921,12 +2734,14 @@ class APIEndpoints:
             growth.sort(key=lambda d: d.size_diff, reverse=True)
             growth_stats = []
             for stat in growth[:20]:
-                growth_stats.append({
-                    "file": str(stat.traceback),
-                    "size_diff_kb": round(stat.size_diff / 1024, 1),
-                    "count_diff": stat.count_diff,
-                    "current_size_kb": round(stat.size / 1024, 1),
-                })
+                growth_stats.append(
+                    {
+                        "file": str(stat.traceback),
+                        "size_diff_kb": round(stat.size_diff / 1024, 1),
+                        "count_diff": stat.count_diff,
+                        "current_size_kb": round(stat.size / 1024, 1),
+                    }
+                )
             result["growth_since_baseline"] = growth_stats
 
         traced_current, traced_peak = tracemalloc.get_traced_memory()
@@ -2090,7 +2905,9 @@ class APIEndpoints:
             end_ts = float(end_timestamp) if end_timestamp is not None else None
             limit_int = min(int(limit), 50000)
             packets = self._get_storage().get_airtime_data(
-                start_timestamp=start_ts, end_timestamp=end_ts, limit=limit_int,
+                start_timestamp=start_ts,
+                end_timestamp=end_ts,
+                limit=limit_int,
             )
             return self._success(packets, count=len(packets))
         except Exception as e:
@@ -2143,17 +2960,6 @@ class APIEndpoints:
             return self._success(packet) if packet else self._error("Packet not found")
         except Exception as e:
             logger.error(f"Error getting packet by hash: {e}")
-            return self._error(e)
-
-    @cherrypy.expose
-    @cherrypy.tools.json_out()
-    def packet_type_stats(self, hours=24):
-        try:
-            hours = int(hours)
-            stats = self._get_storage().get_packet_type_stats(hours=hours)
-            return self._success(stats)
-        except Exception as e:
-            logger.error(f"Error getting packet type stats: {e}")
             return self._error(e)
 
     @cherrypy.expose
@@ -2244,6 +3050,7 @@ class APIEndpoints:
                 "rx_count": "Received Packets",
                 "tx_count": "Transmitted Packets",
                 "drop_count": "Dropped Packets",
+                "policy_events": "Policy Events",
                 "avg_rssi": "Average RSSI (dBm)",
                 "avg_snr": "Average SNR (dB)",
                 "avg_length": "Average Packet Length",
@@ -2257,11 +3064,37 @@ class APIEndpoints:
                 requested_metrics = [m.strip() for m in metrics.split(",")]
             else:
                 requested_metrics = list(rrd_data["metrics"].keys())
+                requested_metrics.append("policy_events")
 
             timestamps_ms = [ts * 1000 for ts in rrd_data["timestamps"]]
             series = []
 
             for metric_key in requested_metrics:
+                if metric_key == "policy_events":
+                    bucket_seconds = max(1, int(rrd_data.get("step", 60)))
+                    policy_rows = self._get_storage().get_policy_event_counts(
+                        start_timestamp=rrd_data["start_time"],
+                        end_timestamp=rrd_data["end_time"],
+                        bucket_seconds=bucket_seconds,
+                    )
+                    policy_by_bucket = {
+                        int(row.get("timestamp", 0)): int(row.get("count", 0))
+                        for row in policy_rows
+                    }
+                    chart_data = []
+                    for ts in rrd_data["timestamps"]:
+                        bucket_ts = int(ts / bucket_seconds) * bucket_seconds
+                        chart_data.append([ts * 1000, policy_by_bucket.get(bucket_ts, 0)])
+
+                    series.append(
+                        {
+                            "name": metric_names["policy_events"],
+                            "type": "policy_events",
+                            "data": chart_data,
+                        }
+                    )
+                    continue
+
                 if metric_key in rrd_data["metrics"]:
                     if metric_key in counter_metrics:
                         chart_data = self._process_counter_data(
@@ -2364,7 +3197,6 @@ class APIEndpoints:
             self.config["radio"]["cad"]["peak_threshold"] = peak
             self.config["radio"]["cad"]["min_threshold"] = min_val
 
-            config_path = getattr(self, "_config_path", "/etc/pymc_repeater/config.yaml")
             saved = self.config_manager.save_to_file()
             if not saved:
                 return self._error("Failed to save configuration to file")
@@ -2448,16 +3280,18 @@ class APIEndpoints:
                 if freq < 100_000_000 or freq > 1_000_000_000:
                     return self._error("Frequency must be 100-1000 MHz")
                 self.config["radio"]["frequency"] = freq
-                applied.append(f"freq={freq/1_000_000:.3f}MHz")
+                applied.append(f"freq={freq / 1_000_000:.3f}MHz")
 
             # Update bandwidth (in Hz)
             if "bandwidth" in data:
                 bw = int(float(data["bandwidth"]))
                 valid_bw = [7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000]
                 if bw not in valid_bw:
-                    return self._error(f"Bandwidth must be one of {[b/1000 for b in valid_bw]} kHz")
+                    return self._error(
+                        f"Bandwidth must be one of {[b / 1000 for b in valid_bw]} kHz"
+                    )
                 self.config["radio"]["bandwidth"] = bw
-                applied.append(f"bw={bw/1000}kHz")
+                applied.append(f"bw={bw / 1000}kHz")
 
             # Update spreading factor
             if "spreading_factor" in data:
@@ -2554,7 +3388,9 @@ class APIEndpoints:
             if "path_hash_mode" in data:
                 phm = int(data["path_hash_mode"])
                 if phm not in (0, 1, 2):
-                    return self._error("Path hash mode must be 0 (1-byte), 1 (2-byte), or 2 (3-byte)")
+                    return self._error(
+                        "Path hash mode must be 0 (1-byte), 1 (2-byte), or 2 (3-byte)"
+                    )
                 self.config["mesh"]["path_hash_mode"] = phm
                 applied.append(f"path_hash_mode={phm}")
 
@@ -2672,10 +3508,7 @@ class APIEndpoints:
             storage = self._get_storage()
             hours = int(hours)
             count = storage.get_crc_error_count(hours=hours)
-            return self._success({
-                "crc_error_count": count,
-                "hours": hours
-            })
+            return self._success({"crc_error_count": count, "hours": hours})
         except Exception as e:
             logger.error(f"Error fetching CRC error count: {e}")
             return self._error(e)
@@ -2689,11 +3522,7 @@ class APIEndpoints:
             hours = int(hours)
             limit = int(limit) if limit else None
             history = storage.get_crc_error_history(hours=hours, limit=limit)
-            return self._success({
-                "history": history,
-                "hours": hours,
-                "count": len(history)
-            })
+            return self._success({"history": history, "hours": hours, "count": len(history)})
         except Exception as e:
             logger.error(f"Error fetching CRC error history: {e}")
             return self._error(e)
@@ -2775,7 +3604,12 @@ class APIEndpoints:
                 adverts,
                 count=len(adverts),
                 contact_type=contact_type,
-                filters={"contact_type": contact_type, "limit": limit_int, "offset": offset_int, "hours": hours_int},
+                filters={
+                    "contact_type": contact_type,
+                    "limit": limit_int,
+                    "offset": offset_int,
+                    "hours": hours_int,
+                },
             )
 
         except ValueError as e:
@@ -2816,19 +3650,19 @@ class APIEndpoints:
     def advert_rate_limit_stats(self):
         """Get advert rate limiting statistics and adaptive tier info."""
         try:
-            if not self.daemon_instance or not hasattr(self.daemon_instance, 'advert_helper'):
+            if not self.daemon_instance or not hasattr(self.daemon_instance, "advert_helper"):
                 return self._error("Advert helper not available")
-            
+
             advert_helper = self.daemon_instance.advert_helper
             if not advert_helper:
                 return self._error("Advert helper not initialized")
-            
-            if not hasattr(advert_helper, 'get_rate_limit_stats'):
+
+            if not hasattr(advert_helper, "get_rate_limit_stats"):
                 return self._error("Rate limit stats not supported by this advert helper version")
-            
+
             stats = advert_helper.get_rate_limit_stats()
             return self._success(stats)
-            
+
         except Exception as e:
             logger.error(f"Error getting advert rate limit stats: {e}")
             return self._error(e)
@@ -2995,7 +3829,7 @@ class APIEndpoints:
                 self.config["mesh"]["unscoped_flood_allow"] = unscoped_flood_allow
 
                 # Get the actual config path from daemon instance (same as CAD settings)
-                config_path = getattr(self, "_config_path", "/etc/pymc_repeater/config.yaml")
+                config_path = getattr(self, "_config_path", "/etc/openhop_repeater/config.yaml")
                 if self.daemon_instance and hasattr(self.daemon_instance, "config_path"):
                     config_path = self.daemon_instance.config_path
 
@@ -3105,12 +3939,10 @@ class APIEndpoints:
             trace_helper = self.daemon_instance.trace_helper
 
             # Generate unique tag for this ping
-            import random
-
-            trace_tag = random.randint(0, 0xFFFFFFFF)
+            trace_tag = secrets.randbits(32)
 
             # Create trace packet
-            from pymc_core.protocol import PacketBuilder
+            from openhop_core.protocol import PacketBuilder
 
             path_bytes = list(target_hash.to_bytes(byte_count, "big"))
             packet = PacketBuilder.create_trace(
@@ -3127,7 +3959,9 @@ class APIEndpoints:
 
                 # Send packet via router
                 await router.inject_packet(packet)
-                logger.info(f"Ping sent to 0x{target_hash:0{hex_chars}x} with tag {trace_tag} (path_hash_mode={path_hash_mode})")
+                logger.info(
+                    f"Ping sent to 0x{target_hash:0{hex_chars}x} with tag {trace_tag} (path_hash_mode={path_hash_mode})"
+                )
 
                 try:
                     await asyncio.wait_for(event.wait(), timeout=timeout)
@@ -3277,11 +4111,7 @@ class APIEndpoints:
                 settings = comp_config.get("settings", {})
 
                 matching = next(
-                    (
-                        r
-                        for r in registered_identities
-                        if r["name"] == f"companion:{name}"
-                    ),
+                    (r for r in registered_identities if r["name"] == f"companion:{name}"),
                     None,
                 )
 
@@ -3295,9 +4125,7 @@ class APIEndpoints:
                     {
                         "name": name,
                         "type": "companion",
-                        "identity_key": (
-                            ik_hex[:16] + "..." if len(ik_hex) > 16 else ik_hex
-                        ),
+                        "identity_key": (ik_hex[:16] + "..." if len(ik_hex) > 16 else ik_hex),
                         "identity_key_length": len(ik_hex),
                         "settings": settings,
                         "hash": matching["hash"] if matching else None,
@@ -3457,19 +4285,49 @@ class APIEndpoints:
                 if any(str(c.get("name") or "").strip() == name for c in companions):
                     return self._error(f"Companion with name '{name}' already exists")
 
+                try:
+                    bridge_settings = parse_companion_bridge_kwargs(settings)
+                except ValueError as e:
+                    return self._error(str(e))
+
                 comp_settings = {
                     "node_name": settings.get("node_name") or name,
                     "tcp_port": settings.get("tcp_port", 5000),
-                    "bind_address": settings.get("bind_address", "0.0.0.0"),
+                    "bind_address": settings.get("bind_address", "0.0.0.0"),  # nosec B104
                 }
                 if "tcp_timeout" in settings:
                     comp_settings["tcp_timeout"] = settings["tcp_timeout"]
+                if "trim_contacts_on_overflow" in settings:
+                    comp_settings["trim_contacts_on_overflow"] = bool(
+                        settings["trim_contacts_on_overflow"]
+                    )
+                comp_settings.update(bridge_settings)
                 new_identity = {
                     "name": name,
                     "identity_key": identity_key,
                     "type": identity_type,
                     "settings": comp_settings,
                 }
+                sqlite_handler = None
+                repeater_handler = (
+                    getattr(self.daemon_instance, "repeater_handler", None)
+                    if self.daemon_instance
+                    else None
+                )
+                if repeater_handler and getattr(repeater_handler, "storage", None):
+                    sqlite_handler = repeater_handler.storage.sqlite_handler
+                if sqlite_handler and identity_key:
+                    try:
+                        validate_companion_config_capacity(
+                            new_identity,
+                            sqlite_handler,
+                            companion_name=name,
+                            settings=comp_settings,
+                        )
+                    except CompanionContactCapacityError as e:
+                        return self._error(str(e))
+                    except (ValueError, TypeError) as e:
+                        return self._error(str(e))
                 companions.append(new_identity)
                 self.config["identities"]["companions"] = companions
             else:
@@ -3498,9 +4356,10 @@ class APIEndpoints:
 
             # Hot reload - register identity immediately
             registration_success = False
+            companion_activation_error = None
             if identity_type == "room_server" and self.daemon_instance:
                 try:
-                    from pymc_core import LocalIdentity
+                    from openhop_core import LocalIdentity
 
                     # Create LocalIdentity from the key (convert hex string to bytes)
                     if isinstance(identity_key, bytes):
@@ -3552,6 +4411,10 @@ class APIEndpoints:
                     future.result(timeout=15)
                     registration_success = True
                     logger.info(f"Hot reload: Companion '{name}' activated immediately")
+                except CompanionContactCapacityError as cap_error:
+                    # A restart won't fix a capacity overflow; report the real cause.
+                    companion_activation_error = str(cap_error)
+                    logger.warning(f"Hot reload companion '{name}' not activated: {cap_error}")
                 except Exception as comp_error:
                     logger.warning(
                         f"Hot reload companion '{name}' failed: {comp_error}. Restart required to activate.",
@@ -3559,11 +4422,17 @@ class APIEndpoints:
                     )
 
             if identity_type == "companion":
-                message = (
-                    f"Companion '{name}' created successfully and activated immediately!"
-                    if registration_success
-                    else f"Companion '{name}' created successfully. Restart required to activate."
-                )
+                if registration_success:
+                    message = f"Companion '{name}' created successfully and activated immediately!"
+                elif companion_activation_error:
+                    message = (
+                        f"Companion '{name}' created, but not activated: "
+                        f"{companion_activation_error}"
+                    )
+                else:
+                    message = (
+                        f"Companion '{name}' created successfully. Restart required to activate."
+                    )
             else:
                 message = (
                     f"Identity '{name}' created successfully and activated immediately!"
@@ -3663,19 +4532,60 @@ class APIEndpoints:
                             key_bytes = bytes.fromhex(new_key)
                             if len(key_bytes) in (32, 64):
                                 identity["identity_key"] = new_key
-                                logger.info(
-                                    f"Updated identity_key for companion '{resolved_name}'"
-                                )
+                                logger.info(f"Updated identity_key for companion '{resolved_name}'")
                         except ValueError:
                             pass
 
+                trimmed_count = 0
                 if "settings" in data:
-                    if "settings" not in identity:
-                        identity["settings"] = {}
-                    # Only allow companion settings
-                    for k, v in data["settings"].items():
-                        if k in ("node_name", "tcp_port", "bind_address", "tcp_timeout"):
-                            identity["settings"][k] = v
+                    try:
+                        merged_settings = merge_companion_settings_update(
+                            identity.get("settings") or {},
+                            data["settings"],
+                        )
+                    except ValueError as e:
+                        return self._error(str(e))
+
+                    sqlite_handler = None
+                    repeater_handler = (
+                        getattr(self.daemon_instance, "repeater_handler", None)
+                        if self.daemon_instance
+                        else None
+                    )
+                    if repeater_handler and getattr(repeater_handler, "storage", None):
+                        sqlite_handler = repeater_handler.storage.sqlite_handler
+                    if sqlite_handler and identity.get("identity_key"):
+                        try:
+                            validate_companion_config_capacity(
+                                identity,
+                                sqlite_handler,
+                                companion_name=resolved_name,
+                                settings=merged_settings,
+                            )
+                        except CompanionContactCapacityError as e:
+                            if not data.get("force_trim"):
+                                return self._error(str(e))
+                            # Power-user opt-in: trim persisted contacts down to the
+                            # new limit (favourite-aware) instead of rejecting.
+                            try:
+                                trimmed_count = trim_companion_contacts_to_fit(
+                                    sqlite_handler, e.companion_hash, e.max_contacts
+                                )
+                            except ValueError as trim_err:
+                                return self._error(str(trim_err))
+                            except RuntimeError:
+                                return self._error("Failed to persist trimmed contacts")
+                            logger.info(
+                                "Force-trimmed %d contact(s) for companion '%s' "
+                                "to fit max_contacts=%d",
+                                trimmed_count,
+                                resolved_name,
+                                e.max_contacts,
+                            )
+                        except (ValueError, TypeError) as e:
+                            return self._error(str(e))
+
+                    identity["settings"] = merged_settings
 
                 companions[identity_index] = identity
                 self.config["identities"]["companions"] = companions
@@ -3687,6 +4597,12 @@ class APIEndpoints:
                     f"Companion '{resolved_name}' updated successfully. "
                     "Restart required to apply changes."
                 )
+                if trimmed_count:
+                    message = (
+                        f"Companion '{resolved_name}' updated successfully; "
+                        f"trimmed {trimmed_count} contact(s) to fit the new limit. "
+                        "Restart required to apply changes."
+                    )
                 return self._success(identity, message=message)
 
             # Room server path
@@ -3767,7 +4683,7 @@ class APIEndpoints:
 
             if needs_reload and self.daemon_instance:
                 try:
-                    from pymc_core import LocalIdentity
+                    from openhop_core import LocalIdentity
 
                     final_name = identity["name"]  # Could be new_name
                     identity_key = identity["identity_key"]
@@ -3836,7 +4752,9 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def delete_identity(self, name=None, type=None, lookup_identity_key=None, public_key_prefix=None):
+    def delete_identity(
+        self, name=None, type=None, lookup_identity_key=None, public_key_prefix=None
+    ):
         """
         DELETE /api/delete_identity?name=<name>&type=<room_server|companion> - Delete an identity
         Companions may also be deleted with lookup_identity_key or public_key_prefix when name is empty.
@@ -3857,9 +4775,7 @@ class APIEndpoints:
 
             identity_type = (type or "room_server").lower()
             if identity_type not in ["room_server", "companion"]:
-                return self._error(
-                    f"Invalid type: {type}. Use 'room_server' or 'companion'."
-                )
+                return self._error(f"Invalid type: {type}. Use 'room_server' or 'companion'.")
 
             identities_config = self.config.get("identities", {})
 
@@ -3911,9 +4827,7 @@ class APIEndpoints:
 
             # Find and remove the identity
             initial_count = len(room_servers)
-            room_servers = [
-                r for r in room_servers if str(r.get("name") or "").strip() != name_s
-            ]
+            room_servers = [r for r in room_servers if str(r.get("name") or "").strip() != name_s]
 
             if len(room_servers) == initial_count:
                 return self._error(f"Identity '{name_s}' not found")
@@ -4057,8 +4971,8 @@ class APIEndpoints:
     ):
         """Send advert for a room server identity"""
         try:
-            from pymc_core.protocol import PacketBuilder
-            from pymc_core.protocol.constants import (
+            from openhop_core.protocol import PacketBuilder
+            from openhop_core.protocol.constants import (
                 ADVERT_FLAG_HAS_NAME,
                 ADVERT_FLAG_IS_ROOM_SERVER,
             )
@@ -4140,7 +5054,9 @@ class APIEndpoints:
                         {
                             "name": "repeater",
                             "type": "repeater",
-                            "hash": self._fmt_hash(self.daemon_instance.local_identity.get_public_key()),
+                            "hash": self._fmt_hash(
+                                self.daemon_instance.local_identity.get_public_key()
+                            ),
                             "max_clients": repeater_acl.max_clients,
                             "authenticated_clients": repeater_acl.get_num_clients(),
                             "has_admin_password": bool(repeater_acl.admin_password),
@@ -4185,7 +5101,11 @@ class APIEndpoints:
                         writer = getattr(fs, "_client_writer", None)
                         active_by_hash[h] = writer is not None
                         if writer is not None:
-                            peername = writer.get_extra_info("peername") if hasattr(writer, "get_extra_info") else None
+                            peername = (
+                                writer.get_extra_info("peername")
+                                if hasattr(writer, "get_extra_info")
+                                else None
+                            )
                             client_ip_by_hash[h] = str(peername[0]) if peername else None
                 except (ValueError, TypeError):
                     pass
@@ -5250,7 +6170,7 @@ class APIEndpoints:
             exported = _sanitize(exported)
 
             meta = {
-                "exported_at": datetime.utcnow().isoformat() + "Z",
+                "exported_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "version": __version__,
                 "config_path": self._config_path,
                 "includes_secrets": full_backup,
@@ -5344,9 +6264,7 @@ class APIEndpoints:
                     # Preserve identity keys that are redacted
                     for id_section in ("room_servers", "companions"):
                         entries = value.get(id_section, []) or []
-                        cur_entries = (
-                            self.config.get("identities", {}).get(id_section, []) or []
-                        )
+                        cur_entries = self.config.get("identities", {}).get(id_section, []) or []
                         cur_by_name = {e.get("name"): e for e in cur_entries}
                         for entry in entries:
                             if entry.get("identity_key") == "*** REDACTED ***":
@@ -5381,7 +6299,7 @@ class APIEndpoints:
                 return self._error("No valid configuration sections found in import")
 
             # Persist and live-reload
-            result = self.config_manager.update_and_save(
+            self.config_manager.update_and_save(
                 updates={},  # Already applied above
                 live_update=True,
                 live_update_sections=updated_sections,
@@ -5432,7 +6350,9 @@ class APIEndpoints:
             elif isinstance(identity_key, str):
                 key_hex = identity_key
             else:
-                return self._error(f"Identity key has unexpected type: {type(identity_key).__name__}")
+                return self._error(
+                    f"Identity key has unexpected type: {type(identity_key).__name__}"
+                )
 
             result = {
                 "identity_key_hex": key_hex,
@@ -5446,8 +6366,8 @@ class APIEndpoints:
                     pub = li.get_public_key()
                     result["public_key_hex"] = bytes(pub).hex()
                     result["node_address"] = f"0x{pub[0]:02x}"
-            except Exception:
-                pass  # Not critical
+            except Exception as exc:
+                logger.debug(f"Could not derive local identity public key info: {exc}")
 
             return {"success": True, "data": result}
 
@@ -5545,9 +6465,7 @@ class APIEndpoints:
 
             # Add RRD file size if it exists
             rrd_path = storage.sqlite_handler.storage_dir / "metrics.rrd"
-            stats["rrd_size_bytes"] = (
-                rrd_path.stat().st_size if rrd_path.exists() else 0
-            )
+            stats["rrd_size_bytes"] = rrd_path.stat().st_size if rrd_path.exists() else 0
 
             return {"success": True, "data": stats}
         except Exception as e:
@@ -5578,10 +6496,16 @@ class APIEndpoints:
                 return self._error("Missing 'tables' parameter")
 
             ALL_PURGEABLE = [
-                "packets", "adverts", "noise_floor", "crc_errors",
-                "room_messages", "room_client_sync",
-                "companion_contacts", "companion_channels",
-                "companion_messages", "companion_prefs",
+                "packets",
+                "adverts",
+                "noise_floor",
+                "crc_errors",
+                "room_messages",
+                "room_client_sync",
+                "companion_contacts",
+                "companion_channels",
+                "companion_messages",
+                "companion_prefs",
             ]
 
             if tables_param == "all":
@@ -5674,7 +6598,7 @@ class APIEndpoints:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>pyMC Repeater API Documentation</title>
+    <title>openHop Repeater API Documentation</title>
     <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.0/swagger-ui.css">
     <style>
         body {

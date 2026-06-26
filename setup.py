@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Setup script for pymc_repeater
+Setup script for openhop_repeater
 Version is managed by setuptools_scm from git tags
 """
 

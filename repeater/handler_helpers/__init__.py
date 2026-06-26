@@ -1,4 +1,4 @@
-"""Handler helper modules for pyMC Repeater."""
+"""Handler helper modules for openHop Repeater."""
 
 from .advert import AdvertHelper
 from .discovery import DiscoveryHelper
