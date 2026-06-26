@@ -195,7 +195,10 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if config_path is None:
-        config_path = os.getenv("PYMC_REPEATER_CONFIG", "/etc/openhop_repeater/config.yaml")
+        config_path = os.getenv(
+            "OPENHOP_REPEATER_CONFIG",
+            os.getenv("PYMC_REPEATER_CONFIG", "/etc/openhop_repeater/config.yaml"),
+        )
 
     # Check if config file exists
     if not Path(config_path).exists():
@@ -301,10 +304,11 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         else:
             config["repeater"]["identity_key"] = _load_or_create_identity_key()
 
-    if os.getenv("PYMC_REPEATER_LOG_LEVEL"):
+    env_log_level = os.getenv("OPENHOP_REPEATER_LOG_LEVEL", os.getenv("PYMC_REPEATER_LOG_LEVEL"))
+    if env_log_level:
         if "logging" not in config:
             config["logging"] = {}
-        config["logging"]["level"] = os.getenv("PYMC_REPEATER_LOG_LEVEL")
+        config["logging"]["level"] = env_log_level
 
     config = _load_policy_engine_config(config, config_path)
 
@@ -323,7 +327,10 @@ def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) 
         True if successful, False otherwise
     """
     if config_path is None:
-        config_path = os.getenv("PYMC_REPEATER_CONFIG", "/etc/openhop_repeater/config.yaml")
+        config_path = os.getenv(
+            "OPENHOP_REPEATER_CONFIG",
+            os.getenv("PYMC_REPEATER_CONFIG", "/etc/openhop_repeater/config.yaml"),
+        )
 
     try:
         # Create backup of existing config

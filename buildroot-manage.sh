@@ -1247,12 +1247,12 @@ prepare_git_version() {
         git -C "$SCRIPT_DIR" fetch --tags 2>/dev/null || true
         git_version=$(python3 -m setuptools_scm 2>/dev/null || echo "1.0.5")
         export SETUPTOOLS_SCM_PRETEND_VERSION="$git_version"
-        export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYMC_REPEATER="$git_version"
+        export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER="$git_version"
         info "Using version: $git_version"
     else
         git_version="1.0.5"
         export SETUPTOOLS_SCM_PRETEND_VERSION="$git_version"
-        export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYMC_REPEATER="$git_version"
+        export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER="$git_version"
         info "Using fallback version: $git_version"
     fi
 

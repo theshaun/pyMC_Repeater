@@ -1580,6 +1580,7 @@ class APIEndpoints:
         if cherrypy.request.method == "OPTIONS":
             return ""
 
+        future = None
         try:
             self._require_post()
             if not self.send_advert_func:
@@ -1588,7 +1589,6 @@ class APIEndpoints:
                 return self._error("Event loop not available")
             import asyncio
 
-            future = None
             future = asyncio.run_coroutine_threadsafe(self.send_advert_func(), self.event_loop)
             result = future.result(timeout=10)
             return (
@@ -1601,11 +1601,8 @@ class APIEndpoints:
                 "Error sending advert: timeout waiting for advert transmission to complete",
                 exc_info=True,
             )
-            try:
-                if future is not None:
-                    future.cancel()
-            except Exception:
-                pass
+            if future is not None:
+                future.cancel()
             return self._error("Timed out waiting for advert transmission after 10 seconds")
         except cherrypy.HTTPError:
             # Re-raise HTTP errors (like 405 Method Not Allowed) without logging

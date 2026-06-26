@@ -3,7 +3,7 @@ set -eu
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/openhop_repeater}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/openhop_repeater}"
-CONFIG_PATH="${PYMC_REPEATER_CONFIG:-${CONFIG_DIR}/config.yaml}"
+CONFIG_PATH="${OPENHOP_REPEATER_CONFIG:-${PYMC_REPEATER_CONFIG:-${CONFIG_DIR}/config.yaml}}"
 EXAMPLE_PATH="${CONFIG_DIR}/config.yaml.example"
 BUNDLED_EXAMPLE_PATH="${INSTALL_DIR}/config.yaml.example"
 RUNTIME_USER="${USER:-repeater}"
